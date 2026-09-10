@@ -1,0 +1,12 @@
+[project]
+name = "codepulse-memory-lab"
+version = "0.1.0"
+description = "Standalone, read-only long-term memory experiments for CodePulse conversations"
+requires-python = ">=3.11"
+
+[project.scripts]
+memory-lab = "memory_lab.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

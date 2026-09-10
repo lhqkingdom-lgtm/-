@@ -1,0 +1,12 @@
+{
+  "schema_version": "memory-lab-config-v1",
+  "llm": {
+    "provider": "deepseek",
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-v4-pro",
+    "allow_remote": true,
+    "timeout_seconds": 45,
+    "max_attempts": 3,
+    "credential_file": "memory-lab.secrets.local.json"
+  }
+}

@@ -1,0 +1,47 @@
+# Local credentials and protected material
+memory-lab.secrets*.json
+*.dpapi
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime databases and SQLite sidecars
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Generated memory projections and reports
+reports/
+memory/
+preview-memory/
+demo-memory/
+full-suite-memory/
+round1-memory/
+real-project-memory*/
+
+# Copied local firmware fixtures are not redistributable source
+test-projects/
+
+# Python/editor/build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+*.log
+.idea/
+.vscode/

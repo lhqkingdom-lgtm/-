@@ -1,0 +1,90 @@
+{
+  "schema_version": "memory-lab-shadow-gold-v1",
+  "suite_id": "bootstrap-11-v1",
+  "provenance": "tuned_regression",
+  "frozen_at": "2026-09-09T09:55:00.000Z",
+  "description": "首轮跨会话、跨项目用户契约受控集；用于验证提取、拒存、同义识别和范围隔离。",
+  "generalization_note": "该集合参与过提示词调试，只能证明受控回归正确，不能替代后续 CP 新消息的盲测。",
+  "cases": [
+    {
+      "candidate_key": "admcand_48592b4bcc6ddac974de8078",
+      "label": "全局回复语言偏好",
+      "should_store": true,
+      "type": "response_preference",
+      "stable_key": "preference.response.language",
+      "scope": {"level": "global"},
+      "value": "zh",
+      "relation": "new"
+    },
+    {
+      "candidate_key": "admcand_e46c202d6529f3065fde729d",
+      "label": "正式代码生成前确认",
+      "should_store": true,
+      "type": "workflow_rule",
+      "stable_key": "workflow.code_generation.confirmation",
+      "scope": {"level": "global"},
+      "value": "required",
+      "relation": "new"
+    },
+    {
+      "candidate_key": "admcand_3531758595e86fa0e4e9cae2",
+      "label": "跨会话同义确认规则",
+      "should_store": true,
+      "type": "workflow_rule",
+      "stable_key": "workflow.code_generation.confirmation",
+      "scope": {"level": "global"},
+      "value": "required",
+      "relation": "equivalent"
+    },
+    {
+      "candidate_key": "admcand_1e58a24a4ea229db5ab5c781",
+      "label": "仅本轮生效的临时要求",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_30cb7dfe3203cc7e8a12cad3",
+      "label": "单片机领域编译检查流程",
+      "should_store": true,
+      "type": "workflow_rule",
+      "stable_key": "workflow.embedded.code_change.compile_check",
+      "scope": {"level": "domain", "domain": "embedded"},
+      "value": "required",
+      "relation": "new"
+    },
+    {
+      "candidate_key": "admcand_8fad4338c9c51a906edf8f6c",
+      "label": "已由 CP 项目指令完整覆盖",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_295280f8cf6534bdf1d41380",
+      "label": "无独立语义的对话碎片",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_a8188c1d564b057dd6054cdb",
+      "label": "项目声明与实际目录不一致",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_a33a623e0dd6409711a89da4",
+      "label": "另一会话中已由 CP 指令覆盖",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_fbc130b96bb2057f8314fefc",
+      "label": "无记忆价值的数字碎片",
+      "should_store": false
+    },
+    {
+      "candidate_key": "admcand_a08703da9c59bc284826e337",
+      "label": "全局回复结构偏好",
+      "should_store": true,
+      "type": "response_preference",
+      "stable_key": "preference.response.structure",
+      "scope": {"level": "global"},
+      "value": "conclusion_then_details",
+      "relation": "new"
+    }
+  ]
+}
