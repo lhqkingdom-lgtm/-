@@ -17,6 +17,9 @@ CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只�
 
 完整的两个真实项目测试步骤见 [REAL_PROJECT_TEST_PLAN.md](REAL_PROJECT_TEST_PLAN.md)。
 
+可立即执行的 Keil C51 单项目演示步骤见
+[KEIL_FANGUARD_TEST_PLAN.md](KEIL_FANGUARD_TEST_PLAN.md)。
+
 ## 当前通用链路
 
 ```text
