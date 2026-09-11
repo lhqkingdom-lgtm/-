@@ -2,7 +2,8 @@
 
 The CodePulse database is always opened read-only.  The Memory Lab database is
 used only to select a turn that the existing two-sample detector has already
-classified as ``completed`` or ``failed`` and to recover its project identity.
+classified as ``completed``, ``failed``, or stably ``interrupted`` by a later
+user message, and to recover its project identity.
 No project files, Git metadata, instruction files, or hidden model reasoning
 are inspected here.
 """
@@ -25,15 +26,15 @@ from .source import normalize_text, open_read_only, source_id
 
 
 SCHEMA_VERSION = "memory-lab-turn-evidence-v1"
-TERMINAL_TURN_STATES = {"completed", "failed"}
+TERMINAL_TURN_STATES = {"completed", "failed", "interrupted"}
 HIDDEN_PART_TYPES = {"reasoning", "thinking"}
 
 # These are the hard limits of ``unified_model.build_unified_model_request``.
 # They intentionally live here as evidence-envelope limits as well: a single
 # completed turn must never be capable of wedging the oldest-turn cursor just
 # because it contains an unusually long tool transcript.
-MODEL_MAX_OBSERVATIONS = 600
-MODEL_MAX_TOTAL_OBSERVATION_CHARS = 320_000
+MODEL_MAX_OBSERVATIONS = 160
+MODEL_MAX_TOTAL_OBSERVATION_CHARS = 20_000
 TOOL_EVENT_MANIFEST_SCHEMA_VERSION = "memory-lab-tool-event-manifest-v1"
 
 
@@ -45,10 +46,10 @@ class TurnEvidenceError(ValueError):
 class EvidenceLimits:
     """Per-field limits; all observable tool events are retained."""
 
-    user_text_chars: int = 8_000
-    assistant_text_chars: int = 12_000
-    tool_payload_chars: int = 4_000
-    assistant_error_chars: int = 2_000
+    user_text_chars: int = 4_000
+    assistant_text_chars: int = 4_000
+    tool_payload_chars: int = 900
+    assistant_error_chars: int = 900
     identity_chars: int = 256
 
     def __post_init__(self) -> None:
@@ -261,6 +262,89 @@ def _payload_summary(
     }
 
 
+def _completed_question_user_answers(
+    data: Mapping[str, Any],
+    *,
+    source_message_id: str,
+    source_part_id: str,
+    message_ordinal: int,
+    source_part_ordinal: int,
+    occurred_at_ms: Any,
+    workspace: str | None,
+    stats: _SanitizationStats,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Project only unambiguous completed question selections as user evidence."""
+
+    if str(data.get("tool") or data.get("name") or "").casefold() != "question":
+        return []
+    state = data.get("state")
+    if not isinstance(state, Mapping) or state.get("status") != "completed":
+        return []
+    tool_input = state.get("input")
+    metadata = state.get("metadata")
+    if not isinstance(tool_input, Mapping) or not isinstance(metadata, Mapping):
+        return []
+    questions = tool_input.get("questions")
+    answers = metadata.get("answers")
+    if (
+        metadata.get("truncated") is not False
+        or not isinstance(questions, list)
+        or not isinstance(answers, list)
+        or not questions
+        or len(questions) != len(answers)
+    ):
+        return []
+
+    projected: list[tuple[str, str, list[str]]] = []
+    for question, selected in zip(questions, answers):
+        if not isinstance(question, Mapping) or not isinstance(selected, (list, tuple)):
+            return []
+        header = question.get("header")
+        prompt = question.get("question")
+        if (
+            not isinstance(header, str)
+            or not header.strip()
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+            or not selected
+            or any(not isinstance(item, str) or not item.strip() for item in selected)
+        ):
+            return []
+        projected.append((header, prompt, list(selected)))
+
+    state_time = state.get("time")
+    answer_time = state_time.get("end") if isinstance(state_time, Mapping) else None
+    if isinstance(answer_time, bool) or not isinstance(answer_time, int) or answer_time < 0:
+        answer_time = occurred_at_ms
+    if isinstance(answer_time, bool) or not isinstance(answer_time, int) or answer_time < 0:
+        answer_time = 0
+
+    result = []
+    for question_index, (header, prompt, selected) in enumerate(projected, 1):
+        # Keep selections first so an unusually long prompt cannot truncate the
+        # value that carries the user's actual choice. JSON quoting prevents
+        # embedded newlines from blurring field boundaries.
+        text = "\n".join(
+            (
+                f"selected_answers={_canonical_json(selected)}",
+                f"question_header={_canonical_json(header)}",
+                f"question={_canonical_json(prompt)}",
+            )
+        )
+        result.append(
+            {
+                "ordinal": source_part_ordinal * 1_000 + question_index,
+                "message_ordinal": message_ordinal,
+                "source_message_id": source_message_id,
+                "source_part_id": f"{source_part_id}:answer:{question_index}",
+                "occurred_at_ms": answer_time,
+                **_bounded_text(text, limit, workspace, stats),
+            }
+        )
+    return result
+
+
 def _bounded_model_identity(value: Any, maximum: int, fallback: str) -> str:
     """Bound an already-sanitized identity without creating collisions easily."""
 
@@ -362,6 +446,15 @@ def _truncate_observation_content(payload: dict[str, Any], cap: int) -> None:
             if len(text) > cap:
                 part["text"] = text[:cap]
                 part["truncated"] = True
+    user_answers = payload.get("user_answers")
+    if isinstance(user_answers, list):
+        for answer in user_answers:
+            if not isinstance(answer, dict) or not isinstance(answer.get("text"), str):
+                continue
+            text = answer["text"]
+            if len(text) > cap:
+                answer["text"] = text[:cap]
+                answer["truncated"] = True
     tools = payload.get("tools")
     if not isinstance(tools, list):
         return
@@ -422,9 +515,14 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
     session = payload.get("session")
     user = payload.get("user")
     assistant = payload.get("assistant")
+    user_answers = payload.get("user_answers", [])
     tools = payload.get("tools")
     if not all(isinstance(item, dict) for item in (turn, workspace, session, user, assistant)):
         raise TurnEvidenceError("turn evidence envelope is incomplete")
+    if not isinstance(user_answers, list) or not all(
+        isinstance(item, dict) for item in user_answers
+    ):
+        raise TurnEvidenceError("turn evidence user_answers must be an array of objects")
     if not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools):
         raise TurnEvidenceError("turn evidence tools must be an array of objects")
 
@@ -452,6 +550,13 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
             part["source_part_id"] = _bounded_model_identity(
                 part.get("source_part_id"), 500, "unknown-text-part"
             )
+    for answer in user_answers:
+        answer["source_message_id"] = _bounded_model_identity(
+            answer.get("source_message_id"), 500, "unknown-question-message"
+        )
+        answer["source_part_id"] = _bounded_model_identity(
+            answer.get("source_part_id"), 500, "unknown-question-answer"
+        )
 
     original_tools = list(tools)
     prior_manifest = payload.get("tool_event_manifest")
@@ -482,15 +587,17 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
     user_parts = user["text_parts"]
     assistant_parts = assistant["text_parts"]
     quotas = _observation_quotas(
-        [len(user_parts), len(assistant_parts), len(original_tools)],
+        [len(user_parts), len(user_answers), len(assistant_parts), len(original_tools)],
         MODEL_MAX_OBSERVATIONS,
     )
     if not quotas[0]:
         raise TurnEvidenceError("turn evidence has no observable user text")
     selected_user = _evenly_spaced_indices(len(user_parts), quotas[0])
-    selected_assistant = _evenly_spaced_indices(len(assistant_parts), quotas[1])
-    selected_tools = _evenly_spaced_indices(len(original_tools), quotas[2])
+    selected_answers = _evenly_spaced_indices(len(user_answers), quotas[1])
+    selected_assistant = _evenly_spaced_indices(len(assistant_parts), quotas[2])
+    selected_tools = _evenly_spaced_indices(len(original_tools), quotas[3])
     user["text_parts"] = [user_parts[index] for index in selected_user]
+    payload["user_answers"] = [user_answers[index] for index in selected_answers]
     assistant["text_parts"] = [assistant_parts[index] for index in selected_assistant]
     payload["tools"] = [original_tools[index] for index in selected_tools]
     if not has_prior_manifest:
@@ -518,9 +625,12 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
         "max_total_observation_chars": MODEL_MAX_TOTAL_OBSERVATION_CHARS,
         "original_observation_count": prior_original_count
         if isinstance(prior_original_count, int)
-        else len(user_parts) + len(assistant_parts) + len(original_tools),
+        else len(user_parts) + len(user_answers) + len(assistant_parts) + len(original_tools),
         "model_observation_envelope_count": (
-            len(user["text_parts"]) + len(assistant["text_parts"]) + len(payload["tools"])
+            len(user["text_parts"])
+            + len(payload["user_answers"])
+            + len(assistant["text_parts"])
+            + len(payload["tools"])
         ),
         "content_char_cap": prior_budget.get("content_char_cap")
         if isinstance(prior_budget, Mapping)
@@ -531,6 +641,47 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
     candidate = _with_bundle_identity(payload)
     try:
         _model_contract_accepts(candidate)
+        model_budget = candidate.get("safety", {}).get("model_budget")
+        if (
+            isinstance(model_budget, dict)
+            and model_budget.get("content_char_cap") is None
+            and model_budget.get("original_observation_count")
+            != model_budget.get("model_observation_envelope_count")
+        ):
+            max_length = 1
+            for actor in ("user", "assistant"):
+                container = candidate.get(actor)
+                parts = container.get("text_parts") if isinstance(container, dict) else None
+                if isinstance(parts, list):
+                    max_length = max(
+                        max_length,
+                        *(
+                            len(part.get("text") or "")
+                            for part in parts
+                            if isinstance(part, dict)
+                        ),
+                    )
+            answers = candidate.get("user_answers")
+            if isinstance(answers, list):
+                max_length = max(
+                    max_length,
+                    *(
+                        len(answer.get("text") or "")
+                        for answer in answers
+                        if isinstance(answer, dict)
+                    ),
+                )
+            tools = candidate.get("tools")
+            if isinstance(tools, list):
+                for tool in tools:
+                    if not isinstance(tool, dict):
+                        continue
+                    for field in ("input", "output", "error"):
+                        channel = tool.get(field)
+                        if isinstance(channel, dict) and isinstance(channel.get("text"), str):
+                            max_length = max(max_length, len(channel["text"]))
+            candidate["safety"]["model_budget"]["content_char_cap"] = max_length
+            candidate = _with_bundle_identity(candidate)
         return candidate
     except Exception as initial_error:
         # Observation count and model identity bounds are already satisfied;
@@ -543,6 +694,11 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
                 for part in actor["text_parts"]
                 if isinstance(part, dict)
             )
+        lengths.extend(
+            len(answer.get("text") or "")
+            for answer in payload["user_answers"]
+            if isinstance(answer, dict)
+        )
         for tool in payload["tools"]:
             for field in ("input", "output", "error"):
                 channel = tool.get(field)
@@ -619,7 +775,8 @@ def _load_turn(connection: sqlite3.Connection, turn_id: str) -> dict[str, Any]:
     turn = dict(row)
     if turn["current_state"] not in TERMINAL_TURN_STATES:
         raise TurnEvidenceError(
-            f"turn is not a stable completed/failed turn: {turn['current_state']}"
+            "turn is not a stable completed/failed/interrupted turn: "
+            f"{turn['current_state']}"
         )
     return turn
 
@@ -798,6 +955,7 @@ def _read_source_turn(
                 }
             )
 
+    user_answer_parts = []
     tool_events = []
     observable_message_order = []
     tool_ordinal = 0
@@ -833,6 +991,19 @@ def _read_source_turn(
             input_present, input_value = payload("input")
             output_present, output_value = payload("output")
             error_present, error_value = payload("error")
+            user_answer_parts.extend(
+                _completed_question_user_answers(
+                    data,
+                    source_message_id=assistant["id"],
+                    source_part_id=part["id"],
+                    message_ordinal=message_ordinals[assistant["id"]],
+                    source_part_ordinal=global_part_ordinal,
+                    occurred_at_ms=part["time_created"],
+                    workspace=workspace,
+                    stats=stats,
+                    limit=limits.user_text_chars,
+                )
+            )
             tool_events.append(
                 {
                     "ordinal": tool_ordinal,
@@ -892,6 +1063,7 @@ def _read_source_turn(
             "occurred_at_ms": user_message["time_created"],
             "text_parts": user_parts,
         },
+        "user_answers": user_answer_parts,
         "assistant": {
             "message_id": terminal_id,
             "message_ordinal": message_ordinals.get(terminal_id),
@@ -1012,6 +1184,7 @@ def build_turn_evidence(
         },
         "session": lineage,
         "user": source_turn["user"],
+        "user_answers": source_turn["user_answers"],
         "assistant": source_turn["assistant"],
         "tools": source_turn["tools"],
         "safety": {

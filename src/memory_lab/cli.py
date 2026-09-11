@@ -16,6 +16,7 @@ from .config import DEFAULT_CONFIG
 from .consolidation import record_proposal_review, rollback_memory, run_consolidation
 from .engineering_memory import summarize_engineering_candidates
 from .episodes import run_episode_extraction
+from .evidence_pool import DeepSeekPhaseRouter, run_evidence_pool_report
 from .formal_markdown import publish_formal_memory, recall_formal_memory
 from .formal_pipeline import run_deepseek_auto_memory
 from .ingest import run_ingestion
@@ -25,6 +26,7 @@ from .longitudinal import start_run as start_longitudinal_run
 from .llm_client import OpenAICompatibleJsonClient
 from .markdown_store import run_markdown_preview, run_markdown_recall
 from .model_recall import run_deepseek_formal_recall
+from .phase import run_turn_phase_report
 from .prepare import prepare_dataset
 from .report import DEFAULT_GOLD, DEFAULT_REPORT_DIRECTORY, generate_shadow_report
 from .shadow import run_deepseek_shadow
@@ -275,6 +277,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=1000,
         help="Delay between the two allow-listed trace samples (default: 1000)",
     )
+    phases = subparsers.add_parser(
+        "turn-phases",
+        help="Classify stable CP turns into memory extraction phases",
+    )
+    phases.add_argument("--settle-ms", type=int, default=0)
+    phases.add_argument("--limit", type=int, default=20)
+    evidence_pools = subparsers.add_parser(
+        "evidence-pools",
+        help="Build three-tier evidence pools and optionally route final phases with DeepSeek",
+    )
+    evidence_pools.add_argument("--settle-ms", type=int, default=0)
+    evidence_pools.add_argument("--limit", type=int, default=10)
+    evidence_pools.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    evidence_pools.add_argument(
+        "--layer",
+        choices=("all", "core", "candidate", "pointer", "router"),
+        default="all",
+        help="Show one evidence layer at a time for step-by-step validation",
+    )
+    evidence_pools.add_argument(
+        "--model-router",
+        action="store_true",
+        help="Call DeepSeek to correct the deterministic rule phase",
+    )
     return parser
 
 
@@ -458,6 +484,27 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "episodes":
             report = run_episode_extraction(
                 args.source_db, args.lab_db, settle_ms=args.settle_ms
+            )
+        elif args.command == "turn-phases":
+            report = run_turn_phase_report(
+                args.source_db,
+                args.lab_db,
+                settle_ms=args.settle_ms,
+                limit=args.limit,
+            )
+        elif args.command == "evidence-pools":
+            router = None
+            if args.model_router:
+                router = DeepSeekPhaseRouter(
+                    OpenAICompatibleJsonClient.from_config(args.config)
+                )
+            report = run_evidence_pool_report(
+                args.source_db,
+                args.lab_db,
+                settle_ms=args.settle_ms,
+                limit=args.limit,
+                layer=args.layer,
+                router=router,
             )
         elif args.command in {"baseline", "ingest"}:
             report = run_ingestion(args.source_db, args.lab_db, args.command)

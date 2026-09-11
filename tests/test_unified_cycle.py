@@ -287,6 +287,71 @@ class UnifiedCycleTests(unittest.TestCase):
             )
         self.assertIn("html", first["report_files"])
 
+    def test_stably_interrupted_turn_is_processed_before_later_completed_turn(self):
+        with closing(sqlite3.connect(self.source)) as connection, connection:
+            connection.execute(
+                "INSERT INTO message VALUES ('user-interrupted', 'session-1', 2000, ?)",
+                (json.dumps({"role": "user", "time": {"created": 2000}}),),
+            )
+            connection.execute(
+                "INSERT INTO part VALUES ('user-interrupted-part', 'user-interrupted', "
+                "'session-1', 2001, ?)",
+                (
+                    json.dumps(
+                        {"type": "text", "text": "这是当前项目的长期产品规则。"},
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO message VALUES ('assistant-question', 'session-1', 2010, ?)",
+                (
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "parentID": "user-interrupted",
+                            "finish": "tool-calls",
+                            "time": {"created": 2010, "completed": 2020},
+                        }
+                    ),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO part VALUES ('question-part', 'assistant-question', "
+                "'session-1', 2011, ?)",
+                (
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "tool": "question",
+                            "state": {
+                                "status": "completed",
+                                "output": "User selected 250ms sampling.",
+                            },
+                        }
+                    ),
+                ),
+            )
+        self.add_turn(2, 3000, tool=False)
+        planner = _Planner()
+
+        result = run_unified_cycle(
+            self.source,
+            self.lab,
+            self.memory_root,
+            planner=planner,
+            reviewer=_Reviewer(),
+            settle_ms=0,
+            dependencies=self.dependencies(),
+        )
+
+        self.assertEqual(result["processed_turn_count"], 2)
+        self.assertEqual(
+            [turn["turn"]["state"] for turn in planner.calls[0]],
+            ["interrupted", "completed"],
+        )
+        self.assertEqual(planner.calls[0][0]["tools"][0]["name"], "question")
+
     def test_writer_failure_is_redacted_and_same_turn_can_be_retried(self):
         self.add_turn(1, 2000)
         failing = _Planner(failure=True)

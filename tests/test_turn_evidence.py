@@ -275,6 +275,53 @@ class TurnEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(TurnEvidenceError, "different CodePulse"):
             build_turn_evidence(copied_source, self.lab, turn_id)
 
+    def test_stably_interrupted_question_turn_remains_observable(self) -> None:
+        self.add_user("usr_question", 4500, "这是当前项目的长期产品规则。")
+        self.add_assistant("ast_question", "usr_question", 4510, finish="tool-calls")
+        self.add_part(
+            "part_question",
+            "ast_question",
+            4511,
+            {
+                "type": "tool",
+                "tool": "question",
+                "state": {
+                    "status": "completed",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "采样周期是多少？",
+                                "header": "采样周期",
+                                "options": [
+                                    {"label": "250ms", "description": "平衡响应与稳定性"}
+                                ],
+                            }
+                        ]
+                    },
+                    "metadata": {"answers": [["250ms"]], "truncated": False},
+                    "output": (
+                        'User has answered your questions: "采样周期是多少？"="250ms". '
+                        "You can now continue with the user's answers in mind."
+                    ),
+                },
+            },
+        )
+        self.add_user("usr_followup", 4600, "停止追问，先整理现有需求。")
+        run_ingestion(self.source, self.lab, "ingest")
+        prepare_dataset(self.lab)
+        report = run_turn_scan(self.source, self.lab, settle_ms=0)
+        interrupted = next(
+            item for item in report["turns"] if item["state"] == "interrupted"
+        )
+
+        bundle = build_turn_evidence(self.source, self.lab, interrupted["turn_id"])
+
+        self.assertEqual(bundle["turn"]["state"], "interrupted")
+        self.assertEqual(len(bundle["tools"]), 1)
+        self.assertEqual(bundle["tools"][0]["name"], "question")
+        self.assertEqual(bundle["tools"][0]["status"], "completed")
+        self.assertIn("250ms", bundle["tools"][0]["output"]["text"])
+
     def test_missing_turn_and_invalid_limits_fail_closed(self) -> None:
         with self.assertRaisesRegex(TurnEvidenceError, "does not exist"):
             build_turn_evidence(self.source, self.lab, "missing")

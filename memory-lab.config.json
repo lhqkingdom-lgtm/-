@@ -3,10 +3,12 @@
   "llm": {
     "provider": "deepseek",
     "base_url": "https://api.deepseek.com",
-    "model": "deepseek-v4-pro",
+    "model": "deepseek-flash",
     "allow_remote": true,
-    "timeout_seconds": 45,
+    "timeout_seconds": 120,
     "max_attempts": 3,
     "credential_file": "memory-lab.secrets.local.json"
   }
 }
+
+

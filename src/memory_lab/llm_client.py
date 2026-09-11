@@ -99,6 +99,73 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+_TRAILING_JSON_COMMA = re.compile(r",\s*([}\]])")
+_MISNESTED_CONTENT_EVIDENCE = re.compile(
+    r'("content"\s*:\s*\{\s*"statement"\s*:\s*("(?:\\.|[^"\\])*"))\s*,\s*"evidence"\s*:'
+)
+_MISNESTED_CONTENT_ACTION = re.compile(
+    r'("content"\s*:\s*\{\s*"statement"\s*:\s*("(?:\\.|[^"\\])*"))\s*,\s*"action_hint"\s*:'
+)
+
+
+def _loads_model_json(content: str) -> dict[str, Any]:
+    """Parse provider JSON content with a tiny formatting-only repair pass.
+
+    Some JSON-mode providers still occasionally return a fenced object, a
+    short prose prefix, or trailing commas.  This function never invents or
+    rewrites domain content; it only strips wrappers and removes commas that
+    are illegal immediately before ``}`` or ``]``.
+    """
+
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text).strip()
+    starts = [index for index in (text.find("{"), text.find("[")) if index >= 0]
+    if starts:
+        text = text[min(starts) :]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        repaired = _TRAILING_JSON_COMMA.sub(r"\1", text)
+        repaired = _MISNESTED_CONTENT_EVIDENCE.sub(
+            r'\1},"status":"active","evidence":', repaired
+        )
+        repaired = _MISNESTED_CONTENT_ACTION.sub(
+            r'\1},"status":"active","action_hint":', repaired
+        )
+        parsed = json.loads(repaired)
+    parsed = _normalize_model_json_shape(parsed)
+    if not isinstance(parsed, Mapping):
+        raise JsonClientTransportError("provider JSON result must be an object")
+    return dict(parsed)
+
+
+def _normalize_model_json_shape(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_normalize_model_json_shape(item) for item in value]
+    if not isinstance(value, Mapping):
+        return value
+    result = {key: _normalize_model_json_shape(item) for key, item in value.items()}
+    content = result.get("content")
+    if (
+        isinstance(content, Mapping)
+        and isinstance(content.get("statement"), str)
+        and (
+            "evidence" in content
+            or "action_hint" in content
+            or "status" in content
+        )
+    ):
+        result["content"] = {"statement": content["statement"]}
+        if "status" not in result:
+            result["status"] = content.get("status") or "active"
+        for misplaced in ("evidence", "action_hint"):
+            if misplaced not in result and misplaced in content:
+                result[misplaced] = content[misplaced]
+    return result
+
+
 @dataclass(frozen=True)
 class OpenAICompatibleJsonClient:
     """Send one stateless chat-completions request and return a JSON object."""
@@ -172,26 +239,16 @@ class OpenAICompatibleJsonClient:
             _assert_no_secrets({"system": system_prompt, "user": content})
 
         endpoint = self.endpoint()
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "stream": False,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-        }
-        if (urlparse.urlsplit(endpoint).hostname or "").lower() == "api.deepseek.com":
-            payload["thinking"] = {"type": "disabled"}
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Accept": "application/json",
         }
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
-        body = _canonical_json(payload).encode("utf-8")
 
         configured_attempts = max(1, self.max_attempts)
         attempts_made = 0
@@ -212,6 +269,17 @@ class OpenAICompatibleJsonClient:
         for attempt in range(1, configured_attempts + 1):
             attempts_made = attempt
             try:
+                payload: dict[str, Any] = {
+                    "model": self.model,
+                    "temperature": 0,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                }
+                if (urlparse.urlsplit(endpoint).hostname or "").lower() == "api.deepseek.com":
+                    payload["thinking"] = {"type": "disabled"}
+                body = _canonical_json(payload).encode("utf-8")
                 raw = self.transport(endpoint, headers, body, self.timeout_seconds)
                 if len(raw) > MAX_PROVIDER_RESPONSE_BYTES:
                     raise JsonClientTransportError(
@@ -243,12 +311,34 @@ class OpenAICompatibleJsonClient:
                     raise JsonClientTransportError(
                         "provider returned empty JSON content"
                     )
-                result = json.loads(response_content)
-                if not isinstance(result, Mapping):
+                try:
+                    result = _loads_model_json(response_content)
+                except json.JSONDecodeError as error:
+                    last_error = error
+                    if attempt < configured_attempts:
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": response_content[:2000],
+                            }
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Your previous response was not strict valid JSON "
+                                    "accepted by JSON.parse/json.loads. Return the "
+                                    "complete JSON object again. Do not use trailing "
+                                    "commas, comments, Markdown, or extra text."
+                                ),
+                            }
+                        )
+                        wait_before_retry(attempt)
+                        continue
                     raise JsonClientTransportError(
-                        "provider JSON result must be an object"
-                    )
-                return dict(result)
+                        "provider returned malformed JSON content"
+                    ) from error
+                return result
             except JsonClientConfigurationError:
                 raise
             except JsonClientTransportError:

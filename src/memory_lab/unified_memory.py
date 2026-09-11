@@ -47,7 +47,7 @@ RELATION_ACTIONS = frozenset(
 )
 
 _USER_CONTRACT_TYPES = frozenset({"user", "preference", "workflow"})
-_EVIDENCE_KINDS = frozenset({"user_message", "assistant_final", "tool_result"})
+_EVIDENCE_KINDS = frozenset({"user_message", "user_answer", "assistant_final", "tool_result"})
 _SCOPE_LEVELS = frozenset({"global", "domain", "project", "cross_project", "session"})
 _KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,7}$")
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,255}$")
@@ -352,8 +352,8 @@ def _normalize_evidence(value: MemoryEvidence | Mapping[str, Any]) -> MemoryEvid
         _safe_identifier(item.session_id, "evidence.session_id")
     if not isinstance(item.explicit, bool) or not isinstance(item.verified, bool):
         raise _error("invalid_evidence", "evidence flags must be booleans")
-    if item.explicit and item.source_kind != "user_message":
-        raise _error("invalid_evidence", "only user-message evidence may be explicit")
+    if item.explicit and item.source_kind not in {"user_message", "user_answer"}:
+        raise _error("invalid_evidence", "only explicit user evidence may be explicit")
     if item.verified and item.source_kind != "tool_result":
         raise _error("invalid_evidence", "only tool-result evidence may be verified")
     return item
@@ -495,7 +495,8 @@ def validate_memory_candidate(
     if trust_status not in TRUST_STATUSES:
         raise _error("invalid_trust_status", "trust_status is unsupported")
     if trust_status == "declared" and not any(
-        item.source_kind == "user_message" and item.explicit for item in cited_evidence
+        item.source_kind in {"user_message", "user_answer"} and item.explicit
+        for item in cited_evidence
     ):
         raise _error("invalid_trust_status", "declared memory requires explicit user evidence")
     if trust_status == "observed" and not any(
@@ -623,10 +624,92 @@ def _latest_explicit_user_evidence(
         catalog[reference]
         for reference in candidate.get("evidence_refs", [])
         if reference in catalog
-        and catalog[reference].source_kind == "user_message"
+        and catalog[reference].source_kind in {"user_message", "user_answer"}
         and catalog[reference].explicit
     ]
     return max(matches, key=lambda item: item.source_order) if matches else None
+
+
+def _statement_text(candidate: Mapping[str, Any]) -> str:
+    content = candidate.get("content")
+    if isinstance(content, Mapping):
+        value = content.get("statement")
+        if isinstance(value, str):
+            return value
+    value = candidate.get("summary")
+    return value if isinstance(value, str) else ""
+
+
+def _meaning_outcomes(text: str) -> set[str]:
+    folded = text.casefold()
+    outcomes: set[str] = set()
+    if any(
+        marker in folded
+        for marker in ("success", "succeeded", "通过", "成功", "0 error", "0 错误")
+    ):
+        outcomes.add("success")
+    if any(
+        marker in folded
+        for marker in ("failed", "failure", "失败", "错误", "error")
+    ) and not any(marker in folded for marker in ("0 error", "0 错误")):
+        outcomes.add("failure")
+    return outcomes
+
+
+def _anchor_tokens(text: str) -> set[str]:
+    folded = text.casefold()
+    replacements = {
+        "错误": " error ",
+        "警告": " warning ",
+        "成功": " success ",
+        "通过": " success ",
+        "失败": " failure ",
+        "编译": " compile ",
+    }
+    for old, new in replacements.items():
+        folded = folded.replace(old, new)
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]+", folded)
+        if len(token) >= 2
+        and token
+        not in {
+            "the",
+            "and",
+            "with",
+            "in",
+            "a",
+            "an",
+            "to",
+            "of",
+            "is",
+            "are",
+            "for",
+            "项目",
+        }
+    }
+
+
+def _looks_like_language_rewrite(
+    existing: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> bool:
+    old_text = _statement_text(existing)
+    new_text = _statement_text(incoming)
+    if not old_text or not new_text or old_text == new_text:
+        return False
+    old_outcomes = _meaning_outcomes(old_text)
+    new_outcomes = _meaning_outcomes(new_text)
+    if old_outcomes and new_outcomes and old_outcomes != new_outcomes:
+        return False
+    old_tokens = _anchor_tokens(old_text)
+    new_tokens = _anchor_tokens(new_text)
+    if not old_tokens or not new_tokens:
+        return False
+    shared = old_tokens & new_tokens
+    # Strong technical overlap: stable_key/scope/type already matched before
+    # this helper is called, so a few shared anchors are enough to treat an
+    # English/Chinese restatement as a revision rather than a contradiction.
+    return len(shared) >= 3 or len(shared) / max(1, min(len(old_tokens), len(new_tokens))) >= 0.5
 
 
 def decide_memory_relation(
@@ -680,6 +763,13 @@ def decide_memory_relation(
             "action": "merge_evidence",
             "latest_wins": False,
             "reason": "same_reusable_meaning",
+        }
+    if _looks_like_language_rewrite(existing, incoming):
+        return {
+            "relation": "language_rewrite",
+            "action": "revise",
+            "latest_wins": False,
+            "reason": "same_meaning_language_rewrite",
         }
     if existing["type"] in _USER_CONTRACT_TYPES:
         old_evidence = _latest_explicit_user_evidence(existing, catalog)

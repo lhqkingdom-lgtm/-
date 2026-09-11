@@ -199,7 +199,7 @@ def _pending_turns(
                 SELECT t.turn_id, t.user_timestamp, t.current_state
                 FROM conversation_turn AS t
                 WHERE t.source_id = ?
-                  AND t.current_state IN ('completed', 'failed')
+                  AND t.current_state IN ('completed', 'failed', 'interrupted')
                   AND NOT EXISTS (
                       SELECT 1 FROM unified_processed_turn AS p
                       WHERE p.source_id = t.source_id AND p.turn_id = t.turn_id
@@ -624,7 +624,14 @@ def _finish_run(
 
 def _safe_failure(error: Exception) -> tuple[str, str]:
     # Provider exceptions can contain prompts, local paths, or credentials.
-    # The exception class is enough for an actionable local audit.
+    # Keep only bounded local validator messages for actionable audits.
+    message = str(error).replace("\n", " ").strip()
+    if type(error).__name__ in {
+        "UnifiedOutputError",
+        "UnifiedInputError",
+        "UnifiedTransportError",
+    } and message:
+        return type(error).__name__[:120], message[:500]
     return type(error).__name__[:120], "unified_cycle_stage_failed"
 
 

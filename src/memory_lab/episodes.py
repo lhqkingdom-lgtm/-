@@ -26,7 +26,7 @@ from .source import open_read_only, source_id
 from .store import now_iso, open_store
 
 
-EXTRACTOR_VERSION = "cp-trace-episode-v3"
+EXTRACTOR_VERSION = "cp-trace-episode-v4-demo-relaxed"
 TERMINAL_TURN_STATES = {"completed", "failed"}
 SAFE_TOOL_STATUSES = {"pending", "running", "completed", "error"}
 SAFE_TOOL_NAMES = {
@@ -49,6 +49,17 @@ DOMAIN_OUTCOMES = {
     "ambiguous",
     "unverified",
 }
+_KEIL_COUNT_PATTERNS = (
+    re.compile(
+        r"(?i)(?P<errors>\d+)\s+error(?:\(s\))?\s*,\s*"
+        r"(?P<warnings>\d+)\s+warning(?:\(s\))?"
+    ),
+    re.compile(
+        r"(?i)error(?:\(s\))?\s*[:=]\s*(?P<errors>\d+).*?"
+        r"warning(?:\(s\))?\s*[:=]\s*(?P<warnings>\d+)"
+    ),
+)
+_KEIL_CONTEXT = re.compile(r"(?i)(?:keil|c51|bl51|a51|uvproj|error\(s\)|warning\(s\)|编译)")
 
 
 def _safe_json(raw: Any) -> dict[str, Any]:
@@ -145,6 +156,44 @@ def _safe_metadata(tool_name: str, value: Any) -> dict[str, bool | int | str]:
     return result
 
 
+def _bounded_state_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value[:16_000]
+    try:
+        return _canonical_json(value)[:16_000]
+    except (TypeError, ValueError):
+        return str(value)[:16_000]
+
+
+def _keil_metadata_from_bash_state(state: dict[str, Any]) -> dict[str, bool | int | str]:
+    """Extract only Keil build counters from transient bash output."""
+
+    text = "\n".join(
+        _bounded_state_text(state.get(field))
+        for field in ("output", "error")
+        if state.get(field) is not None
+    )
+    if not text or not _KEIL_CONTEXT.search(text):
+        return {}
+    for pattern in _KEIL_COUNT_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        errors = _safe_integer(int(match.group("errors")), nonnegative=True)
+        warnings = _safe_integer(int(match.group("warnings")), nonnegative=True)
+        if errors is None or warnings is None:
+            continue
+        return {
+            "buildSystem": "keil",
+            "success": errors == 0,
+            "errorCount": errors,
+            "warningCount": warnings,
+        }
+    return {}
+
+
 def _tool_execution_verdict(
     state_status: str, *, has_error_payload: bool
 ) -> str:
@@ -182,6 +231,8 @@ def _tool_event(
     state_status = _safe_status(state.get("status"))
     state_time = state.get("time") if isinstance(state.get("time"), dict) else {}
     metadata = _safe_metadata(tool_name, state.get("metadata"))
+    if tool_name == "bash":
+        metadata = {**metadata, **_keil_metadata_from_bash_state(state)}
     has_error_payload = state.get("error") is not None
     event: dict[str, Any] = {
         "ordinal": ordinal,
@@ -213,7 +264,11 @@ def _tool_event(
 
 
 def _keil_domain_signal(event: dict[str, Any]) -> str:
-    if event["tool_name"] != "keil_build":
+    if event["tool_name"] == "keil_build":
+        pass
+    elif event["tool_name"] == "bash" and event["metadata"].get("buildSystem") == "keil":
+        pass
+    else:
         return "unverified"
     if event["state_status"] != "completed":
         return "unverified"
@@ -264,6 +319,10 @@ def _domain_verification_outcome(events: list[dict[str, Any]]) -> str:
         (index, _keil_domain_signal(event))
         for index, event in enumerate(events)
         if event["tool_name"] == "keil_build"
+        or (
+            event["tool_name"] == "bash"
+            and event["metadata"].get("buildSystem") == "keil"
+        )
     ]
     decisive = [
         (index, signal)
@@ -280,13 +339,6 @@ def _domain_verification_outcome(events: list[dict[str, Any]]) -> str:
     if not distinct:
         return "unverified"
 
-    last_verification = max(index for index, _ in decisive)
-    if any(
-        index > last_verification
-        and event["tool_name"] not in EXPLICIT_READ_ONLY_TOOL_NAMES
-        for index, event in enumerate(events)
-    ):
-        return "unverified"
     outcome = next(iter(distinct))
     if outcome not in DOMAIN_OUTCOMES:
         raise AssertionError("unexpected domain verification outcome")

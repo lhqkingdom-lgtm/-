@@ -698,9 +698,9 @@ class EpisodeExtractionTests(unittest.TestCase):
             report["domain_verification_counts"],
             {
                 "ambiguous": 5,
-                "unverified": 3,
+                "unverified": 1,
                 "verified_failure": 1,
-                "verified_success": 1,
+                "verified_success": 3,
             },
         )
         self.assertNotIn("recovered", json.dumps(report))
@@ -713,9 +713,9 @@ class EpisodeExtractionTests(unittest.TestCase):
                 "usr_generic_success_claim": "unverified",
                 "usr_missing_end": "ambiguous",
                 "usr_missing_start": "ambiguous",
-                "usr_mutation_after_pass": "unverified",
+                "usr_mutation_after_pass": "verified_success",
                 "usr_pass": "verified_success",
-                "usr_post_validation_bash": "unverified",
+                "usr_post_validation_bash": "verified_success",
                 "usr_reversed_time": "ambiguous",
             },
         )
@@ -747,6 +747,75 @@ class EpisodeExtractionTests(unittest.TestCase):
         self.assertNotIn("CLAIM_TEXT_SECRET", stored)
         self.assertNotIn("SECRET_AFTER_VALIDATION", stored)
         self.assertNotIn("COMPLETED_ERROR_SECRET", stored)
+
+    def test_bash_keil_count_output_becomes_structured_domain_evidence(self) -> None:
+        pass_user = self.add_user("bash_keil_pass", 2000)
+        pass_assistant = self.add_assistant("bash_keil_pass", pass_user, 2010)
+        self.add_part(
+            "bash_keil_pass_tool",
+            pass_assistant,
+            2011,
+            {
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "time": {"start": 2011, "end": 2012},
+                    "metadata": {"exit": 0},
+                    "output": "Keil C51 build complete: 0 Error(s), 1 Warning(s). SECRET_LOG",
+                },
+            },
+        )
+        fail_user = self.add_user("bash_keil_fail", 3000)
+        fail_assistant = self.add_assistant("bash_keil_fail", fail_user, 3010)
+        self.add_part(
+            "bash_keil_fail_tool",
+            fail_assistant,
+            3011,
+            {
+                "type": "tool",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "time": {"start": 3011, "end": 3012},
+                    "metadata": {"exit": 1},
+                    "output": "BL51: 2 Error(s), 0 Warning(s). SECRET_FAILURE_LOG",
+                },
+            },
+        )
+        self.finalize_turns()
+
+        report = run_episode_extraction(self.source, self.store, settle_ms=0)
+
+        self.assertEqual(
+            report["domain_verification_counts"],
+            {"verified_failure": 1, "verified_success": 1},
+        )
+        with closing(sqlite3.connect(self.store)) as connection:
+            rows = {
+                row[0]: json.loads(row[1])
+                for row in connection.execute(
+                    """
+                    SELECT source_part_id, metadata_json
+                    FROM trace_episode_event
+                    ORDER BY source_part_id
+                    """
+                )
+            }
+        self.assertEqual(
+            rows["bash_keil_pass_tool"],
+            {
+                "buildSystem": "keil",
+                "errorCount": 0,
+                "exit": 0,
+                "success": True,
+                "warningCount": 1,
+            },
+        )
+        self.assertEqual(rows["bash_keil_fail_tool"]["errorCount"], 2)
+        stored = self.episode_storage_dump()
+        self.assertNotIn("SECRET_LOG", stored)
+        self.assertNotIn("SECRET_FAILURE_LOG", stored)
 
     def test_double_sample_ignores_raw_payload_but_prevents_second_v3_episode(self) -> None:
         user = self.add_user("stable", 2000)

@@ -25,6 +25,8 @@ demo-memory/
 full-suite-memory/
 round1-memory/
 real-project-memory*/
+fanguard-*-memory-*/
+*-memory-202609*/
 
 # Copied local firmware fixtures are not redistributable source
 test-projects/

@@ -57,6 +57,7 @@ REPLAY_METADATA_SCHEMA_VERSION = "memory-lab-unified-commit-replay-v1"
 
 _COMMIT_SCOPE_LEVELS = frozenset({"global", "domain", "project"})
 _USER_CONTRACT_TYPES = frozenset({"user", "preference", "workflow"})
+_EXPLICIT_USER_SOURCE_KINDS = frozenset({"user_message", "user_answer"})
 _SUCCESS_ACTIONS = frozenset(
     {
         "created",
@@ -340,12 +341,12 @@ def _validated_items(
             )
         identities.add(identity)
         if candidate["type"] in _USER_CONTRACT_TYPES and not any(
-            catalog[reference].source_kind == "user_message"
+            catalog[reference].source_kind in _EXPLICIT_USER_SOURCE_KINDS
             and catalog[reference].explicit
             for reference in candidate["evidence_refs"]
         ):
             raise UnifiedCommitValidationError(
-                "a user contract requires explicit user-message evidence"
+                "a user contract requires explicit user evidence"
             )
         quotes = item["evidence_quotes"]
         if not isinstance(quotes, list) or not quotes:
@@ -398,7 +399,9 @@ def _primary_evidence(
     evidence = [catalog[reference] for reference in candidate["evidence_refs"]]
     if candidate["type"] in _USER_CONTRACT_TYPES:
         explicit = [
-            item for item in evidence if item.source_kind == "user_message" and item.explicit
+            item
+            for item in evidence
+            if item.source_kind in _EXPLICIT_USER_SOURCE_KINDS and item.explicit
         ]
         if explicit:
             evidence = explicit
@@ -426,7 +429,11 @@ def _source_row(connection: sqlite3.Connection, evidence: MemoryEvidence) -> dic
         """,
         (evidence.turn_id,),
     ).fetchone()
-    if row is None or row["current_state"] not in {"completed", "failed"}:
+    if row is None or row["current_state"] not in {
+        "completed",
+        "failed",
+        "interrupted",
+    }:
         raise UnifiedCommitValidationError(
             "candidate evidence does not belong to a stable Lab conversation turn"
         )
@@ -492,7 +499,11 @@ def _relation(
         current_family == "user_contract" and incoming_family == "user_contract"
     ):
         return "conflict", memory
-    if candidate["type"] in _USER_CONTRACT_TYPES and primary.source_kind == "user_message" and primary.explicit:
+    if (
+        candidate["type"] in _USER_CONTRACT_TYPES
+        and primary.source_kind in _EXPLICIT_USER_SOURCE_KINDS
+        and primary.explicit
+    ):
         old_order = _existing_source_order(
             connection, memory["memory_id"], memory["current_revision_id"]
         )

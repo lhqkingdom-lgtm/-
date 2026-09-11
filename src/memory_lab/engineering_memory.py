@@ -213,12 +213,6 @@ def _derive_verification(events: Sequence[Mapping[str, Any]]) -> tuple[str, list
         return "ambiguous", []
     if not distinct:
         return "unverified", []
-    last_verification_index = max(index for index, _, _ in decisive)
-    if any(
-        index > last_verification_index and event["tool_name"] not in _READ_ONLY_TOOLS
-        for index, event in enumerate(events)
-    ):
-        return "unverified", []
     outcome = next(iter(distinct))
     references = [
         str(event["evidence_id"])

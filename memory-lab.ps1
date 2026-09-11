@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -69,6 +69,9 @@ param(
 
     [switch]$ModelRouter,
 
+    [ValidateSet('all', 'core', 'candidate', 'pointer', 'router')]
+    [string]$EvidenceLayer = 'all',
+
     [switch]$Refresh,
 
     [switch]$DryRun
@@ -98,6 +101,20 @@ try {
     $env:PYTHONPATH = $SourceDirectory
     if ($Command -in @('turns', 'episodes')) {
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase $Command --settle-ms $SettleMilliseconds
+    }
+    elseif ($Command -eq 'turn-phases') {
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase $Command --settle-ms $SettleMilliseconds --limit $Limit
+    }
+    elseif ($Command -eq 'evidence-pools') {
+        $EvidenceArguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--settle-ms', $SettleMilliseconds, '--limit', $Limit,
+            '--config', $ConfigPath, '--layer', $EvidenceLayer
+        )
+        if ($ModelRouter) {
+            $EvidenceArguments += '--model-router'
+        }
+        & $PythonExecutable @EvidenceArguments
     }
     elseif ($Command -eq 'review') {
         if (-not $ProposalId -or -not $ReviewOutcome -or -not $Reviewer) {

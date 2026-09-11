@@ -82,6 +82,57 @@ class JsonClientTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(sleeps, [0.0])
 
+    def test_repairs_trailing_comma_without_changing_content(self) -> None:
+        malformed = json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '```json\n{"ok":true,}\n```'},
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        client = OpenAICompatibleJsonClient(
+            base_url="http://localhost:8000",
+            model="x",
+            transport=lambda *_args: malformed,
+        )
+        self.assertEqual(
+            client.complete_json(system_prompt="json", user_payload="{}"),
+            {"ok": True},
+        )
+
+    def test_repairs_common_misnested_candidate_content(self) -> None:
+        content = (
+            '{"content":{"statement":"保持原句","evidence":[{"evidence_ref":"e1",'
+            '"quote":"q"}],"action_hint":{"kind":"create_or_match"}}}'
+        )
+        malformed = json.dumps(
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": content},
+                    }
+                ]
+            }
+        ).encode("utf-8")
+        client = OpenAICompatibleJsonClient(
+            base_url="http://localhost:8000",
+            model="x",
+            transport=lambda *_args: malformed,
+        )
+        self.assertEqual(
+            client.complete_json(system_prompt="json", user_payload="{}"),
+            {
+                "content": {"statement": "保持原句"},
+                "status": "active",
+                "evidence": [{"evidence_ref": "e1", "quote": "q"}],
+                "action_hint": {"kind": "create_or_match"},
+            },
+        )
+
     def test_unsafe_endpoints_and_secret_payload_fail_before_transport(self) -> None:
         called = []
         client = OpenAICompatibleJsonClient(

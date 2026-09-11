@@ -64,6 +64,7 @@ def turn_bundle(
                 }
             ],
         },
+        "user_answers": [],
         "assistant": {
             "message_id": f"assistant-{suffix}",
             "text_parts": [
@@ -107,6 +108,54 @@ def tool_part(suffix: str = "a") -> dict:
             "text": None,
             "truncated": False,
             "sanitized_hash": "error-hash",
+        },
+    }
+
+
+def user_answer_part(suffix: str = "a") -> dict:
+    return {
+        "ordinal": 1001,
+        "message_ordinal": 1,
+        "source_message_id": f"assistant-{suffix}",
+        "source_part_id": f"question-part-{suffix}:answer:1",
+        "occurred_at_ms": 1010,
+        "text": (
+            'selected_answers=["基于现有工程二次开发"]\n'
+            'question_header="工程方式"\n'
+            'question="希望以现有工程为基础还是新建工程？"'
+        ),
+        "truncated": False,
+        "sanitized_hash": "answer-hash",
+    }
+
+
+def question_tool_part(suffix: str = "a") -> dict:
+    return {
+        "ordinal": 2,
+        "message_ordinal": 1,
+        "part_ordinal": 2,
+        "assistant_part_ordinal": 2,
+        "source_message_id": f"assistant-{suffix}",
+        "source_part_id": f"question-part-{suffix}",
+        "name": "question",
+        "status": "completed",
+        "input": {
+            "present": True,
+            "text": '{"questions":[{"question":"希望以现有工程为基础还是新建工程？"}]}',
+            "truncated": False,
+            "sanitized_hash": "question-input-hash",
+        },
+        "output": {
+            "present": True,
+            "text": "User selected 基于现有工程二次开发",
+            "truncated": False,
+            "sanitized_hash": "question-output-hash",
+        },
+        "error": {
+            "present": False,
+            "text": None,
+            "truncated": False,
+            "sanitized_hash": "question-error-hash",
         },
     }
 
@@ -198,6 +247,60 @@ class UnifiedModelTests(unittest.TestCase):
         self.assertEqual(len(plan["evidence_catalog"]), 1)
         self.assertEqual(plan["evidence_catalog"][0]["turn_id"], "turn-a")
         self.assertEqual(plan["evidence_catalog"][0]["occurred_at_ms"], 1000)
+
+    def test_user_answer_is_visible_as_explicit_user_evidence(self) -> None:
+        bundle = turn_bundle(
+            user_text="我要开发 MJ60B 温控风扇控制器。",
+            assistant_text="已完成需求对齐。",
+        )
+        bundle["user_answers"] = [user_answer_part()]
+
+        def answer_candidate(request: dict) -> dict:
+            answer_index = next(
+                index
+                for index, item in enumerate(request["turns"][0]["observations"])
+                if item["source_type"] == "user_answer"
+            )
+            return candidate_output(
+                request,
+                observation_index=answer_index,
+                stable_key="project.development_mode",
+                memory_type="project",
+                scope={
+                    "level": "project",
+                    "project_refs": ["project_1"],
+                    "session_refs": [],
+                    "domain": None,
+                },
+                trust_status="declared",
+                summary="当前项目基于现有工程二次开发",
+            )
+
+        client = FakeClient(answer_candidate)
+        plan = DeepSeekUnifiedMemoryPlanner(client).plan(bundle)
+
+        observations = client.calls[0]["user_payload"]["turns"][0]["observations"]
+        self.assertIn("user_answer", {item["source_type"] for item in observations})
+        memory = plan["candidates"][0]["memory"]
+        self.assertEqual(memory["trust_status"], "declared")
+        self.assertEqual(plan["evidence_catalog"][0]["source_kind"], "user_answer")
+        self.assertTrue(plan["evidence_catalog"][0]["explicit"])
+
+    def test_question_tool_payload_is_omitted_when_user_answer_exists(self) -> None:
+        bundle = turn_bundle(
+            user_text="我要开发 MJ60B 温控风扇控制器。",
+            assistant_text="已完成需求对齐。",
+            tools=[question_tool_part()],
+        )
+        bundle["user_answers"] = [user_answer_part()]
+
+        client = FakeClient(empty_output)
+        DeepSeekUnifiedMemoryPlanner(client).plan(bundle)
+
+        observations = client.calls[0]["user_payload"]["turns"][0]["observations"]
+        self.assertIn("user_answer", {item["source_type"] for item in observations})
+        self.assertNotIn("tool_result", {item["source_type"] for item in observations})
+        self.assertNotIn("User selected 基于现有工程二次开发", json.dumps(observations, ensure_ascii=False))
 
     def test_request_redacts_secrets_paths_and_excludes_thinking(self) -> None:
         bundle = turn_bundle(
@@ -312,7 +415,7 @@ class UnifiedModelTests(unittest.TestCase):
         self.assertEqual(request["policy"]["memory_statuses"], ["active"])
         self.assertEqual(
             request["policy"]["trust_statuses"],
-            ["contested", "declared", "observed", "unverified"],
+            ["contested", "declared", "observed", "unverified", "verified"],
         )
         candidate_schema = request["output_json_schema"]["candidates"][0]
         self.assertEqual(candidate_schema["scope"]["level"], "global|domain|project")
@@ -495,8 +598,11 @@ class UnifiedModelTests(unittest.TestCase):
 
     def test_global_scope_requires_explicit_global_user_words(self) -> None:
         bundle = turn_bundle(user_text="回复时先给结论。")
-        with self.assertRaisesRegex(UnifiedOutputError, "global scope lacks"):
-            DeepSeekUnifiedMemoryPlanner(FakeClient(candidate_output)).plan(bundle)
+        plan = DeepSeekUnifiedMemoryPlanner(FakeClient(candidate_output)).plan(bundle)
+        self.assertEqual(
+            plan["candidates"][0]["memory"]["scope"],
+            {"level": "project", "project_key": "project-a"},
+        )
 
     def test_model_extra_fields_and_transport_failure_fail_closed(self) -> None:
         def extra(request):
@@ -518,9 +624,11 @@ class UnifiedModelTests(unittest.TestCase):
         class OnceInvalidClient:
             def __init__(self):
                 self.calls = 0
+                self.payloads = []
 
             def complete_json(self, **kwargs):
                 self.calls += 1
+                self.payloads.append(kwargs["user_payload"])
                 result = candidate_output(kwargs["user_payload"])
                 if self.calls == 1:
                     result["unexpected"] = True
@@ -530,6 +638,52 @@ class UnifiedModelTests(unittest.TestCase):
         plan = DeepSeekUnifiedMemoryPlanner(client).plan(turn_bundle())
         self.assertEqual(client.calls, 2)
         self.assertEqual(plan["candidate_count"], 1)
+        self.assertNotIn("validation_feedback", client.payloads[0])
+        feedback = client.payloads[1]["validation_feedback"]
+        self.assertEqual(feedback["attempt"], 2)
+        self.assertEqual(feedback["previous_output"], "rejected_by_local_validator")
+        self.assertEqual(feedback["error_code"], "schema_validation_failed")
+        self.assertEqual(
+            client.payloads[0]["request_id"], client.payloads[1]["request_id"]
+        )
+
+    def test_writer_downgrades_evidence_bound_trust_without_weakening_it(self) -> None:
+        class TrustRepairClient:
+            def __init__(self):
+                self.calls = []
+
+            def complete_json(self, **kwargs):
+                request = kwargs["user_payload"]
+                self.calls.append(request)
+                assistant_index = next(
+                    index
+                    for index, item in enumerate(request["turns"][0]["observations"])
+                    if item["source_type"] == "assistant_final"
+                )
+                return candidate_output(
+                    request,
+                    observation_index=assistant_index,
+                    stable_key="project.response.summary",
+                    memory_type="project",
+                    scope={
+                        "level": "project",
+                        "project_refs": ["project_1"],
+                        "session_refs": [],
+                        "domain": None,
+                    },
+                    trust_status=(
+                        "declared"
+                        if "validation_feedback" not in request
+                        else "unverified"
+                    ),
+                )
+
+        client = TrustRepairClient()
+        plan = DeepSeekUnifiedMemoryPlanner(client).plan(turn_bundle())
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            plan["candidates"][0]["memory"]["trust_status"], "unverified"
+        )
 
     def test_verified_claim_cannot_be_created_from_unverified_tool_status(self) -> None:
         def responder(request):
@@ -552,7 +706,7 @@ class UnifiedModelTests(unittest.TestCase):
                 trust_status="verified",
             )
 
-        with self.assertRaisesRegex(UnifiedOutputError, "trust_status is unsupported"):
+        with self.assertRaisesRegex(UnifiedOutputError, "invalid_trust_status"):
             DeepSeekUnifiedMemoryPlanner(FakeClient(responder)).plan(
                 turn_bundle(tools=[tool_part()])
             )
