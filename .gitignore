@@ -11,6 +11,9 @@ memory-lab.secrets*.json
 
 # Runtime databases and SQLite sidecars
 data/
+pgdata/
+exports/
+pg-memory-lab.local.json
 *.db
 *.db-shm
 *.db-wal

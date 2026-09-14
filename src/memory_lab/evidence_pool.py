@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
@@ -121,6 +122,210 @@ def _clip(text: str, limit: int) -> str:
     return text[: max(1, limit - 1)] + "…"
 
 
+def _display_path(value: str) -> str:
+    value = str(value or "").replace("\\", "/")
+    for marker in ("<WORKSPACE>/", "<ABS_PATH>/", "<WORKSPACE>", "<ABS_PATH>"):
+        value = value.replace(marker, "")
+    return value.rsplit("/", 1)[-1] if "/" in value else value
+
+
+def _clean_display_text(value: str) -> str:
+    text = str(value or "")
+    replacements = {
+        "<WORKSPACE>/": "",
+        "<ABS_PATH>/": "",
+        "<WORKSPACE>": "",
+        "<ABS_PATH>": "",
+        "\\n": " ",
+        "\\r": " ",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return _clip(text, 10_000)
+
+
+def _quoted_field(text: str, name: str) -> str | None:
+    match = re.search(rf'{re.escape(name)}="([^"]*)"', text)
+    return match.group(1) if match else None
+
+
+def _json_string_field(text: str, name: str) -> str | None:
+    match = re.search(rf'"{re.escape(name)}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if not match:
+        return None
+    try:
+        return json.loads(f'"{match.group(1)}"')
+    except json.JSONDecodeError:
+        return match.group(1)
+
+
+def _extract_file_path(text: str) -> str | None:
+    for pattern in (
+        r'"filePath"\s*:\s*"([^"]+)"',
+        r'"project_path"\s*:\s*"([^"]+)"',
+        r"<path>(.*?)</path>",
+        r"filePath='([^']+)'",
+    ):
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return _display_path(match.group(1))
+    return None
+
+
+def _extract_command(text: str) -> str | None:
+    match = re.search(r'"command"\s*:\s*"([^"]+)"', text)
+    if match:
+        return _clip(match.group(1), 120)
+    return None
+
+
+def _extract_function_names(text: str, *, limit: int = 5) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"\b(?:void|char|int|long|short|unsigned\s+int|signed\s+int|bit|sbit|static\s+void|static\s+unsigned\s+int)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        text,
+    ):
+        name = match.group(1)
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _extract_key_points(text: str, *, limit: int = 5) -> list[str]:
+    lower = text.casefold()
+    points: list[str] = []
+    if "return 2048" in lower:
+        points.append("固定返回 2048（return 2048）")
+    for label, pattern in (("编译错误", r"\b(?:error|ERROR)\s+[A-Z]?\d+"), ("编译警告", r"\b(?:warning|WARNING)\s+[A-Z]?\d+")):
+        for match in re.finditer(pattern, text):
+            token = match.group(0).strip()
+            value = f"{label}：{token}"
+            if value not in points:
+                points.append(value)
+            break
+    checks = (
+        ("硬件桩/人工必须替换", "桩" in text or "人工必须替换" in text),
+        ("编译 0 Error / 0 Warning", ("0 error" in lower or "0 errors" in lower) and ("0 warning" in lower or "0 warnings" in lower)),
+        ("涉及 ADC 采样", "adc" in lower or "adc_sample" in lower),
+        ("涉及 PWM 输出", "pwm" in lower),
+        ("涉及 NTC 温度输入", "ntc" in lower),
+        ("涉及失效安全/报警", "fail" in lower or "失效" in text or "报警" in text),
+    )
+    for label, enabled in checks:
+        if enabled and label not in points:
+            points.append(label)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def _candidate_summary(item: Mapping[str, Any], text: str, kind: str) -> str:
+    """Create a human-readable, rule-only candidate summary.
+
+    This deliberately avoids model reasoning.  It removes tool wrapper noise but
+    keeps enough signal for a Writer/Reviewer to decide whether it should ask
+    for the raw pointer.
+    """
+
+    source_type = str(item.get("source_type") or "")
+    if source_type == "user_answer":
+        header = _quoted_field(text, "question_header") or "未命名问题"
+        question = _quoted_field(text, "question")
+        selected = _quoted_field(text, "selected_answers")
+        if not selected:
+            match = re.search(r"selected_answers=\[(.*?)\]", text)
+            selected = match.group(1).strip() if match else None
+        pieces = [f"需求选项：{header}"]
+        if selected:
+            pieces.append(f"用户选择：{_clip(_clean_display_text(selected), 120)}")
+        if question:
+            pieces.append(f"原问题：{_clip(_clean_display_text(question), 160)}")
+        return "；".join(pieces) + "。"
+
+    if source_type != "tool_result":
+        return _clip(text, 260)
+
+    tool = str(item.get("tool_name") or "工具")
+    status = str(item.get("tool_status") or "unknown")
+    path = _extract_file_path(text)
+    command = _extract_command(text)
+    functions = _extract_function_names(text)
+    points = _extract_key_points(text)
+
+    if tool == "read":
+        subject = f"读取文件 {path}" if path else "读取文件/上下文"
+        details: list[str] = []
+        if functions:
+            details.append("发现函数：" + "、".join(functions))
+        if points:
+            details.append("命中重点：" + "、".join(points))
+        if details:
+            return subject + "：" + "；".join(details) + "。"
+        return subject + f"：读取成功，状态 {status}；细节可通过原始指针回查。"
+
+    if tool in {"write", "edit"}:
+        action = "写入" if tool == "write" else "修改"
+        target = f" {path}" if path else ""
+        details = "；".join(points) if points else "保存了文件变更"
+        return f"{action}文件{target}：{details}；完整 diff/内容通过原始指针回查。"
+
+    if tool in {"glob", "grep"}:
+        pattern = _quoted_field(text, "pattern")
+        sample_paths = [_display_path(match) for match in re.findall(r"([A-Za-z]:/[^\\s\"<>]+|<WORKSPACE>/[^\\s\"<>]+)", text)[:5]]
+        subject = "搜索文件" if tool == "glob" else "检索文本"
+        pieces = [subject]
+        if pattern:
+            pieces.append(f"模式：{pattern}")
+        if sample_paths:
+            pieces.append("样例：" + "、".join(sample_paths))
+        return "；".join(pieces) + "。"
+
+    if tool == "question":
+        header = _quoted_field(text, "header") or "需求问题"
+        question = _quoted_field(text, "question")
+        return f"弹出需求澄清问题：{header}" + (f"；问题：{_clip(question, 180)}。" if question else "。")
+
+    if tool in {"bash", "cmd", "powershell"}:
+        return f"执行命令：{command or _clip(text, 120)}；状态 {status}。"
+
+    if tool == "skill":
+        name = _quoted_field(text, "name")
+        points_text = "；".join(points) if points else "技能内容已折叠"
+        return f"技能上下文{name and f'（{name}）' or ''}：{points_text}；完整内容通过原始指针回查。"
+
+    if "build" in tool.casefold() or _contains_any(text, BUILD_KEYWORDS):
+        points_text = "；".join(points) if points else _clip(text, 180)
+        return f"构建/编译结果：{points_text}。"
+
+    if tool == "task":
+        description = _json_string_field(text, "description") or _quoted_field(text, "description") or "子任务结果"
+        return f"子任务/检索上下文：{description}；完整结果可通过原始指针回查。"
+
+    points_text = "；".join(points) if points else _clip(text, 180)
+    return f"工具结果（{tool}/{status}）：{points_text}。"
+
+
+def _pointer_summary(item: Mapping[str, Any], text: str) -> str:
+    source_type = str(item.get("source_type") or "unknown")
+    message_id = str(item.get("message_id") or "")
+    part_id = str(item.get("pointer_part_id") or item.get("part_id") or "")
+    tool = str(item.get("tool_name") or "")
+    path = _extract_file_path(text)
+    label = source_type
+    if tool:
+        label += f"/{tool}"
+    if path:
+        label += f"/{path}"
+    return (
+        f"原始指针：{label}；message_id={message_id}；part_id={part_id}；"
+        f"预览：{_clip(text, 140)}"
+    )
+
+
 def _text_part_items(bundle: Mapping[str, Any], actor: str) -> list[dict[str, Any]]:
     container = bundle.get(actor)
     if not isinstance(container, Mapping):
@@ -156,12 +361,15 @@ def _user_answer_items(bundle: Mapping[str, Any]) -> list[dict[str, Any]]:
     for index, answer in enumerate(answers):
         if not isinstance(answer, Mapping) or not isinstance(answer.get("text"), str):
             continue
+        source_part_id = str(answer.get("source_part_id") or f"user-answer-{index}")
+        raw_part_id = str(answer.get("raw_source_part_id") or source_part_id.split(":answer:", 1)[0])
         result.append(
             {
                 "source": "user",
                 "source_type": "user_answer",
                 "message_id": str(answer.get("source_message_id") or "unknown-question-message"),
-                "part_id": str(answer.get("source_part_id") or f"user-answer-{index}"),
+                "part_id": source_part_id,
+                "pointer_part_id": raw_part_id,
                 "ordinal": index,
                 "text": answer["text"],
                 "truncated": bool(answer.get("truncated")),
@@ -302,9 +510,9 @@ def build_evidence_pool(
                 "source_type": source_type,
                 "kind": kind,
                 "message_id": item["message_id"],
-                "part_id": item["part_id"],
+                "part_id": item.get("pointer_part_id") or item["part_id"],
                 "ordinal": item["ordinal"],
-                "summary": _clip(text, 180),
+                "summary": _pointer_summary(item, text),
                 "expandable": True,
             }
         )
@@ -340,7 +548,7 @@ def build_evidence_pool(
                     "source": item["source"],
                     "source_type": source_type,
                     "kind": kind,
-                    "summary": _clip(text, 260),
+                    "summary": _candidate_summary(item, text, kind),
                     "raw_pointer_ref": pointer_ref,
                     "expandable": True,
                     "why_candidate": "可能相关但未进入核心证据；保留摘要供模型请求补证据。",

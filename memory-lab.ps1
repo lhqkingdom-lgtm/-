@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-expand-pointer', 'pg-read-memory-detail', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -21,6 +21,8 @@ param(
 
     [string]$ConfigPath = "$PSScriptRoot\memory-lab.config.json",
 
+    [string]$PgConfigPath = "$PSScriptRoot\pg-memory-lab.local.json",
+
     [string]$GoldPath = "$PSScriptRoot\gold\bootstrap_v1.json",
 
     [string]$ReportDirectory = "$PSScriptRoot\reports",
@@ -32,6 +34,16 @@ param(
     [string]$ShadowRunId,
 
     [string]$RunId,
+
+    [string]$TurnId,
+
+    [string]$RawPointerId,
+
+    [ValidateRange(1, 20000)]
+    [int]$MaxChars = 4000,
+
+    [ValidateRange(1, 500)]
+    [int]$MemoryLimit = 80,
 
     [string]$Query,
 
@@ -115,6 +127,48 @@ try {
             $EvidenceArguments += '--model-router'
         }
         & $PythonExecutable @EvidenceArguments
+    }
+    elseif ($Command -eq 'pg-ingest-turn') {
+        $PgArguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--settle-ms', $SettleMilliseconds, '--pg-config', $PgConfigPath
+        )
+        if ($TurnId) {
+            $PgArguments += @('--turn-id', $TurnId)
+        }
+        & $PythonExecutable @PgArguments
+    }
+    elseif ($Command -eq 'pg-show-turn') {
+        if (-not $TurnId) {
+            throw 'pg-show-turn requires -TurnId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --turn-id $TurnId
+    }
+    elseif ($Command -eq 'pg-quality-report') {
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --limit $Limit
+    }
+    elseif ($Command -eq 'pg-writer-context') {
+        if (-not $TurnId) {
+            throw 'pg-writer-context requires -TurnId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --turn-id $TurnId --memory-limit $MemoryLimit
+    }
+    elseif ($Command -eq 'pg-expand-pointer') {
+        if (-not $RawPointerId) {
+            throw 'pg-expand-pointer requires -RawPointerId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --raw-pointer-id $RawPointerId --max-chars $MaxChars
+    }
+    elseif ($Command -eq 'pg-read-memory-detail') {
+        if (-not $MemoryId) {
+            throw 'pg-read-memory-detail requires -MemoryId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --memory-id $MemoryId
     }
     elseif ($Command -eq 'review') {
         if (-not $ProposalId -or -not $ReviewOutcome -or -not $Reviewer) {

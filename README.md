@@ -1,5 +1,15 @@
 # CodePulse Memory Lab
 
+> 当前最新路线见 [PostgreSQL 轻量长期记忆 MVP 状态](POSTGRES_LIGHT_MEMORY_STATUS.md)。
+>
+> 项目已从早期“完整版本链 + 证据链 + 独立 Reviewer”实验方案，收敛为更贴近 Claude Code 的轻量方案：
+>
+> ```text
+> CP SQLite → turn 三层证据池 → PostgreSQL → 单 Writer → memory_topics / memories → Markdown 投影
+> ```
+>
+> 目前已完成三层证据池、candidate 中文摘要清洗、pointer 回查、轻量 memory 表和 Writer 读取工具；尚未接入 LLM Writer、正式 memory 写入和 Markdown 投影。
+
 CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只把 CodePulse 的 SQLite 会话记录
 作为输入，不修改 CP 源码、不扫描项目文件，也不向 CP 主 Agent 注入记忆。
 

@@ -27,6 +27,15 @@ from .llm_client import OpenAICompatibleJsonClient
 from .markdown_store import run_markdown_preview, run_markdown_recall
 from .model_recall import run_deepseek_formal_recall
 from .phase import run_turn_phase_report
+from .pg_store import (
+    DEFAULT_PG_CONFIG,
+    build_writer_context,
+    expand_pointer,
+    ingest_turn_to_postgres,
+    postgres_quality_report,
+    read_memory_detail,
+    show_postgres_turn,
+)
 from .prepare import prepare_dataset
 from .report import DEFAULT_GOLD, DEFAULT_REPORT_DIRECTORY, generate_shadow_report
 from .shadow import run_deepseek_shadow
@@ -301,6 +310,45 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Call DeepSeek to correct the deterministic rule phase",
     )
+    pg_ingest_turn = subparsers.add_parser(
+        "pg-ingest-turn",
+        help="Persist one CP turn and its three evidence layers into PostgreSQL",
+    )
+    pg_ingest_turn.add_argument("--settle-ms", type=int, default=0)
+    pg_ingest_turn.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_ingest_turn.add_argument("--turn-id")
+    pg_show_turn = subparsers.add_parser(
+        "pg-show-turn",
+        help="Show one PostgreSQL turn with its persisted evidence previews",
+    )
+    pg_show_turn.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_show_turn.add_argument("--turn-id", required=True)
+    pg_quality_report = subparsers.add_parser(
+        "pg-quality-report",
+        help="Evaluate PostgreSQL evidence pool quality and raw pointer traceability",
+    )
+    pg_quality_report.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_quality_report.add_argument("--limit", type=int, default=20)
+    pg_writer_context = subparsers.add_parser(
+        "pg-writer-context",
+        help="Build fixed Writer input from one turn plus lightweight memory index",
+    )
+    pg_writer_context.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_writer_context.add_argument("--turn-id", required=True)
+    pg_writer_context.add_argument("--memory-limit", type=int, default=80)
+    pg_expand_pointer = subparsers.add_parser(
+        "pg-expand-pointer",
+        help="Expand one raw_pointer_id back to the original CP SQLite part",
+    )
+    pg_expand_pointer.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_expand_pointer.add_argument("--raw-pointer-id", required=True)
+    pg_expand_pointer.add_argument("--max-chars", type=int, default=4000)
+    pg_read_memory_detail = subparsers.add_parser(
+        "pg-read-memory-detail",
+        help="Read one lightweight memory with its topic",
+    )
+    pg_read_memory_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_read_memory_detail.add_argument("--memory-id", required=True)
     return parser
 
 
@@ -505,6 +553,43 @@ def main(argv: list[str] | None = None) -> int:
                 limit=args.limit,
                 layer=args.layer,
                 router=router,
+            )
+        elif args.command == "pg-ingest-turn":
+            report = ingest_turn_to_postgres(
+                args.source_db,
+                args.lab_db,
+                pg_config_path=args.pg_config,
+                turn_id=args.turn_id,
+                settle_ms=args.settle_ms,
+            )
+        elif args.command == "pg-show-turn":
+            report = show_postgres_turn(
+                pg_config_path=args.pg_config,
+                turn_id=args.turn_id,
+            )
+        elif args.command == "pg-quality-report":
+            report = postgres_quality_report(
+                args.source_db,
+                pg_config_path=args.pg_config,
+                limit=args.limit,
+            )
+        elif args.command == "pg-writer-context":
+            report = build_writer_context(
+                pg_config_path=args.pg_config,
+                turn_id=args.turn_id,
+                memory_limit=args.memory_limit,
+            )
+        elif args.command == "pg-expand-pointer":
+            report = expand_pointer(
+                args.source_db,
+                pg_config_path=args.pg_config,
+                raw_pointer_id=args.raw_pointer_id,
+                max_chars=args.max_chars,
+            )
+        elif args.command == "pg-read-memory-detail":
+            report = read_memory_detail(
+                pg_config_path=args.pg_config,
+                memory_id=args.memory_id,
             )
         elif args.command in {"baseline", "ingest"}:
             report = run_ingestion(args.source_db, args.lab_db, args.command)

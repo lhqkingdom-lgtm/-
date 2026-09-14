@@ -103,7 +103,8 @@ class EvidencePoolTests(unittest.TestCase):
         self.assertNotIn("WARNING C322", core_text)
         self.assertNotIn("edit completed", core_text)
         self.assertIn("WARNING C322", candidate_text)
-        self.assertIn("edit completed", candidate_text)
+        self.assertIn("修改文件", candidate_text)
+        self.assertIn("0 Error / 0 Warning", candidate_text)
 
     def test_requirement_answers_are_candidates_not_core(self) -> None:
         payload = bundle()

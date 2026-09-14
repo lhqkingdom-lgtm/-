@@ -338,6 +338,7 @@ def _completed_question_user_answers(
                 "message_ordinal": message_ordinal,
                 "source_message_id": source_message_id,
                 "source_part_id": f"{source_part_id}:answer:{question_index}",
+                "raw_source_part_id": source_part_id,
                 "occurred_at_ms": answer_time,
                 **_bounded_text(text, limit, workspace, stats),
             }
@@ -556,6 +557,11 @@ def fit_turn_evidence_to_model_limits(bundle: Mapping[str, Any]) -> dict[str, An
         )
         answer["source_part_id"] = _bounded_model_identity(
             answer.get("source_part_id"), 500, "unknown-question-answer"
+        )
+        answer["raw_source_part_id"] = _bounded_model_identity(
+            answer.get("raw_source_part_id"),
+            500,
+            str(answer["source_part_id"]).split(":answer:", 1)[0],
         )
 
     original_tools = list(tools)
