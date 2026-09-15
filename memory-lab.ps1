@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-expand-pointer', 'pg-read-memory-detail', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-read-topic-detail', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-agent-batch', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -27,6 +27,8 @@ param(
 
     [string]$ReportDirectory = "$PSScriptRoot\reports",
 
+    [string]$AgentLogDirectory,
+
     [string]$MemoryDirectory = "$PSScriptRoot\preview-memory",
 
     [string]$FormalMemoryRoot = "$PSScriptRoot\memory",
@@ -36,6 +38,8 @@ param(
     [string]$RunId,
 
     [string]$TurnId,
+
+    [string[]]$TurnIds,
 
     [string]$RawPointerId,
 
@@ -71,6 +75,8 @@ param(
 
     [string]$MemoryId,
 
+    [string]$TopicId,
+
     [string]$TargetRevisionId,
 
     [string]$Reason,
@@ -83,6 +89,11 @@ param(
 
     [ValidateSet('all', 'core', 'candidate', 'pointer', 'router')]
     [string]$EvidenceLayer = 'all',
+
+    [ValidateSet('core', 'candidate', 'pointer')]
+    [string[]]$Layer,
+
+    [switch]$IncludeInactive,
 
     [switch]$Refresh,
 
@@ -156,6 +167,35 @@ try {
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
             $Command --pg-config $PgConfigPath --turn-id $TurnId --memory-limit $MemoryLimit
     }
+    elseif ($Command -eq 'pg-get-turn-evidence') {
+        if (-not $TurnId) {
+            throw 'pg-get-turn-evidence requires -TurnId'
+        }
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--turn-id', $TurnId, '--max-chars', $MaxChars
+        )
+        foreach ($Item in ($Layer | Where-Object { $_ })) {
+            $Arguments += @('--layer', $Item)
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'pg-list-memory-topics') {
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--limit', $Limit
+        )
+        if ($Domain) {
+            $Arguments += @('--domain', $Domain)
+        }
+        if ($ProjectKey) {
+            $Arguments += @('--project-key', $ProjectKey)
+        }
+        if ($IncludeInactive) {
+            $Arguments += '--include-inactive'
+        }
+        & $PythonExecutable @Arguments
+    }
     elseif ($Command -eq 'pg-expand-pointer') {
         if (-not $RawPointerId) {
             throw 'pg-expand-pointer requires -RawPointerId'
@@ -169,6 +209,93 @@ try {
         }
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
             $Command --pg-config $PgConfigPath --memory-id $MemoryId
+    }
+    elseif ($Command -eq 'pg-read-topic-detail') {
+        if (-not $TopicId) {
+            throw 'pg-read-topic-detail requires -TopicId'
+        }
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--topic-id', $TopicId, '--max-chars', $MaxChars
+        )
+        if ($IncludeInactive) {
+            $Arguments += '--include-inactive'
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'pg-writer-dry-run') {
+        if (-not $TurnId) {
+            throw 'pg-writer-dry-run requires -TurnId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --config $ConfigPath `
+            --turn-id $TurnId --memory-limit $MemoryLimit
+    }
+    elseif ($Command -eq 'pg-commit-plan') {
+        if (-not $PlanPath) {
+            throw 'pg-commit-plan requires -PlanPath'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --plan-path $PlanPath
+    }
+    elseif ($Command -eq 'pg-writer-commit') {
+        if (-not $TurnId) {
+            throw 'pg-writer-commit requires -TurnId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --config $ConfigPath `
+            --turn-id $TurnId --memory-limit $MemoryLimit
+    }
+    elseif ($Command -eq 'pg-validate-memory-changes') {
+        if (-not $PlanPath) {
+            throw 'pg-validate-memory-changes requires -PlanPath'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --plan-path $PlanPath
+    }
+    elseif ($Command -eq 'pg-commit-memory-changes') {
+        if (-not $PlanPath) {
+            throw 'pg-commit-memory-changes requires -PlanPath'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --plan-path $PlanPath
+    }
+    elseif ($Command -eq 'pg-memory-agent-run') {
+        if (-not $TurnId) {
+            throw 'pg-memory-agent-run requires -TurnId'
+        }
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
+            '--turn-id', $TurnId, '--memory-limit', $MemoryLimit
+        )
+        if ($DryRun) {
+            $Arguments += '--dry-run'
+        }
+        if ($AgentLogDirectory) {
+            $Arguments += @('--log-dir', $AgentLogDirectory)
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'pg-memory-agent-batch') {
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
+            '--limit', $Limit, '--memory-limit', $MemoryLimit
+        )
+        foreach ($Item in ($TurnIds | Where-Object { $_ })) {
+            $Arguments += @('--turn-id', $Item)
+        }
+        if ($TurnId) {
+            $Arguments += @('--turn-id', $TurnId)
+        }
+        if ($DryRun) {
+            $Arguments += '--dry-run'
+        }
+        if ($AgentLogDirectory) {
+            $Arguments += @('--log-dir', $AgentLogDirectory)
+        }
+        & $PythonExecutable @Arguments
     }
     elseif ($Command -eq 'review') {
         if (-not $ProposalId -or -not $ReviewOutcome -or -not $Reviewer) {

@@ -25,15 +25,20 @@ from .longitudinal import run_status as longitudinal_status
 from .longitudinal import start_run as start_longitudinal_run
 from .llm_client import OpenAICompatibleJsonClient
 from .markdown_store import run_markdown_preview, run_markdown_recall
+from .memory_changes import commit_memory_changes_file, validate_memory_changes_file
+from .memory_agent import run_memory_agent, run_memory_agent_batch
 from .model_recall import run_deepseek_formal_recall
 from .phase import run_turn_phase_report
 from .pg_store import (
     DEFAULT_PG_CONFIG,
     build_writer_context,
     expand_pointer,
+    get_turn_evidence,
     ingest_turn_to_postgres,
+    list_memory_topics,
     postgres_quality_report,
     read_memory_detail,
+    read_topic_detail,
     show_postgres_turn,
 )
 from .prepare import prepare_dataset
@@ -53,6 +58,8 @@ from .unified_model import (
     DeepSeekUnifiedMemoryPlanner,
     DeepSeekUnifiedMemoryReviewer,
 )
+from .writer_commit import commit_plan_file, run_writer_commit
+from .writer_dry_run import run_writer_dry_run
 
 
 DEFAULT_SOURCE = Path.home() / ".local" / "share" / "codepulse" / "opencode-dev.db"
@@ -336,6 +343,28 @@ def build_parser() -> argparse.ArgumentParser:
     pg_writer_context.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_writer_context.add_argument("--turn-id", required=True)
     pg_writer_context.add_argument("--memory-limit", type=int, default=80)
+    pg_get_turn_evidence = subparsers.add_parser(
+        "pg-get-turn-evidence",
+        help="Read one PostgreSQL turn evidence pool by explicit layers",
+    )
+    pg_get_turn_evidence.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_get_turn_evidence.add_argument("--turn-id", required=True)
+    pg_get_turn_evidence.add_argument(
+        "--layer",
+        action="append",
+        choices=["core", "candidate", "pointer"],
+        help="Evidence layer to include; repeatable. Defaults to all layers.",
+    )
+    pg_get_turn_evidence.add_argument("--max-chars", type=int, default=1200)
+    pg_list_memory_topics = subparsers.add_parser(
+        "pg-list-memory-topics",
+        help="List lightweight memory topic index entries without memory bodies",
+    )
+    pg_list_memory_topics.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_list_memory_topics.add_argument("--domain")
+    pg_list_memory_topics.add_argument("--project-key")
+    pg_list_memory_topics.add_argument("--include-inactive", action="store_true")
+    pg_list_memory_topics.add_argument("--limit", type=int, default=200)
     pg_expand_pointer = subparsers.add_parser(
         "pg-expand-pointer",
         help="Expand one raw_pointer_id back to the original CP SQLite part",
@@ -349,6 +378,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pg_read_memory_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_read_memory_detail.add_argument("--memory-id", required=True)
+    pg_read_topic_detail = subparsers.add_parser(
+        "pg-read-topic-detail",
+        help="Read one lightweight memory topic and its memories",
+    )
+    pg_read_topic_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_read_topic_detail.add_argument("--topic-id", required=True)
+    pg_read_topic_detail.add_argument("--include-inactive", action="store_true")
+    pg_read_topic_detail.add_argument("--max-chars", type=int, default=4000)
+    pg_writer_dry_run = subparsers.add_parser(
+        "pg-writer-dry-run",
+        help="Call the lightweight memory Writer and validate its JSON plan without committing",
+    )
+    pg_writer_dry_run.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_writer_dry_run.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    pg_writer_dry_run.add_argument("--turn-id", required=True)
+    pg_writer_dry_run.add_argument("--memory-limit", type=int, default=80)
+    pg_commit_plan = subparsers.add_parser(
+        "pg-commit-plan",
+        help="Validate and commit one lightweight Writer JSON plan into PostgreSQL",
+    )
+    pg_commit_plan.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_commit_plan.add_argument("--plan-path", type=Path, required=True)
+    pg_writer_commit = subparsers.add_parser(
+        "pg-writer-commit",
+        help="Run lightweight memory Writer and commit the validated JSON plan",
+    )
+    pg_writer_commit.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_writer_commit.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    pg_writer_commit.add_argument("--turn-id", required=True)
+    pg_writer_commit.add_argument("--memory-limit", type=int, default=80)
+    pg_validate_memory_changes = subparsers.add_parser(
+        "pg-validate-memory-changes",
+        help="Validate a multi-change memory proposal without writing PostgreSQL",
+    )
+    pg_validate_memory_changes.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_validate_memory_changes.add_argument("--plan-path", type=Path, required=True)
+    pg_commit_memory_changes = subparsers.add_parser(
+        "pg-commit-memory-changes",
+        help="Validate and commit a multi-change memory proposal with per-change isolation",
+    )
+    pg_commit_memory_changes.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_commit_memory_changes.add_argument("--plan-path", type=Path, required=True)
+    pg_memory_agent_run = subparsers.add_parser(
+        "pg-memory-agent-run",
+        help="Run the first-pass memory maintenance agent for one turn",
+    )
+    pg_memory_agent_run.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_memory_agent_run.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    pg_memory_agent_run.add_argument("--turn-id", required=True)
+    pg_memory_agent_run.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_agent_run.add_argument("--dry-run", action="store_true")
+    pg_memory_agent_run.add_argument("--log-dir", type=Path)
+    pg_memory_agent_batch = subparsers.add_parser(
+        "pg-memory-agent-batch",
+        help="Run the memory maintenance agent over multiple turns",
+    )
+    pg_memory_agent_batch.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_memory_agent_batch.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    pg_memory_agent_batch.add_argument("--turn-id", action="append")
+    pg_memory_agent_batch.add_argument("--limit", type=int, default=5)
+    pg_memory_agent_batch.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_agent_batch.add_argument("--dry-run", action="store_true")
+    pg_memory_agent_batch.add_argument("--log-dir", type=Path)
     return parser
 
 
@@ -579,6 +671,21 @@ def main(argv: list[str] | None = None) -> int:
                 turn_id=args.turn_id,
                 memory_limit=args.memory_limit,
             )
+        elif args.command == "pg-get-turn-evidence":
+            report = get_turn_evidence(
+                pg_config_path=args.pg_config,
+                turn_id=args.turn_id,
+                layers=args.layer,
+                max_chars=args.max_chars,
+            )
+        elif args.command == "pg-list-memory-topics":
+            report = list_memory_topics(
+                pg_config_path=args.pg_config,
+                domain=args.domain,
+                project_key=args.project_key,
+                include_inactive=args.include_inactive,
+                limit=args.limit,
+            )
         elif args.command == "pg-expand-pointer":
             report = expand_pointer(
                 args.source_db,
@@ -590,6 +697,61 @@ def main(argv: list[str] | None = None) -> int:
             report = read_memory_detail(
                 pg_config_path=args.pg_config,
                 memory_id=args.memory_id,
+            )
+        elif args.command == "pg-read-topic-detail":
+            report = read_topic_detail(
+                pg_config_path=args.pg_config,
+                topic_id=args.topic_id,
+                include_inactive=args.include_inactive,
+                max_chars=args.max_chars,
+            )
+        elif args.command == "pg-writer-dry-run":
+            report = run_writer_dry_run(
+                turn_id=args.turn_id,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                memory_limit=args.memory_limit,
+            )
+        elif args.command == "pg-commit-plan":
+            report = commit_plan_file(
+                args.plan_path,
+                pg_config_path=args.pg_config,
+            )
+        elif args.command == "pg-writer-commit":
+            report = run_writer_commit(
+                turn_id=args.turn_id,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                memory_limit=args.memory_limit,
+            )
+        elif args.command == "pg-validate-memory-changes":
+            report = validate_memory_changes_file(
+                args.plan_path,
+                pg_config_path=args.pg_config,
+            )
+        elif args.command == "pg-commit-memory-changes":
+            report = commit_memory_changes_file(
+                args.plan_path,
+                pg_config_path=args.pg_config,
+            )
+        elif args.command == "pg-memory-agent-run":
+            report = run_memory_agent(
+                turn_id=args.turn_id,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                memory_limit=args.memory_limit,
+                dry_run=args.dry_run,
+                log_dir=args.log_dir if args.log_dir else None,
+            )
+        elif args.command == "pg-memory-agent-batch":
+            report = run_memory_agent_batch(
+                turn_ids=args.turn_id,
+                limit=args.limit,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                memory_limit=args.memory_limit,
+                dry_run=args.dry_run,
+                log_dir=args.log_dir if args.log_dir else None,
             )
         elif args.command in {"baseline", "ingest"}:
             report = run_ingestion(args.source_db, args.lab_db, args.command)

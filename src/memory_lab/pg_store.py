@@ -393,6 +393,259 @@ SELECT body::text FROM payload;
     return {"status": "complete", "turn": json.loads(output[start : end + 1])}
 
 
+def get_turn_evidence(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    turn_id: str,
+    layers: list[str] | None = None,
+    max_chars: int = 1200,
+) -> dict[str, Any]:
+    """Read one turn's evidence pool as explicit agent-readable layers."""
+
+    allowed_layers = {"core", "candidate", "pointer"}
+    requested_layers = layers or ["core", "candidate", "pointer"]
+    invalid_layers = [layer for layer in requested_layers if layer not in allowed_layers]
+    if invalid_layers:
+        raise ValueError(f"invalid evidence layers: {invalid_layers}")
+    if not requested_layers:
+        raise ValueError("at least one evidence layer is required")
+    max_chars = max(80, min(int(max_chars), 8000))
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    layer_values = ", ".join(_sql_literal(layer) for layer in requested_layers)
+    empty_arrays = ",\n      ".join(
+        f"{_sql_literal(layer)}, '[]'::jsonb" for layer in requested_layers
+    )
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH selected_turn AS (
+  SELECT *
+  FROM turns
+  WHERE turn_id = {_sql_literal(turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+),
+requested(layer) AS (
+  VALUES {", ".join(f"({_sql_literal(layer)})" for layer in requested_layers)}
+),
+grouped AS (
+  SELECT
+    e.layer,
+    jsonb_agg(
+      jsonb_build_object(
+        'evidence_id', e.evidence_id,
+        'layer', e.layer,
+        'source_type', e.source_type,
+        'kind', e.kind,
+        'raw_pointer_id', e.raw_pointer_id,
+        'message_id', e.message_id,
+        'part_id', e.part_id,
+        'ordinal', e.ordinal,
+        'text', left(e.text_or_summary, {max_chars}),
+        'truncated', length(e.text_or_summary) > {max_chars}
+      )
+      ORDER BY e.ordinal NULLS LAST, e.evidence_id
+    ) AS items
+  FROM evidence_items e
+  JOIN selected_turn t ON t.turn_id = e.turn_id
+  WHERE e.layer IN ({layer_values})
+  GROUP BY e.layer
+),
+payload AS (
+  SELECT jsonb_build_object(
+    'found', true,
+    'turn', jsonb_build_object(
+      'turn_id', t.turn_id,
+      'user_id', t.user_id,
+      'source_id', t.source_id,
+      'project_key', t.project_key,
+      'state', t.state,
+      'rule_phase', t.rule_phase,
+      'final_phase', t.final_phase,
+      'phase_hint', COALESCE(t.final_phase, t.rule_phase),
+      'occurred_at', t.occurred_at
+    ),
+    'requested_layers', to_jsonb(ARRAY[{layer_values}]),
+    'layers', (
+      SELECT jsonb_build_object({empty_arrays}) ||
+             COALESCE(jsonb_object_agg(r.layer, COALESCE(g.items, '[]'::jsonb)), '{{}}'::jsonb)
+      FROM requested r
+      LEFT JOIN grouped g ON g.layer = r.layer
+    )
+  ) AS body
+  FROM selected_turn t
+)
+SELECT COALESCE(
+  (SELECT body FROM payload),
+  jsonb_build_object(
+    'found', false,
+    'turn', null,
+    'requested_layers', to_jsonb(ARRAY[{layer_values}]),
+    'layers', jsonb_build_object({empty_arrays})
+  )
+)::text;
+"""
+    evidence = _json_from_psql_object(config, sql)
+    return {
+        "status": "complete",
+        "tool": "get_turn_evidence",
+        "turn_id": turn_id,
+        "found": bool(evidence.get("found")),
+        "evidence": evidence,
+    }
+
+
+def list_memory_topics(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    domain: str | None = None,
+    project_key: str | None = None,
+    include_inactive: bool = False,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List lightweight memory topic index entries without reading memory bodies."""
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    limit = max(1, min(int(limit), 500))
+    filters = [f"mt.user_id = {_sql_literal(user_id)}"]
+    if not include_inactive:
+        filters.append("mt.status = 'active'")
+    scope_filters = ["mt.scope ->> 'level' = 'global'"]
+    if domain:
+        scope_filters.append(
+            f"(mt.scope ->> 'level' = 'domain' AND mt.scope ->> 'domain' = {_sql_literal(domain)})"
+        )
+    if project_key:
+        scope_filters.append(
+            f"(mt.scope ->> 'level' = 'project' AND mt.scope ->> 'project_key' = {_sql_literal(project_key)})"
+        )
+    if domain or project_key:
+        filters.append("(" + " OR ".join(scope_filters) + ")")
+    where_sql = " AND ".join(filters)
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+SELECT COALESCE(jsonb_agg(
+  jsonb_build_object(
+    'topic_id', mt.topic_id,
+    'topic_key', mt.topic_key,
+    'title', mt.title,
+    'summary', mt.summary,
+    'topic_type', mt.topic_type,
+    'scope', mt.scope,
+    'status', mt.status,
+    'memory_count', (
+      SELECT count(*)
+      FROM memories m
+      WHERE m.topic_id = mt.topic_id
+        AND m.user_id = mt.user_id
+        AND ({'true' if include_inactive else "m.status = 'active'"})
+    ),
+    'created_at', mt.created_at,
+    'updated_at', mt.updated_at
+  )
+  ORDER BY mt.updated_at DESC, mt.topic_key
+), '[]'::jsonb)::text
+FROM (
+  SELECT *
+  FROM memory_topics mt
+  WHERE {where_sql}
+  ORDER BY mt.updated_at DESC, mt.topic_key
+  LIMIT {limit}
+) mt;
+"""
+    topics = _json_from_psql_array(config, sql)
+    return {
+        "status": "complete",
+        "tool": "list_memory_topics",
+        "filters": {
+            "domain": domain,
+            "project_key": project_key,
+            "include_inactive": include_inactive,
+            "limit": limit,
+        },
+        "topics": topics,
+        "count": len(topics),
+    }
+
+
+def read_topic_detail(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    topic_id: str,
+    include_inactive: bool = False,
+    max_chars: int = 4000,
+) -> dict[str, Any]:
+    """Read one topic and its memories after the topic has been selected."""
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    max_chars = max(200, min(int(max_chars), 12000))
+    topic_status_filter = "true" if include_inactive else "mt.status = 'active'"
+    memory_status_filter = "true" if include_inactive else "m.status = 'active'"
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH selected_topic AS (
+  SELECT *
+  FROM memory_topics mt
+  WHERE mt.topic_id = {_sql_literal(topic_id)}
+    AND mt.user_id = {_sql_literal(user_id)}
+    AND {topic_status_filter}
+)
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'topic', jsonb_build_object(
+      'topic_id', mt.topic_id,
+      'topic_key', mt.topic_key,
+      'title', mt.title,
+      'summary', mt.summary,
+      'topic_type', mt.topic_type,
+      'scope', mt.scope,
+      'status', mt.status,
+      'created_at', mt.created_at,
+      'updated_at', mt.updated_at
+    ),
+    'memories', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'memory_id', m.memory_id,
+          'stable_key', m.stable_key,
+          'memory_type', m.memory_type,
+          'scope', m.scope,
+          'summary', m.summary,
+          'content', left(m.content, {max_chars}),
+          'content_truncated', length(m.content) > {max_chars},
+          'status', m.status,
+          'confidence', m.confidence,
+          'metadata', m.metadata,
+          'created_at', m.created_at,
+          'updated_at', m.updated_at
+        )
+        ORDER BY m.updated_at DESC, m.stable_key
+      )
+      FROM memories m
+      WHERE m.topic_id = mt.topic_id
+        AND m.user_id = mt.user_id
+        AND {memory_status_filter}
+    ), '[]'::jsonb)
+  )
+  FROM selected_topic mt
+), jsonb_build_object('found', false, 'topic', null, 'memories', '[]'::jsonb))::text;
+"""
+    detail = _json_from_psql_object(config, sql)
+    return {
+        "status": "complete",
+        "tool": "read_topic_detail",
+        "topic_id": topic_id,
+        "found": bool(detail.get("found")),
+        "detail": detail,
+    }
+
+
 def _json_from_psql_object(config: Mapping[str, Any], sql: str) -> dict[str, Any]:
     output = _run_psql(config, sql).strip()
     if not output:
