@@ -415,6 +415,28 @@ memory 内容为英文回复偏好；
 
 ## 11. 当前已经打通的能力
 
+这一节记录当前系统已经真实实现并验证过的能力，方便后续判断哪些属于“可用能力”，哪些只是设计目标。
+
+### 11.0 当前能力总表
+
+| 能力 | 当前状态 | 验证情况 |
+|---|---|---|
+| CP SQLite 原始会话读取 | 已实现 | 可从本机 CP 数据库读取真实会话 |
+| turn 切分 | 已实现 | 已能按一轮任务生成 turn |
+| 三层证据池 | 已实现 | core / candidate / pointer 已入 PostgreSQL |
+| PostgreSQL 入库 | 已实现 | turns / evidence_items / memories / topics / conflict records 可查 |
+| ReAct 记忆维护 | 已实现 | 模型可先读详情/补证据，再提交结构化计划 |
+| `memory-changes-v1` 校验 | 已实现 | 单测覆盖非法字段、缺字段、错误 ID、错误 evidence |
+| 新增记忆 | 已实现 | 真实生成用户偏好、编译经验、运行现象经验 |
+| 合并/更新记忆 | 已实现 | merge/update 同 turn 重跑会跳过 |
+| 主题维护 | 已实现基础能力 | `update_topic` 可修正 title/summary |
+| 冲突记录 | 已实现基础能力 | `record_conflict_decision` 可记录 old/new/decision/reason |
+| 幂等重跑 | 已实现核心路径 | duplicate turn → skipped，不重复写库 |
+| 错误返回 | 已实现基础能力 | 返回 error_codes 和 suggested_next_actions |
+| Markdown 导出 | 已实现 | 可导出 MEMORY.md 和主题文件 |
+| 真实多轮回归 | 已执行 | 用户偏好、编译、运行现象、修复确认四类已跑 |
+| 全量测试 | 部分通过 | 301 个测试中 300 个通过，1 个旧 unified_cycle 测试失败 |
+
 ### 11.1 用户偏好沉淀
 
 例：
@@ -471,6 +493,69 @@ Keil C51 C141 / C202 / L250 错误模式。
 同冲突重跑不会重复创建 conflict；
 topic 无变化返回 skipped_no_change。
 ```
+
+### 11.5 工具级安全边界
+
+当前已实现：
+
+```text
+非法 action 拒绝
+多余字段拒绝
+缺字段拒绝
+不存在 topic_id / memory_id 拒绝
+evidence_refs 不属于当前 turn 拒绝
+update_topic 禁止修改 topic_key
+record_conflict_decision 必须包含 old_claim / new_claim / decision / reason
+```
+
+这些边界由单元测试覆盖：
+
+```text
+tests/test_memory_changes_validation.py
+```
+
+### 11.6 模型可恢复错误返回
+
+当前 commit 返回中包含：
+
+```text
+ok
+applied
+skipped
+rejected
+warnings
+suggested_next_actions
+counts
+```
+
+典型错误返回：
+
+```json
+{
+  "error_codes": ["TOPIC_NOT_FOUND"],
+  "suggested_next_actions": [
+    "Call read_topic_detail or list_memory_topics again, then use an active topic_id."
+  ]
+}
+```
+
+这使模型后续可以根据错误信息重新生成正确 plan，而不是静默失败。
+
+### 11.7 当前可展示成果
+
+当前可直接展示：
+
+```text
+reports/p0-memory-review/MEMORY.md
+reports/p0-memory-review/*.md
+```
+
+展示重点：
+
+1. 用户偏好从“中文”改为“英文”后，topic 已修正为“回复语言偏好”；
+2. 编译经验形成了“C51 编译前自检”和“C51 编译错误模式”两类记忆；
+3. 用户反馈的风扇频繁启停现象已沉淀为“自激振荡需时间滤波”；
+4. 重跑 turn 不重复写库，而是返回 skipped/noop。
 
 ## 12. 当前架构选择的权衡
 
@@ -601,15 +686,252 @@ rename_topic_key / 文件名迁移策略
 
 ## 14. 后续路线
 
-建议顺序：
+后续不要一次性扩很多功能，建议继续保持当前节奏：
 
 ```text
-P0：处理唯一全量测试失败，保证全量测试全绿。
-P1：Markdown 展示 conflict records。
-P2：实现 search_related_memories，开始召回测试。
-P3：增加 move_memory_to_topic / split_memory。
-P4：设计长期运行压测，验证 20+ turn 连续处理不污染。
-P5：评估是否迁移到 LangGraph 编排。
+每一步：单元测试 + 小回归
+工具层改完：真实多轮回归
+接入前：全量测试
+```
+
+### 14.1 P0：处理唯一全量测试失败
+
+当前问题：
+
+```text
+test_unified_cycle.UnifiedCycleTests.test_long_transcripts_use_longest_model_compatible_prefix_without_starvation
+```
+
+表现：
+
+```text
+期望 selected_turn_count = 1
+实际 selected_turn_count = 3
+```
+
+目标：
+
+```text
+明确这是测试期望过时，还是 unified_cycle 批处理策略需要恢复。
+```
+
+验收标准：
+
+```text
+python -m unittest discover -s tests -v 全量通过。
+```
+
+### 14.2 P1：Markdown 展示 conflict records
+
+当前 conflict 已入库，但没有展示到 Markdown。
+
+要实现：
+
+```text
+在主题文件中增加 “冲突记录” 小节：
+- 旧说法
+- 新说法
+- 处理决定
+- 原因
+- 来源 turn / evidence
+```
+
+为什么优先做：
+
+```text
+演示时用户能看到“系统不是覆盖掉旧记忆，而是记录了为什么覆盖”。
+```
+
+验收标准：
+
+```text
+回复语言偏好主题文件中能看到中文→英文的冲突记录；
+重复导出不产生重复内容；
+Markdown 仍可读。
+```
+
+### 14.3 P2：实现 search_related_memories
+
+当前 ReAct 主要依赖初始 memory index 和已知 ID。
+
+问题：
+
+```text
+如果 memory index 摘要没有命中，模型不知道该查哪个 memory/topic。
+```
+
+要实现：
+
+```text
+search_related_memories(query, memory_type?, scope?, limit?)
+```
+
+第一版可以不用向量检索，先用：
+
+```text
+summary/content/topic title ILIKE
+memory_type 过滤
+scope 过滤
+limit 限制
+```
+
+验收标准：
+
+```text
+输入“Keil C51 编译错误”能召回编译相关记忆；
+输入“回复语言”能召回语言偏好；
+输入“风扇阈值附近启停”能召回自激振荡记忆；
+无关 query 不返回大量噪声。
+```
+
+### 14.4 P3：开始召回使用测试
+
+当前重点是“沉淀”，还没有系统验证“使用”。
+
+要验证：
+
+```text
+新任务开始时，系统根据任务描述召回相关记忆。
+```
+
+测试用例：
+
+1. 新 Keil C51 工程生成代码；
+2. 新编译错误修复；
+3. 新运行现象诊断；
+4. 用户偏好类任务。
+
+验收标准：
+
+```text
+召回内容相关；
+不召回一次性项目参数；
+召回数量可控；
+模型行为确实减少重复问答/重复错误。
+```
+
+### 14.5 P4：结构维护工具
+
+当前已有：
+
+```text
+update_topic
+```
+
+下一步需要：
+
+```text
+move_memory_to_topic
+split_memory
+merge_topic
+rename_topic_key / 文件名迁移策略
+```
+
+先做顺序：
+
+```text
+1. move_memory_to_topic
+2. split_memory
+3. merge_topic
+4. rename_topic_key
+```
+
+原因：
+
+```text
+移动和拆分比改 topic_key 风险低；
+topic_key 会影响 Markdown 文件名和历史引用，应最后处理。
+```
+
+验收标准：
+
+```text
+memory 放错主题时可迁移；
+一条 memory 混合多个语义时可拆分；
+Markdown 导出后主题结构仍一致；
+重复执行不产生重复 memory。
+```
+
+### 14.6 P5：长期运行压测
+
+目标：
+
+```text
+验证 20+ turn 连续处理后不重复、不污染、不丢证据。
+```
+
+测试集建议：
+
+```text
+5 轮用户偏好
+5 轮编译修复
+5 轮运行现象
+5 轮无长期价值/noop
+若干冲突/纠正 turn
+```
+
+验收标准：
+
+```text
+memory/topic/conflict 数量增长符合预期；
+同一批 turn 重跑后数量不增长；
+没有重复 topic；
+没有重复 conflict；
+Markdown 导出稳定。
+```
+
+### 14.7 P6：评估是否迁移到 LangGraph
+
+当前手写编排适合 MVP。
+
+满足以下条件后再评估 LangGraph：
+
+```text
+节点稳定；
+状态字段稳定；
+工具集合稳定；
+需要 checkpoint / resume / human-in-the-loop；
+需要并发或任务队列。
+```
+
+可能的 LangGraph 节点：
+
+```text
+load_turn
+build_evidence_pool
+load_memory_index
+react_decide
+execute_read_tools
+validate_plan
+commit_plan
+export_markdown
+quality_report
+```
+
+验收标准：
+
+```text
+迁移后与当前手写链路结果一致；
+失败可从 checkpoint 恢复；
+工具返回和数据库写入仍保持幂等。
+```
+
+### 14.8 总路线图
+
+```text
+P0 全量测试全绿
+  ↓
+P1 Markdown 展示冲突记录
+  ↓
+P2 search_related_memories
+  ↓
+P3 召回使用测试
+  ↓
+P4 move/split/merge topic 结构维护
+  ↓
+P5 长期运行压测
+  ↓
+P6 评估 LangGraph 化
 ```
 
 ## 15. 当前结论
@@ -636,4 +958,3 @@ P5：评估是否迁移到 LangGraph 编排。
 ```text
 召回使用、完整冲突策略、主题结构重构、长期压测、全量测试全绿。
 ```
-
