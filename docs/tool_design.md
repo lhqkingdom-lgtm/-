@@ -1,0 +1,323 @@
+# 工具设计文档
+
+本文说明 Memory Lab 中供大模型间接调用的长期记忆工具为什么这样设计，以及它们如何对齐主流 Agent 工具调用标准。
+
+## 1. 设计背景
+
+Memory Lab 的目标不是让大模型直接改数据库，而是让模型基于一轮 CP 对话证据和已有记忆，判断是否需要：
+
+- 新增记忆；
+- 更新已有记忆；
+- 合并同类证据；
+- 修正主题展示；
+- 记录冲突处理过程；
+- 明确无操作。
+
+因此工具设计的核心约束是：
+
+```text
+模型负责判断，程序负责校验、幂等、落库和可审计返回。
+```
+
+这个设计避免了两类风险：
+
+1. 大模型直接写库导致不可控修改；
+2. 纯规则系统无法理解“这轮对话到底该不该沉淀”的语义。
+
+## 2. 参考的外部工具设计标准
+
+我们参考了以下公开工具调用设计共识：
+
+- OpenAI Structured Outputs / function calling：强调输出应符合 JSON Schema，用结构化输出减少解析歧义。参考：[OpenAI Structured Outputs](https://developers.openai.com/)
+- Anthropic tool definition best practices：强调工具描述要详细，要包含使用边界、输入格式、示例和边缘情况。参考：[Anthropic Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)、[Claude tool definitions](https://platform.claude.com/)
+- Anthropic context engineering：强调工具集要精简，避免工具职责重叠导致模型选择困难。参考：[Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+- LangChain / LangGraph 工具调用实践：强调工具 schema、运行状态、错误状态和人机审查流程。参考：[LangChain Tool Calling](https://docs.langchain.com/)、[LangGraph](https://www.langchain.com/langgraph)
+
+落到本项目，形成了 8 条工具标准。
+
+## 3. 本项目工具设计标准
+
+### 3.1 职责清晰
+
+读工具只读，写工具只提交结构化计划。
+
+当前读工具：
+
+```text
+read_topic_detail
+read_memory_detail
+expand_pointer
+```
+
+当前写入入口：
+
+```text
+commit_memory_changes
+```
+
+模型不能直接 SQL 写库，也不能越过校验器修改 PostgreSQL。
+
+### 3.2 输入强 schema
+
+所有写入都必须符合 `memory-changes-v1`。
+
+顶层结构：
+
+```json
+{
+  "schema_version": "memory-changes-v1",
+  "turn_id": "turn_xxx",
+  "reason": "整体判断原因",
+  "changes": []
+}
+```
+
+每个 change 必须声明 `action`，并只能使用该 action 允许的字段。
+
+例如 `update_topic` 只允许：
+
+```json
+{
+  "action": "update_topic",
+  "reason": "...",
+  "target_topic_id": "topic_xxx",
+  "topic": {
+    "title": "...",
+    "summary": "..."
+  },
+  "evidence_refs": []
+}
+```
+
+不允许模型通过 `update_topic` 修改 `topic_key` 或文件名，因为这会影响引用和历史链路。
+
+### 3.3 参数描述明确
+
+ReAct 提示词中明确写了：
+
+- 什么时候 `create_memory`；
+- 什么时候 `merge_memory`；
+- 什么时候 `update_memory`；
+- 什么时候 `update_topic`；
+- 什么时候 `record_conflict_decision`；
+- 什么时候 `noop`；
+- 什么时候需要先读详情或扩展 pointer。
+
+例如用户偏好被明确纠正时，提示词要求优先考虑：
+
+```text
+update_memory + update_topic + record_conflict_decision
+```
+
+而不是只更新 memory 正文。
+
+### 3.4 输出可继续推理
+
+工具返回不能只有 `ok=true`，必须能告诉模型下一步发生了什么。
+
+当前返回包括：
+
+```json
+{
+  "ok": true,
+  "applied": [],
+  "skipped": [],
+  "rejected": [],
+  "noop": [],
+  "requests": [],
+  "warnings": [],
+  "suggested_next_actions": [],
+  "counts": {}
+}
+```
+
+每条结果都包含：
+
+```json
+{
+  "action": "update_topic",
+  "result": "updated",
+  "target_id": "topic_xxx",
+  "message": "topic title/summary updated"
+}
+```
+
+这样模型和人都能判断这次提交到底是创建、更新、跳过还是失败。
+
+### 3.5 错误可恢复
+
+错误返回带：
+
+```json
+{
+  "error_codes": ["TOPIC_NOT_FOUND"],
+  "suggested_next_actions": [
+    "Call read_topic_detail or list_memory_topics again, then use an active topic_id."
+  ]
+}
+```
+
+当前已支持的错误类型包括：
+
+```text
+MEMORY_NOT_FOUND
+TOPIC_NOT_FOUND
+EVIDENCE_NOT_IN_TURN
+POINTER_NOT_IN_TURN
+UNSUPPORTED_FIELD
+MISSING_REQUIRED_FIELD
+DUPLICATE_STABLE_KEY
+UNKNOWN_ACTION
+VALIDATION_ERROR
+```
+
+### 3.6 幂等
+
+同一个 turn 或同一个 plan 重跑，不能产生重复记忆或重复冲突记录。
+
+当前行为：
+
+```text
+update_topic 无变化 → skipped_no_change
+record_conflict_decision 已存在 → skipped_existing / updated_existing
+update_memory / merge_memory 同 turn 重跑 → skipped_duplicate_turn
+```
+
+真实回归中已经验证：
+
+- 语言偏好冲突记录最终收敛为 1 条；
+- 编译 turn 重跑不会重复 merge；
+- 修复确认 turn 重跑不会重复追加证据。
+
+### 3.7 可审计
+
+每次写入计划都保留：
+
+```text
+turn_id
+action
+reason
+evidence_refs
+target_id
+result
+```
+
+memory 自身 metadata 记录：
+
+```text
+source_turn_id
+source_turn_ids
+evidence_refs
+last_action
+change_reason
+```
+
+冲突记录单独进入：
+
+```text
+memory_conflict_records
+```
+
+用于保留旧说法、新说法、处理决定和证据。
+
+### 3.8 安全边界清楚
+
+模型不能：
+
+- 发明 memory_id；
+- 发明 topic_id；
+- 发明 evidence_id；
+- 使用非当前 turn 的 evidence；
+- 直接写 SQL；
+- 越权修改 topic_key；
+- 没读 memory 正文就 update/merge/conflict。
+
+ReAct 运行器会强制：
+
+```text
+修改已有 memory 前必须 read_memory_detail 或 read_topic_detail。
+```
+
+## 4. 当前工具清单
+
+### 4.1 读工具
+
+| 工具 | 作用 | 当前状态 |
+|---|---|---|
+| `read_topic_detail` | 读取主题和主题下 memory | 已实现 |
+| `read_memory_detail` | 读取单条 memory 正文 | 已实现 |
+| `expand_pointer` | 从原始 CP SQLite 回查原文片段 | 已实现 |
+
+### 4.2 写入 action
+
+| action | 作用 | 当前状态 |
+|---|---|---|
+| `create_memory` | 新增记忆 | 已实现 |
+| `update_memory` | 更新已有记忆 | 已实现，已补同 turn 幂等 |
+| `merge_memory` | 合并同类证据 | 已实现，已补同 turn 幂等 |
+| `mark_conflict` | 标记 memory 冲突状态 | 已实现基础能力 |
+| `update_topic` | 修改主题标题/概要 | 已实现 |
+| `record_conflict_decision` | 记录冲突处理过程 | 已实现 |
+| `noop` | 明确无长期记忆价值 | 已实现 |
+| `request_more_evidence` | 请求补证据 | 已实现基础 schema |
+
+## 5. 为什么不拆成很多小工具
+
+没有把写入拆成很多独立工具，例如：
+
+```text
+create_memory_tool
+update_memory_tool
+merge_memory_tool
+split_memory_tool
+conflict_tool
+```
+
+原因是过多工具会增加模型选择难度。当前采用：
+
+```text
+一个 commit 入口 + 多个 action
+```
+
+好处：
+
+- 统一校验；
+- 统一幂等；
+- 统一错误返回；
+- 可一次提交多个相关动作；
+- 便于记录一轮 turn 的完整整理意图。
+
+## 6. 本轮已完成的工具优化
+
+本轮已完成：
+
+```text
+1. update_topic
+2. record_conflict_decision
+3. commit 返回结构统一
+4. error_code / suggested_next_actions
+5. update/merge 同 turn 幂等跳过
+6. conflict wording 变化不重复创建
+7. ReAct 提示词三件套规则
+8. 单元测试和真实多轮回归
+```
+
+真实回归结果：
+
+```text
+用户偏好冲突：中文 → 英文，冲突记录收敛为 1 条。
+编译经验：重复 turn 重跑不重复 merge。
+运行现象：已覆盖时 noop。
+修复确认：已处理过的 turn 返回 skipped_duplicate_turn。
+```
+
+## 7. 后续建议
+
+下一阶段工具优化建议：
+
+1. 增加 `search_related_memories`，解决 memory index 摘要不命中时的检索问题；
+2. 增加 `move_memory_to_topic`，支持记忆归类修正；
+3. 增加 `split_memory`，支持一条记忆混入多个语义时拆分；
+4. 冲突记录投影到 Markdown；
+5. 处理 topic_key / 文件名迁移策略。
+
