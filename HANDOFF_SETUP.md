@@ -121,7 +121,51 @@ data\fanguard_domain_auto_rerun_20260911.db
 
 如果没有这个实验 DB，也可以从 CP SQLite 重新扫描生成。
 
-## 6. 常用命令
+## 6. PostgreSQL 事实源
+
+当前重构后的三层证据池和长期记忆表保存在 PostgreSQL：
+
+```text
+host     = localhost
+port     = 55512
+database = codepulse_memory_lab
+user     = root
+password = 见本机 pg-memory-lab.local.json
+```
+
+本机数据目录：
+
+```text
+D:\codepulse\Codepulse-Memory-Lab\pgdata
+```
+
+历史上该实例使用 `55432`，但当前 Windows 将 `55432` 放入 TCP 排除端口段 `55412–55511`，所以本机改用同一套 `pgdata` 启动到 `55512`。
+
+启动命令：
+
+```powershell
+& D:\PostgreSQL\17\bin\pg_ctl.exe start `
+  -D D:\codepulse\Codepulse-Memory-Lab\pgdata `
+  -o "-p 55512 -h localhost" `
+  -l D:\codepulse\Codepulse-Memory-Lab\pgdata\memory-lab-postgres-55512.log
+```
+
+确认命令：
+
+```powershell
+.\memory-lab.ps1 pg-quality-report -Limit 5
+```
+
+当前已确认该实例包含：
+
+```text
+turns = 9
+evidence_items = 386
+memory_topics = 1
+memories = 1
+```
+
+## 7. 常用命令
 
 ### 查看 turn 阶段粗识别
 

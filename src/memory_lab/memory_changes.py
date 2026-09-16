@@ -30,6 +30,8 @@ ALLOWED_ACTIONS = {
     "merge_memory",
     "update_memory",
     "mark_conflict",
+    "update_topic",
+    "record_conflict_decision",
     "noop",
     "request_more_evidence",
 }
@@ -48,6 +50,48 @@ class MemoryChangesValidationError(ValueError):
 
 class MemoryChangesCommitError(ValueError):
     pass
+
+
+def _error_codes_for_messages(errors: list[str]) -> list[str]:
+    codes: list[str] = []
+    patterns = [
+        ("target_memory_id does not exist", "MEMORY_NOT_FOUND"),
+        ("memory_id does not exist", "MEMORY_NOT_FOUND"),
+        ("target_topic_id does not exist", "TOPIC_NOT_FOUND"),
+        ("topic_id does not exist", "TOPIC_NOT_FOUND"),
+        ("evidence_id does not belong to this turn", "EVIDENCE_NOT_IN_TURN"),
+        ("raw_pointer_id does not belong to this turn", "POINTER_NOT_IN_TURN"),
+        ("unsupported fields", "UNSUPPORTED_FIELD"),
+        ("is required", "MISSING_REQUIRED_FIELD"),
+        ("must be a non-empty string", "MISSING_REQUIRED_FIELD"),
+        ("stable_key already exists", "DUPLICATE_STABLE_KEY"),
+        ("action is not allowed", "UNKNOWN_ACTION"),
+    ]
+    for error in errors:
+        for needle, code in patterns:
+            if needle in error and code not in codes:
+                codes.append(code)
+    return codes or ["VALIDATION_ERROR"]
+
+
+def _suggestions_for_error_codes(codes: list[str]) -> list[str]:
+    suggestions: list[str] = []
+    mapping = {
+        "MEMORY_NOT_FOUND": "Call read_memory_detail or search/list memory index again, then use an active memory_id.",
+        "TOPIC_NOT_FOUND": "Call read_topic_detail or list_memory_topics again, then use an active topic_id.",
+        "EVIDENCE_NOT_IN_TURN": "Use only evidence_id values from the current turn evidence pool, or expand the relevant pointer first.",
+        "POINTER_NOT_IN_TURN": "Use only raw_pointer_id values from the current turn pointer layer.",
+        "UNSUPPORTED_FIELD": "Remove unsupported fields and keep only the schema fields allowed for this action.",
+        "MISSING_REQUIRED_FIELD": "Add the missing required field using the action schema.",
+        "DUPLICATE_STABLE_KEY": "Update or merge the existing memory instead of creating a new memory with the same stable_key.",
+        "UNKNOWN_ACTION": "Use one of the allowed memory-changes-v1 actions.",
+        "VALIDATION_ERROR": "Fix the reported validation errors and resubmit the corrected change.",
+    }
+    for code in codes:
+        suggestion = mapping.get(code)
+        if suggestion and suggestion not in suggestions:
+            suggestions.append(suggestion)
+    return suggestions
 
 
 def _is_object(value: Any) -> bool:
@@ -217,6 +261,43 @@ def _check_evidence_refs(
             errors.append(f"{ref_prefix}.reason must be a non-empty string")
 
 
+def _check_topic_patch(patch: Any, errors: list[str], prefix: str) -> None:
+    if not _is_object(patch):
+        errors.append(f"{prefix}.topic must be an object")
+        return
+    allowed = {"title", "summary"}
+    extra = set(patch) - allowed
+    if extra:
+        errors.append(f"{prefix}.topic has unsupported fields: {sorted(extra)}")
+    if not any(field in patch for field in allowed):
+        errors.append(f"{prefix}.topic must contain at least one of title/summary")
+    if "title" in patch and not _non_empty_string(patch.get("title")):
+        errors.append(f"{prefix}.topic.title must be a non-empty string")
+    if "summary" in patch:
+        if not _non_empty_string(patch.get("summary")):
+            errors.append(f"{prefix}.topic.summary must be a non-empty string")
+        elif len(str(patch["summary"])) > MAX_SUMMARY_CHARS:
+            errors.append(f"{prefix}.topic.summary exceeds {MAX_SUMMARY_CHARS} characters")
+
+
+def _check_conflict_decision(decision: Any, errors: list[str], prefix: str) -> None:
+    if not _is_object(decision):
+        errors.append(f"{prefix}.conflict must be an object")
+        return
+    required = {"conflict_type", "old_claim", "new_claim", "decision", "reason"}
+    allowed = {*required, "status", "metadata"}
+    extra = set(decision) - allowed
+    if extra:
+        errors.append(f"{prefix}.conflict has unsupported fields: {sorted(extra)}")
+    for field in required:
+        if not _non_empty_string(decision.get(field)):
+            errors.append(f"{prefix}.conflict.{field} must be a non-empty string")
+    if "status" in decision and str(decision.get("status")) not in {"recorded", "resolved", "needs_review"}:
+        errors.append(f"{prefix}.conflict.status must be recorded/resolved/needs_review")
+    if "metadata" in decision and not _is_object(decision.get("metadata")):
+        errors.append(f"{prefix}.conflict.metadata must be an object")
+
+
 def validate_memory_changes(
     proposal: Mapping[str, Any],
     *,
@@ -319,6 +400,52 @@ def validate_memory_changes(
             else:
                 batch_targets[str(target)] = action
             _check_memory(change.get("memory"), errors, prefix, create=False)
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "update_topic":
+            allowed = {"action", "reason", "target_topic_id", "topic", "evidence_refs"}
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target = change.get("target_topic_id")
+            if not _non_empty_string(target):
+                errors.append(f"{prefix}.target_topic_id must be a non-empty string")
+            elif target not in topic_ids:
+                errors.append(f"{prefix}.target_topic_id does not exist or is not active")
+            _check_topic_patch(change.get("topic"), errors, prefix)
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "record_conflict_decision":
+            allowed = {
+                "action",
+                "reason",
+                "target_memory_id",
+                "conflict",
+                "evidence_refs",
+            }
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target = change.get("target_memory_id")
+            if not _non_empty_string(target):
+                errors.append(f"{prefix}.target_memory_id must be a non-empty string")
+            elif target not in memory_ids:
+                errors.append(f"{prefix}.target_memory_id does not exist or is not active")
+            _check_conflict_decision(change.get("conflict"), errors, prefix)
             _check_evidence_refs(
                 change.get("evidence_refs"),
                 errors,
@@ -437,8 +564,10 @@ def _single_change_proposal(proposal: Mapping[str, Any], change: Mapping[str, An
 
 
 def _evidence_metadata(proposal: Mapping[str, Any], change: Mapping[str, Any]) -> dict[str, Any]:
+    turn_id = proposal.get("turn_id")
     return {
-        "source_turn_id": proposal.get("turn_id"),
+        "source_turn_id": turn_id,
+        "source_turn_ids": [turn_id] if turn_id else [],
         "change_reason": change.get("reason"),
         "evidence_refs": change.get("evidence_refs") or [],
         "last_action": change.get("action"),
@@ -513,18 +642,183 @@ def _update_memory_sql(
     status: str | None = None,
 ) -> str:
     status_sql = f"status = {_sql_literal(status)}," if status else ""
+    metadata_json = _json_literal(metadata)
     return f"""
+WITH updated AS (
 UPDATE memories
 SET {status_sql}
     summary = {_sql_literal(str(memory["summary"]))},
     content = {_sql_literal(str(memory["content"]))},
     confidence = {float(memory["confidence"]):.3f},
-    metadata = metadata || {_json_literal(metadata)},
+    metadata =
+      (metadata || {metadata_json})
+      || jsonb_build_object(
+        'source_turn_ids',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+          FROM jsonb_array_elements_text(
+            COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'source_turn_ids', '[]'::jsonb)
+            || CASE
+                 WHEN metadata ? 'source_turn_id' THEN jsonb_build_array(metadata ->> 'source_turn_id')
+                 ELSE '[]'::jsonb
+               END
+          ) AS merged(value)
+        ),
+        'evidence_refs',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT item), '[]'::jsonb)
+          FROM jsonb_array_elements(
+            COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'evidence_refs', '[]'::jsonb)
+          ) AS merged(item)
+        )
+      ),
     updated_at = now()
 WHERE memory_id = {_sql_literal(memory_id)}
   AND user_id = {_sql_literal(user_id)}
+  AND status = 'active'
+RETURNING topic_id, summary
+)
+UPDATE memory_topics mt
+SET summary = updated.summary,
+    updated_at = now()
+FROM updated
+WHERE mt.topic_id = updated.topic_id
+  AND mt.user_id = {_sql_literal(user_id)};
+"""
+
+
+def _update_topic_sql(
+    *,
+    user_id: str,
+    topic_id: str,
+    topic: Mapping[str, Any],
+) -> str:
+    assignments: list[str] = []
+    if "title" in topic:
+        assignments.append(f"title = {_sql_literal(str(topic['title']))}")
+    if "summary" in topic:
+        assignments.append(f"summary = {_sql_literal(str(topic['summary']))}")
+    assignments.append("updated_at = now()")
+    return f"""
+UPDATE memory_topics
+SET {", ".join(assignments)}
+WHERE topic_id = {_sql_literal(topic_id)}
+  AND user_id = {_sql_literal(user_id)}
   AND status = 'active';
 """
+
+
+def _read_topic_state(
+    *,
+    config: Mapping[str, Any],
+    user_id: str,
+    topic_id: str,
+) -> dict[str, Any]:
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'topic_id', topic_id,
+    'title', title,
+    'summary', summary
+  )
+  FROM memory_topics
+  WHERE topic_id = {_sql_literal(topic_id)}
+    AND user_id = {_sql_literal(user_id)}
+    AND status = 'active'
+), jsonb_build_object('found', false))::text;
+"""
+    return _json_from_psql_object(config, sql)
+
+
+def _read_conflict_state(
+    *,
+    config: Mapping[str, Any],
+    user_id: str,
+    conflict_id: str,
+) -> dict[str, Any]:
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'conflict_id', conflict_id,
+    'reason', reason,
+    'status', status,
+    'evidence_refs', evidence_refs
+  )
+  FROM memory_conflict_records
+  WHERE conflict_id = {_sql_literal(conflict_id)}
+    AND user_id = {_sql_literal(user_id)}
+), jsonb_build_object('found', false))::text;
+"""
+    return _json_from_psql_object(config, sql)
+
+
+def _insert_conflict_decision_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    turn_id: str,
+    conflict: Mapping[str, Any],
+    evidence_refs: list[Any],
+    metadata: Mapping[str, Any],
+) -> tuple[str, str]:
+    conflict_type = str(conflict["conflict_type"])
+    old_claim = str(conflict["old_claim"])
+    new_claim = str(conflict["new_claim"])
+    decision = str(conflict["decision"])
+    conflict_id = _digest_id(
+        "conflict",
+        user_id,
+        memory_id,
+        turn_id,
+        conflict_type,
+    )
+    status = str(conflict.get("status") or "recorded")
+    conflict_metadata = {
+        **(conflict.get("metadata") if isinstance(conflict.get("metadata"), Mapping) else {}),
+        **metadata,
+    }
+    sql = f"""
+INSERT INTO memory_conflict_records(
+  conflict_id, user_id, memory_id, topic_id, turn_id, conflict_type,
+  old_claim, new_claim, decision, reason, evidence_refs, status, metadata
+)
+SELECT
+  {_sql_literal(conflict_id)},
+  {_sql_literal(user_id)},
+  m.memory_id,
+  m.topic_id,
+  {_sql_literal(turn_id)},
+  {_sql_literal(conflict_type)},
+  {_sql_literal(old_claim)},
+  {_sql_literal(new_claim)},
+  {_sql_literal(decision)},
+  {_sql_literal(str(conflict["reason"]))},
+  {_json_literal(evidence_refs)},
+  {_sql_literal(status)},
+  {_json_literal(conflict_metadata)}
+FROM memories m
+WHERE m.memory_id = {_sql_literal(memory_id)}
+  AND m.user_id = {_sql_literal(user_id)}
+  AND m.status = 'active'
+ON CONFLICT (conflict_id)
+DO UPDATE SET
+  old_claim = EXCLUDED.old_claim,
+  new_claim = EXCLUDED.new_claim,
+  decision = EXCLUDED.decision,
+  reason = EXCLUDED.reason,
+  evidence_refs = EXCLUDED.evidence_refs,
+  status = EXCLUDED.status,
+  metadata = memory_conflict_records.metadata || EXCLUDED.metadata;
+"""
+    return conflict_id, sql
 
 
 def _memory_already_processed_turn(
@@ -543,7 +837,17 @@ SELECT jsonb_build_object(
     FROM memories
     WHERE user_id = {_sql_literal(user_id)}
       AND memory_id = {_sql_literal(memory_id)}
-      AND metadata ->> 'source_turn_id' = {_sql_literal(turn_id)}
+      AND (
+        metadata ->> 'source_turn_id' = {_sql_literal(turn_id)}
+        OR COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb) ? {_sql_literal(turn_id)}
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)) AS ref(item)
+          JOIN evidence_items e ON e.evidence_id = ref.item ->> 'evidence_id'
+          WHERE e.turn_id = {_sql_literal(turn_id)}
+            AND e.user_id = {_sql_literal(user_id)}
+        )
+      )
   )
 )::text;
 """
@@ -563,14 +867,20 @@ def _commit_validated_change(
         return {
             "action": action,
             "committed": False,
+            "result": "noop",
+            "target_id": None,
             "reason": change.get("reason"),
+            "message": "no durable memory update is needed",
         }
     if action == "request_more_evidence":
         return {
             "action": action,
             "committed": False,
+            "result": "request_more_evidence",
+            "target_id": None,
             "reason": change.get("reason"),
             "requests": change.get("requests") or [],
+            "message": "more evidence is required before committing memory changes",
         }
 
     metadata = _evidence_metadata(proposal, change)
@@ -590,9 +900,98 @@ def _commit_validated_change(
         return {
             "action": action,
             "committed": True,
+            "result": "created",
+            "target_id": memory_id,
             "topic_id": topic_id,
             "memory_id": memory_id,
             "stable_key": change["memory"]["stable_key"],
+            "message": "memory created",
+        }
+
+    if action == "update_topic":
+        target_topic_id = str(change["target_topic_id"])
+        current = _read_topic_state(
+            config=config,
+            user_id=user_id,
+            topic_id=target_topic_id,
+        )
+        changed_fields = [
+            field
+            for field in ("title", "summary")
+            if field in change["topic"] and str(change["topic"][field]) != str(current.get(field) or "")
+        ]
+        if current.get("found") and not changed_fields:
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_no_change",
+                "target_id": target_topic_id,
+                "topic_id": target_topic_id,
+                "message": "topic title/summary already match the requested values",
+            }
+        sql = _update_topic_sql(
+            user_id=user_id,
+            topic_id=target_topic_id,
+            topic=change["topic"],
+        )
+        _run_psql(config, "BEGIN;\n" + sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": "updated",
+            "target_id": target_topic_id,
+            "topic_id": target_topic_id,
+            "title": change["topic"].get("title"),
+            "summary": change["topic"].get("summary"),
+            "changed_fields": changed_fields,
+            "message": "topic title/summary updated",
+        }
+
+    if action == "record_conflict_decision":
+        target_memory_id = str(change["target_memory_id"])
+        conflict_id, sql = _insert_conflict_decision_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            conflict=change["conflict"],
+            evidence_refs=change.get("evidence_refs") or [],
+            metadata=metadata,
+        )
+        current = _read_conflict_state(
+            config=config,
+            user_id=user_id,
+            conflict_id=conflict_id,
+        )
+        desired_status = str(change["conflict"].get("status") or "recorded")
+        desired_reason = str(change["conflict"]["reason"])
+        desired_evidence_refs = change.get("evidence_refs") or []
+        if (
+            current.get("found")
+            and str(current.get("status") or "") == desired_status
+            and str(current.get("reason") or "") == desired_reason
+            and current.get("evidence_refs") == desired_evidence_refs
+        ):
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_existing",
+                "target_id": conflict_id,
+                "memory_id": target_memory_id,
+                "conflict_id": conflict_id,
+                "status": desired_status,
+                "message": "conflict decision already recorded with identical content",
+            }
+        result = "updated_existing" if current.get("found") else "created"
+        _run_psql(config, "BEGIN;\n" + sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": result,
+            "target_id": conflict_id,
+            "memory_id": target_memory_id,
+            "conflict_id": conflict_id,
+            "status": str(change["conflict"].get("status") or "recorded"),
+            "message": "conflict decision recorded" if result == "created" else "conflict decision updated",
         }
 
     target_memory_id = str(change["target_memory_id"])
@@ -602,9 +1001,14 @@ def _commit_validated_change(
         memory_id=target_memory_id,
         turn_id=str(proposal.get("turn_id") or ""),
     ):
-        raise MemoryChangesCommitError(
-            "target memory already processed this source_turn_id; skipping duplicate write"
-        )
+        return {
+            "action": action,
+            "committed": False,
+            "result": "skipped_duplicate_turn",
+            "target_id": target_memory_id,
+            "memory_id": target_memory_id,
+            "message": "target memory already processed this source_turn_id; skipping duplicate write",
+        }
     status = "conflict" if action == "mark_conflict" else None
     sql = _update_memory_sql(
         user_id=user_id,
@@ -617,8 +1021,11 @@ def _commit_validated_change(
     return {
         "action": action,
         "committed": True,
+        "result": "marked_conflict" if action == "mark_conflict" else "updated",
+        "target_id": target_memory_id,
         "memory_id": target_memory_id,
         "status": status or "active",
+        "message": "memory marked as conflict" if action == "mark_conflict" else "memory updated",
     }
 
 
@@ -650,13 +1057,22 @@ def commit_memory_changes(
         raise MemoryChangesValidationError(top_errors)
 
     applied: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     noops: list[dict[str, Any]] = []
     requests: list[dict[str, Any]] = []
     for index, change in enumerate(changes):
         if not isinstance(change, Mapping):
+            errors = [f"changes[{index}] must be an object"]
+            codes = _error_codes_for_messages(errors)
             rejected.append(
-                {"index": index, "action": None, "errors": [f"changes[{index}] must be an object"]}
+                {
+                    "index": index,
+                    "action": None,
+                    "errors": errors,
+                    "error_codes": codes,
+                    "suggested_next_actions": _suggestions_for_error_codes(codes),
+                }
             )
             continue
         single = _single_change_proposal(proposal, change)
@@ -669,20 +1085,27 @@ def commit_memory_changes(
                 change=change,
             )
         except MemoryChangesValidationError as error:
+            codes = _error_codes_for_messages(error.errors)
             rejected.append(
                 {
                     "index": index,
                     "action": change.get("action"),
                     "errors": error.errors,
+                    "error_codes": codes,
+                    "suggested_next_actions": _suggestions_for_error_codes(codes),
                 }
             )
             continue
         except Exception as error:
+            errors = [str(error)]
+            codes = _error_codes_for_messages(errors)
             rejected.append(
                 {
                     "index": index,
                     "action": change.get("action"),
-                    "errors": [str(error)],
+                    "errors": errors,
+                    "error_codes": codes,
+                    "suggested_next_actions": _suggestions_for_error_codes(codes),
                 }
             )
             continue
@@ -691,18 +1114,47 @@ def commit_memory_changes(
             noops.append(row)
         elif result["action"] == "request_more_evidence":
             requests.append(row)
+        elif result.get("committed") is False:
+            skipped.append(row)
         else:
             applied.append(row)
+    warnings: list[dict[str, Any]] = []
+    suggested_next_actions: list[str] = []
+    if rejected:
+        rejected_suggestions: list[str] = []
+        for item in rejected:
+            for suggestion in item.get("suggested_next_actions") or []:
+                if isinstance(suggestion, str) and suggestion not in rejected_suggestions:
+                    rejected_suggestions.append(suggestion)
+        warnings.append(
+            {
+                "type": "PARTIAL_REJECTION",
+                "message": "one or more changes were rejected; inspect rejected[].errors and regenerate only the failed changes",
+            }
+        )
+        suggested_next_actions.extend(
+            rejected_suggestions
+            or ["Fix rejected changes using the reported field errors, then resubmit a corrected plan."]
+        )
+    if requests:
+        suggested_next_actions.append(
+            "Run the requested read tools, then submit a new memory-changes-v1 plan with the additional evidence."
+        )
     return {
+        "ok": not rejected,
         "status": "complete",
         "tool": "commit_memory_changes",
         "turn_id": proposal.get("turn_id"),
         "applied": applied,
+        "skipped": skipped,
         "rejected": rejected,
         "noop": noops,
         "requests": requests,
+        "warnings": warnings,
+        "suggested_next_actions": suggested_next_actions,
         "counts": {
             "applied": len(applied),
+            "skipped": len(skipped),
             "rejected": len(rejected),
             "noop": len(noops),
             "requests": len(requests),

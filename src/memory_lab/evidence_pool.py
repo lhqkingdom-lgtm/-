@@ -462,6 +462,13 @@ def _kind_for_text(source_type: str, text: str, rule_phase: str) -> str:
         if any(word in lower for word in ("编译", "error", "warning", "0 error")):
             return "compile_conclusion"
         return "assistant_conclusion"
+    if source_type == "tool_result":
+        # Todo/task-list tools often contain compile-related words because the
+        # plan mentions build steps.  They are process context, not actual build
+        # evidence, and should not pollute build_or_tool_result candidates.
+        first_line = lower.splitlines()[0] if lower.splitlines() else lower
+        if first_line.startswith("todowrite"):
+            return "tool_context"
     if _contains_any(text, BUILD_KEYWORDS):
         return "build_or_tool_result"
     return "tool_context"

@@ -102,6 +102,24 @@ create table if not exists memory_agent_runs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists memory_conflict_records (
+  conflict_id text primary key,
+  user_id text not null references users(user_id) on delete cascade,
+  memory_id text not null references memories(memory_id) on delete cascade,
+  topic_id text references memory_topics(topic_id) on delete set null,
+  turn_id text references turns(turn_id) on delete set null,
+  conflict_type text not null,
+  old_claim text not null,
+  new_claim text not null,
+  decision text not null,
+  reason text not null,
+  evidence_refs jsonb not null default '[]'::jsonb,
+  status text not null default 'recorded',
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (user_id, memory_id, turn_id, conflict_type, old_claim, new_claim, decision)
+);
+
 create index if not exists idx_sources_user_id on sources(user_id);
 create index if not exists idx_turns_user_source on turns(user_id, source_id);
 create index if not exists idx_turns_user_project on turns(user_id, project_key);
@@ -115,6 +133,10 @@ create index if not exists idx_memories_user_type on memories(user_id, memory_ty
 create index if not exists idx_memories_topic on memories(topic_id);
 create index if not exists idx_memories_scope_gin on memories using gin(scope);
 create index if not exists idx_memory_agent_runs_user_turn on memory_agent_runs(user_id, turn_id);
+create index if not exists idx_memory_conflict_records_memory on memory_conflict_records(user_id, memory_id);
+create index if not exists idx_memory_conflict_records_turn on memory_conflict_records(user_id, turn_id);
+create unique index if not exists idx_memory_conflict_records_unique_slot
+  on memory_conflict_records(user_id, memory_id, turn_id, conflict_type);
 
 insert into users(user_id, email, display_name)
 values ('local-default-user', null, 'Local Default User')

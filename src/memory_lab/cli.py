@@ -27,6 +27,7 @@ from .llm_client import OpenAICompatibleJsonClient
 from .markdown_store import run_markdown_preview, run_markdown_recall
 from .memory_changes import commit_memory_changes_file, validate_memory_changes_file
 from .memory_agent import run_memory_agent, run_memory_agent_batch
+from .memory_react_agent import run_memory_react_agent
 from .model_recall import run_deepseek_formal_recall
 from .phase import run_turn_phase_report
 from .pg_store import (
@@ -41,6 +42,7 @@ from .pg_store import (
     read_topic_detail,
     show_postgres_turn,
 )
+from .pg_markdown_export import export_pg_markdown
 from .prepare import prepare_dataset
 from .report import DEFAULT_GOLD, DEFAULT_REPORT_DIRECTORY, generate_shadow_report
 from .shadow import run_deepseek_shadow
@@ -386,6 +388,13 @@ def build_parser() -> argparse.ArgumentParser:
     pg_read_topic_detail.add_argument("--topic-id", required=True)
     pg_read_topic_detail.add_argument("--include-inactive", action="store_true")
     pg_read_topic_detail.add_argument("--max-chars", type=int, default=4000)
+    pg_export_markdown = subparsers.add_parser(
+        "pg-export-markdown",
+        help="Export lightweight PostgreSQL memory state to review Markdown files",
+    )
+    pg_export_markdown.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_export_markdown.add_argument("--output-dir", type=Path, default=DEFAULT_REPORTS / "p0-memory-review")
+    pg_export_markdown.add_argument("--include-inactive", action="store_true")
     pg_writer_dry_run = subparsers.add_parser(
         "pg-writer-dry-run",
         help="Call the lightweight memory Writer and validate its JSON plan without committing",
@@ -430,6 +439,17 @@ def build_parser() -> argparse.ArgumentParser:
     pg_memory_agent_run.add_argument("--memory-limit", type=int, default=80)
     pg_memory_agent_run.add_argument("--dry-run", action="store_true")
     pg_memory_agent_run.add_argument("--log-dir", type=Path)
+    pg_memory_react_run = subparsers.add_parser(
+        "pg-memory-react-run",
+        help="Run the ReAct memory maintenance agent for one turn",
+    )
+    pg_memory_react_run.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_memory_react_run.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    pg_memory_react_run.add_argument("--turn-id", required=True)
+    pg_memory_react_run.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_react_run.add_argument("--max-iterations", type=int, default=3)
+    pg_memory_react_run.add_argument("--dry-run", action="store_true")
+    pg_memory_react_run.add_argument("--log-dir", type=Path)
     pg_memory_agent_batch = subparsers.add_parser(
         "pg-memory-agent-batch",
         help="Run the memory maintenance agent over multiple turns",
@@ -705,6 +725,12 @@ def main(argv: list[str] | None = None) -> int:
                 include_inactive=args.include_inactive,
                 max_chars=args.max_chars,
             )
+        elif args.command == "pg-export-markdown":
+            report = export_pg_markdown(
+                pg_config_path=args.pg_config,
+                output_dir=args.output_dir,
+                include_inactive=args.include_inactive,
+            )
         elif args.command == "pg-writer-dry-run":
             report = run_writer_dry_run(
                 turn_id=args.turn_id,
@@ -740,6 +766,17 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 config_path=args.config,
                 memory_limit=args.memory_limit,
+                dry_run=args.dry_run,
+                log_dir=args.log_dir if args.log_dir else None,
+            )
+        elif args.command == "pg-memory-react-run":
+            report = run_memory_react_agent(
+                source_database=args.source_db,
+                turn_id=args.turn_id,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                memory_limit=args.memory_limit,
+                max_iterations=args.max_iterations,
                 dry_run=args.dry_run,
                 log_dir=args.log_dir if args.log_dir else None,
             )

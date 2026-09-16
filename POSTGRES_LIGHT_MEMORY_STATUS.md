@@ -567,10 +567,10 @@ CP SQLite 原始会话
 
 ```text
 host     = localhost
-port     = 55432
+port     = 55512
 database = codepulse_memory_lab
 user     = root
-password = 123456
+password = 本机测试密码，保存在 pg-memory-lab.local.json
 ```
 
 本地配置文件：
@@ -580,6 +580,38 @@ pg-memory-lab.local.json
 ```
 
 该文件已被 `.gitignore` 忽略，不会上传。
+
+端口说明：
+
+- 这套数据目录位于 `D:\codepulse\Codepulse-Memory-Lab\pgdata`；
+- 历史配置曾使用 `55432`；
+- 当前 Windows 将 `55432` 放入 TCP 排除端口段 `55412–55511`，PostgreSQL 直接绑定会报 `could not bind IPv4 address "127.0.0.1": Permission denied`；
+- 因此当前本机使用同一套 `pgdata` 临时启动到 `55512`。
+
+启动命令：
+
+```powershell
+& D:\PostgreSQL\17\bin\pg_ctl.exe start `
+  -D D:\codepulse\Codepulse-Memory-Lab\pgdata `
+  -o "-p 55512 -h localhost" `
+  -l D:\codepulse\Codepulse-Memory-Lab\pgdata\memory-lab-postgres-55512.log
+```
+
+确认命令：
+
+```powershell
+netstat -ano | Select-String ':55512'
+& D:\PostgreSQL\17\bin\psql.exe -h localhost -p 55512 -U root -d codepulse_memory_lab -c "\dt"
+```
+
+当前已确认该实例包含：
+
+```text
+turns = 9
+evidence_items = 386
+memory_topics = 1
+memories = 1
+```
 
 ### 2. PostgreSQL schema
 
@@ -843,23 +875,32 @@ GET  /v1/health
 
 ## 下一步建议
 
-下一步建议先做单 Writer 最小闭环：
+当前路线已从“一次性 Writer”调整为 ReAct 长期记忆维护器：
 
 ```text
-1. 定义 Writer 输出 JSON schema
-2. 接 DeepSeek Writer
-3. 支持 need_more_evidence：
-   - expand_pointer
-   - read_memory_detail
-4. 支持最终计划：
-   - create
-   - merge
-   - update
-   - conflict
-   - noop
-5. 程序校验 JSON
-6. 写入 memory_topics / memories
-7. 再生成 Markdown 投影
+turn 三层证据
+  ↓
+已有 memory/topic 摘要索引
+  ↓
+模型判断是否需要补证据
+  ↓
+只读工具 read_memory_detail / read_topic_detail / expand_pointer
+  ↓
+模型输出 memory-changes-v1 计划
+  ↓
+程序校验并写入 PostgreSQL
+```
+
+新的近期计划：
+
+```text
+R1：重写模型提示词，明确长期记忆整理流程、沉淀标准、动作选择标准和 JSON 示例。
+R2：优化 payload，显式区分 summary_only_memory_ids、observed_memory_ids、modifiable_memory_ids。
+R3：保留硬限制，但对“未读详情直接修改已有 memory”优先自动补 read_memory_detail 后重判。
+R4：用真实 turn dry-run 验收 noop / update / create / merge。
+R5：dry-run 稳定后再 commit 验收。
+R6：多 turn 连续跑，观察重复、合并、更新、范围污染。
+R7：生成中文变更报告和可视化。
 ```
 
 第一条真实测试建议继续使用：
@@ -883,8 +924,74 @@ turn_e90... 烧录后风扇不随温度变化，adc_sample 固定 return 2048
 candidate 中文清洗：通过
 pointer 原始回查：通过
 轻量 memory 表：已建
-Writer 读取工具：通过
-LLM Writer：未开始
-正式 memory 写入：未开始
+ReAct 读取工具：通过
+ReAct 提示词 R1：已重写
+ReAct payload R2：已加入 memory_access_state / action_decision_guide
+ReAct dry-run：已通过 1 个真实运行现象 turn
+正式 memory 写入：提交器可用，但本阶段暂以 dry-run 验证为主
 Markdown 投影：未开始
+```
+
+最新真实 turn dry-run 验收：
+
+```text
+turn_id = turn_e90cab8f66831ddd470536aae9e6f8b940d2faf01c0db74878705db0db20745e
+输入类型 = 用户反馈运行现象 + 代码层根因定位
+结果 = ok=true
+iterations = 2
+observation_count = 1
+流程 = 第 1 轮 read_memory_detail(mem_ab2f188c06b6481e)，第 2 轮 final_changes/noop
+结论 = 已有 memory 覆盖本轮“桩函数固定返回值导致假数据、外设无响应”的失败模式，因此不重复写入。
+```
+
+R4 多类型 dry-run 验收：
+
+```text
+1. turn_b87025692cfaccf32d9af2b4cb5b077dd227c6d5f793262e77acaeab206d7296
+   类型 = 既有 Keil C51 工程代码生成 + 编译成功
+   结果 = ok=true
+   iterations = 2
+   observation_count = 2
+   计划 = create_memory 用户偏好：既有 Keil C51 工程不重建结构、不改 STARTUP.A51、优先 C51 兼容写法、交付时说明模块划分与需人工确认硬件资源；同时对已有桩函数记忆 noop。
+
+2. turn_0e6c9aa67c3a0776783748acfe5838a3e9e0f1a59e1ecc60d982d95ddfb442f6
+   类型 = 用户确认修复成功
+   结果 = ok=true
+   iterations = 2
+   observation_count = 1
+   计划 = merge_memory 到 mem_ab2f188c06b6481e，补充“替换真实 ADC 驱动后，经用户烧录实测验证输入变化、占空比切换和失效安全有效”的验证证据。
+
+3. turn_d8f25f9e4ae0d1f72838f3416fc47f2a47b5935e852866eb1ed132f512450f93
+   类型 = 需求对齐
+   结果 = ok=true
+   iterations = 1
+   observation_count = 0
+   计划 = noop；温度阈值、滞回、PWM 频率、滤波、看门狗等属于当前项目需求参数，可由需求文档恢复，不沉淀为长期记忆。
+
+4. turn_ae03bf8b31152f404c805fe70821d6e50707fe0517e84a0a8da7f9d7af6b59fc
+   类型 = 真实驱动替换 + Keil 编译成功
+   结果 = ok=true
+   iterations = 2
+   observation_count = 3
+   计划 = update_memory 到 mem_ab2f188c06b6481e，把已有“桩函数假数据”经验扩展为“桩函数或不匹配外设寄存器/模块都会导致编译通过但运行无响应”，并补充 Keil 0 errors / 0 warnings 编译验证。
+
+5. turn_64bbc76b5ecdea714511940a63629fe45357b2917a67af60000e42a3e853c88a
+   类型 = Keil C51 一次编译通过确认
+   结果 = ok=true
+   iterations = 1
+   observation_count = 0
+   计划 = create_memory 编译成功经验：Keil C51 编译前做 storage modifier、code/const、ISR、static 函数定义顺序等自检，可减少编译返工。
+```
+
+程序级边界验收：
+
+```text
+update_without_read_should_fail = PASS
+  未通过 read_memory_detail/read_topic_detail 读取目标 memory 前，update_memory 会被拦截。
+
+update_after_read_should_pass = PASS
+  读取过目标 memory 后，update_memory schema 可通过。
+
+conflict_after_read_should_pass_schema = PASS
+  读取过目标 memory 后，mark_conflict schema 可通过；真实业务冲突样本尚未出现，后续需用长期测试补足。
 ```
