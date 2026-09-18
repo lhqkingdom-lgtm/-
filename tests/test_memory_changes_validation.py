@@ -199,6 +199,81 @@ class MemoryChangesValidationTests(unittest.TestCase):
 
 
 class MemoryChangesCommitIdempotencyTests(unittest.TestCase):
+    def test_create_memory_writes_initial_revision(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "create_memory",
+                "reason": "新增用户协作偏好。",
+                "topic": {
+                    "topic_key": "user_preference_answer_style",
+                    "title": "回答风格偏好",
+                    "summary": "记录用户对回答详略的偏好。",
+                    "topic_type": "user_preference",
+                    "scope": {"level": "global"},
+                },
+                "memory": {
+                    "stable_key": "user.preference.answer_style.concise",
+                    "memory_type": "collaboration_preference",
+                    "summary": "用户希望回答更简洁。",
+                    "content": "用户希望回答更简洁，优先给结论。",
+                    "scope": {"level": "global"},
+                    "confidence": 0.8,
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=SNAPSHOT,
+        ), patch("memory_lab.memory_changes._run_psql") as run_psql:
+            result = commit_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+        run_psql.assert_called_once()
+        sql = run_psql.call_args.args[1]
+        self.assertIn("INSERT INTO memory_revisions", sql)
+        self.assertIn("'create'", sql)
+        self.assertIn("revision_number", sql)
+        self.assertEqual(result["counts"]["applied"], 1)
+        self.assertEqual(result["applied"][0]["result"], "created")
+
+    def test_update_memory_appends_revision_and_supersedes_previous_current(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "update_memory",
+                "reason": "更新已有偏好。",
+                "target_memory_id": "mem_language",
+                "memory": {
+                    "summary": "用户要求默认英文回复。",
+                    "content": "用户要求默认英文回复。",
+                    "confidence": 0.9,
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=SNAPSHOT,
+        ), patch(
+            "memory_lab.memory_changes._memory_already_processed_turn",
+            return_value=False,
+        ), patch("memory_lab.memory_changes._run_psql") as run_psql:
+            result = commit_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+        run_psql.assert_called_once()
+        sql = run_psql.call_args.args[1]
+        self.assertIn("UPDATE memory_revisions", sql)
+        self.assertIn("SET status = 'superseded'", sql)
+        self.assertIn("INSERT INTO memory_revisions", sql)
+        self.assertIn("'update_memory'", sql)
+        self.assertEqual(result["counts"]["applied"], 1)
+        self.assertEqual(result["applied"][0]["result"], "updated")
+
     def test_update_topic_skips_when_title_and_summary_are_unchanged(self) -> None:
         proposal = base_proposal(
             {

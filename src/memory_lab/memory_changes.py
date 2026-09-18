@@ -633,6 +633,67 @@ VALUES (
     return memory_id, sql
 
 
+def _insert_memory_revision_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    turn_id: str,
+    change_type: str,
+    reason: str,
+    metadata: Mapping[str, Any],
+    initial: bool = False,
+) -> str:
+    """Append a lightweight revision for the current state of one memory."""
+
+    if initial:
+        revision_number_sql = "1"
+        supersede_sql = ""
+    else:
+        revision_number_sql = """
+        COALESCE((
+          SELECT max(r.revision_number)
+          FROM memory_revisions r
+          WHERE r.user_id = m.user_id
+            AND r.memory_id = m.memory_id
+        ), 0) + 1
+        """
+        supersede_sql = f"""
+UPDATE memory_revisions
+SET status = 'superseded'
+WHERE user_id = {_sql_literal(user_id)}
+  AND memory_id = {_sql_literal(memory_id)}
+  AND status = 'current';
+"""
+    return f"""
+{supersede_sql}
+INSERT INTO memory_revisions(
+  revision_id, user_id, memory_id, revision_number, summary, content,
+  confidence, trust_level, status, change_type, reason, source_turn_id, metadata
+)
+SELECT
+  'rev_' || substr(md5(
+    m.user_id || '|' || m.memory_id || '|' || {_sql_literal(change_type)} || '|' ||
+    COALESCE({_sql_literal(turn_id)}, '') || '|' || m.summary || '|' || m.content
+  ), 1, 16),
+  m.user_id,
+  m.memory_id,
+  {revision_number_sql},
+  m.summary,
+  m.content,
+  m.confidence,
+  m.trust_level,
+  'current',
+  {_sql_literal(change_type)},
+  {_sql_literal(reason)},
+  {_sql_literal(turn_id)}::text,
+  {_json_literal({"change_metadata": metadata})}
+FROM memories m
+WHERE m.user_id = {_sql_literal(user_id)}
+  AND m.memory_id = {_sql_literal(memory_id)}
+ON CONFLICT (revision_id) DO NOTHING;
+"""
+
+
 def _update_memory_sql(
     *,
     user_id: str,
@@ -896,7 +957,16 @@ def _commit_validated_change(
             memory=change["memory"],
             metadata=metadata,
         )
-        _run_psql(config, "BEGIN;\n" + topic_sql + memory_sql + "\nCOMMIT;")
+        revision_sql = _insert_memory_revision_sql(
+            user_id=user_id,
+            memory_id=memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            change_type="create",
+            reason=str(change.get("reason") or "create_memory"),
+            metadata=metadata,
+            initial=True,
+        )
+        _run_psql(config, "BEGIN;\n" + topic_sql + memory_sql + revision_sql + "\nCOMMIT;")
         return {
             "action": action,
             "committed": True,
@@ -1017,7 +1087,16 @@ def _commit_validated_change(
         metadata=metadata,
         status=status,
     )
-    _run_psql(config, "BEGIN;\n" + sql + "\nCOMMIT;")
+    revision_sql = _insert_memory_revision_sql(
+        user_id=user_id,
+        memory_id=target_memory_id,
+        turn_id=str(proposal.get("turn_id") or ""),
+        change_type=action,
+        reason=str(change.get("reason") or action),
+        metadata=metadata,
+        initial=False,
+    )
+    _run_psql(config, "BEGIN;\n" + sql + revision_sql + "\nCOMMIT;")
     return {
         "action": action,
         "committed": True,
