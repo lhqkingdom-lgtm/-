@@ -1351,6 +1351,319 @@ LIMIT 1;
     return {"status": "complete", "tool": "read_memory_detail", "memory": memory}
 
 
+def list_topic_memories(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    topic_id: str,
+    include_inactive: bool = False,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """List bounded current-state memory summaries under one topic."""
+
+    limit = max(1, min(int(limit), 50))
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    topic_status_filter = "true" if include_inactive else "mt.status = 'active'"
+    memory_status_filter = "true" if include_inactive else "m.status = 'active'"
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH selected_topic AS (
+  SELECT *
+  FROM memory_topics mt
+  WHERE mt.topic_id = {_sql_literal(topic_id)}
+    AND mt.user_id = {_sql_literal(user_id)}
+    AND {topic_status_filter}
+)
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'topic', jsonb_build_object(
+      'topic_id', mt.topic_id,
+      'topic_key', mt.topic_key,
+      'title', mt.title,
+      'summary', mt.summary,
+      'topic_type', mt.topic_type,
+      'scope', mt.scope,
+      'status', mt.status,
+      'updated_at', mt.updated_at
+    ),
+    'memories', COALESCE((
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'memory_id', m.memory_id,
+          'stable_key', m.stable_key,
+          'memory_type', m.memory_type,
+          'scope', m.scope,
+          'summary', left(m.summary, 500),
+          'summary_truncated', length(m.summary) > 500,
+          'status', m.status,
+          'confidence', m.confidence,
+          'trust_level', m.trust_level,
+          'updated_at', m.updated_at
+        )
+        ORDER BY m.updated_at DESC, m.stable_key
+      )
+      FROM (
+        SELECT *
+        FROM memories m
+        WHERE m.topic_id = mt.topic_id
+          AND m.user_id = mt.user_id
+          AND {memory_status_filter}
+        ORDER BY m.updated_at DESC, m.stable_key
+        LIMIT {limit}
+      ) m
+    ), '[]'::jsonb),
+    'total_active_memory_count', (
+      SELECT count(*)
+      FROM memories m
+      WHERE m.topic_id = mt.topic_id
+        AND m.user_id = mt.user_id
+        AND {memory_status_filter}
+    )
+  )
+  FROM selected_topic mt
+), jsonb_build_object(
+  'found', false,
+  'topic', null,
+  'memories', '[]'::jsonb,
+  'total_active_memory_count', 0
+))::text;
+"""
+    detail = _json_from_psql_object(config, sql)
+    found = bool(detail.get("found"))
+    return {
+        "status": "complete" if found else "not_found",
+        "tool": "list_topic_memories",
+        "topic_id": topic_id,
+        "found": found,
+        "include_inactive": include_inactive,
+        "limit": limit,
+        "topic": detail.get("topic"),
+        "memories": detail.get("memories") or [],
+        "count": len(detail.get("memories") or []),
+        "total_active_memory_count": int(detail.get("total_active_memory_count") or 0),
+        "guidance": (
+            "如需修改某条 memory，请先调用 read_memory_detail 读取完整正文。"
+            if found
+            else "未找到 topic_id；请先通过 list_memory_topics 或 search_related_memories 获取有效 topic_id。"
+        ),
+    }
+
+
+def read_memory_history(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    memory_id: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Read bounded revision history for one memory."""
+
+    limit = max(1, min(int(limit), 50))
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH selected_memory AS (
+  SELECT m.*, mt.topic_key, mt.title AS topic_title
+  FROM memories m
+  JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+  WHERE m.memory_id = {_sql_literal(memory_id)}
+    AND m.user_id = {_sql_literal(user_id)}
+),
+revision_rows AS (
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'revision_id', r.revision_id,
+      'revision_number', r.revision_number,
+      'summary', left(r.summary, 500),
+      'summary_truncated', length(r.summary) > 500,
+      'content_preview', left(r.content, 1000),
+      'content_truncated', length(r.content) > 1000,
+      'confidence', r.confidence,
+      'trust_level', r.trust_level,
+      'status', r.status,
+      'change_type', r.change_type,
+      'reason', left(r.reason, 500),
+      'source_turn_id', r.source_turn_id,
+      'created_at', r.created_at
+    )
+    ORDER BY r.revision_number DESC
+  ), '[]'::jsonb) AS revisions
+  FROM (
+    SELECT *
+    FROM memory_revisions r
+    WHERE r.memory_id = {_sql_literal(memory_id)}
+      AND r.user_id = {_sql_literal(user_id)}
+    ORDER BY r.revision_number DESC
+    LIMIT {limit}
+  ) r
+)
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'memory', jsonb_build_object(
+      'memory_id', m.memory_id,
+      'topic_id', m.topic_id,
+      'topic_key', m.topic_key,
+      'topic_title', m.topic_title,
+      'stable_key', m.stable_key,
+      'memory_type', m.memory_type,
+      'summary', m.summary,
+      'status', m.status,
+      'confidence', m.confidence,
+      'trust_level', m.trust_level,
+      'updated_at', m.updated_at
+    ),
+    'revisions', (SELECT revisions FROM revision_rows),
+    'total_revision_count', (
+      SELECT count(*)
+      FROM memory_revisions r
+      WHERE r.memory_id = m.memory_id
+        AND r.user_id = m.user_id
+    )
+  )
+  FROM selected_memory m
+), jsonb_build_object(
+  'found', false,
+  'memory', null,
+  'revisions', '[]'::jsonb,
+  'total_revision_count', 0
+))::text;
+"""
+    detail = _json_from_psql_object(config, sql)
+    found = bool(detail.get("found"))
+    return {
+        "status": "complete" if found else "not_found",
+        "tool": "read_memory_history",
+        "memory_id": memory_id,
+        "found": found,
+        "limit": limit,
+        "memory": detail.get("memory"),
+        "revisions": detail.get("revisions") or [],
+        "count": len(detail.get("revisions") or []),
+        "total_revision_count": int(detail.get("total_revision_count") or 0),
+        "guidance": (
+            "history 只用于判断时间线和变更原因；修改 memory 前仍需 read_memory_detail。"
+            if found
+            else "未找到 memory_id；请先通过 search_related_memories 或 list_topic_memories 获取有效 memory_id。"
+        ),
+    }
+
+
+def list_memory_conflicts(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    memory_id: str | None = None,
+    topic_id: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """List bounded conflict decisions for one memory or one topic."""
+
+    memory_id = str(memory_id or "").strip() or None
+    topic_id = str(topic_id or "").strip() or None
+    if bool(memory_id) == bool(topic_id):
+        return {
+            "status": "rejected",
+            "tool": "list_memory_conflicts",
+            "error_code": "invalid_target",
+            "memory_id": memory_id,
+            "topic_id": topic_id,
+            "conflicts": [],
+            "count": 0,
+            "guidance": "必须且只能提供 memory_id 或 topic_id 其中一个。",
+        }
+    limit = max(1, min(int(limit), 50))
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    target_filter = (
+        f"c.memory_id = {_sql_literal(memory_id)}"
+        if memory_id
+        else f"c.topic_id = {_sql_literal(topic_id or '')}"
+    )
+    target_exists_sql = (
+        f"""
+        SELECT EXISTS(
+          SELECT 1 FROM memories
+          WHERE user_id = {_sql_literal(user_id)}
+            AND memory_id = {_sql_literal(memory_id or '')}
+        )
+        """
+        if memory_id
+        else f"""
+        SELECT EXISTS(
+          SELECT 1 FROM memory_topics
+          WHERE user_id = {_sql_literal(user_id)}
+            AND topic_id = {_sql_literal(topic_id or '')}
+        )
+        """
+    )
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH target AS (
+  {target_exists_sql} AS found
+),
+conflict_rows AS (
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'conflict_id', c.conflict_id,
+      'memory_id', c.memory_id,
+      'topic_id', c.topic_id,
+      'conflict_type', c.conflict_type,
+      'old_claim', left(c.old_claim, 800),
+      'new_claim', left(c.new_claim, 800),
+      'decision', left(c.decision, 800),
+      'reason', left(c.reason, 800),
+      'status', c.status,
+      'turn_id', c.turn_id,
+      'evidence_refs', c.evidence_refs,
+      'created_at', c.created_at
+    )
+    ORDER BY c.created_at DESC, c.conflict_id
+  ), '[]'::jsonb) AS conflicts
+  FROM (
+    SELECT *
+    FROM memory_conflict_records c
+    WHERE c.user_id = {_sql_literal(user_id)}
+      AND {target_filter}
+    ORDER BY c.created_at DESC, c.conflict_id
+    LIMIT {limit}
+  ) c
+)
+SELECT jsonb_build_object(
+  'found', (SELECT found FROM target),
+  'conflicts', (SELECT conflicts FROM conflict_rows),
+  'total_conflict_count', (
+    SELECT count(*)
+    FROM memory_conflict_records c
+    WHERE c.user_id = {_sql_literal(user_id)}
+      AND {target_filter}
+  )
+)::text;
+"""
+    detail = _json_from_psql_object(config, sql)
+    found = bool(detail.get("found"))
+    conflicts = detail.get("conflicts") or []
+    return {
+        "status": "complete" if found else "not_found",
+        "tool": "list_memory_conflicts",
+        "memory_id": memory_id,
+        "topic_id": topic_id,
+        "found": found,
+        "limit": limit,
+        "conflicts": conflicts,
+        "count": len(conflicts),
+        "total_conflict_count": int(detail.get("total_conflict_count") or 0),
+        "guidance": (
+            "若已有相同冲突记录，优先避免重复记录；必要时补充证据或更新决策。"
+            if found
+            else "目标不存在；请先通过 read_memory_detail 或 read_topic_detail 确认 ID。"
+        ),
+    }
+
+
 def trace_memory_relations(
     *,
     pg_config_path: Path = DEFAULT_PG_CONFIG,
@@ -1767,7 +2080,10 @@ def postgres_quality_report(
 __all__ = [
     "DEFAULT_PG_CONFIG",
     "ingest_turn_to_postgres",
+    "list_memory_conflicts",
     "load_pg_config",
+    "list_topic_memories",
+    "read_memory_history",
     "postgres_quality_report",
     "show_postgres_turn",
 ]

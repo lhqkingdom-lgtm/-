@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-list-topic-memories', 'pg-read-memory-history', 'pg-list-memory-conflicts', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -67,7 +67,7 @@ param(
 
     [string[]]$Condition,
 
-    [ValidateRange(1, 20)]
+    [ValidateRange(1, 50)]
     [int]$Limit = 5,
 
     [ValidateRange(1, 32)]
@@ -236,6 +236,39 @@ try {
         }
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
             $Command --pg-config $PgConfigPath --memory-id $MemoryId
+    }
+    elseif ($Command -eq 'pg-list-topic-memories') {
+        if (-not $TopicId) {
+            throw 'pg-list-topic-memories requires -TopicId'
+        }
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--topic-id', $TopicId, '--limit', $Limit
+        )
+        if ($IncludeInactive) {
+            $Arguments += '--include-inactive'
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'pg-read-memory-history') {
+        if (-not $MemoryId) {
+            throw 'pg-read-memory-history requires -MemoryId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --memory-id $MemoryId --limit $Limit
+    }
+    elseif ($Command -eq 'pg-list-memory-conflicts') {
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--limit', $Limit
+        )
+        if ($MemoryId) {
+            $Arguments += @('--memory-id', $MemoryId)
+        }
+        if ($TopicId) {
+            $Arguments += @('--topic-id', $TopicId)
+        }
+        & $PythonExecutable @Arguments
     }
     elseif ($Command -eq 'pg-trace-memory-relations') {
         if (-not $MemoryId) {

@@ -18,6 +18,9 @@ class MemoryReactPromptTests(unittest.TestCase):
         self.assertIn("搜索结果只用于决定下一步读哪个 memory/topic 详情", REACT_SYSTEM_PROMPT)
         self.assertIn("trace_memory_relations", REACT_SYSTEM_PROMPT)
         self.assertIn("record_memory_relation", REACT_SYSTEM_PROMPT)
+        self.assertIn("list_topic_memories", REACT_SYSTEM_PROMPT)
+        self.assertIn("read_memory_history", REACT_SYSTEM_PROMPT)
+        self.assertIn("list_memory_conflicts", REACT_SYSTEM_PROMPT)
 
     def test_validate_accepts_search_related_memories_request(self) -> None:
         decision = {
@@ -191,6 +194,79 @@ class MemoryReactPromptTests(unittest.TestCase):
                 turn_id="turn_1",
                 available_ids={
                     "topic_ids": set(),
+                    "memory_ids": {"mem_language"},
+                    "pointer_ids": set(),
+                },
+                pg_config_path=Path("unused.json"),
+            )
+
+    def test_validate_accepts_new_memory_management_read_tools(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "需要看主题下记忆、记忆历史和已有冲突。",
+            "tool_requests": [
+                {
+                    "tool": "list_topic_memories",
+                    "topic_id": "topic_language",
+                    "reason": "查看主题下是否已有同类偏好。",
+                    "limit": 10,
+                },
+                {
+                    "tool": "read_memory_history",
+                    "memory_id": "mem_language",
+                    "reason": "查看这条偏好是否已被多次修正。",
+                    "limit": 5,
+                },
+                {
+                    "tool": "list_memory_conflicts",
+                    "memory_id": "mem_language",
+                    "reason": "查看是否已有同类语言偏好冲突记录。",
+                    "limit": 5,
+                },
+            ],
+            "changes": [],
+        }
+
+        validated = validate_react_decision(
+            decision,
+            turn_id="turn_1",
+            available_ids={
+                "topic_ids": {"topic_language"},
+                "memory_ids": {"mem_language"},
+                "pointer_ids": set(),
+            },
+            pg_config_path=Path("unused.json"),
+        )
+
+        self.assertEqual(
+            [item["tool"] for item in validated["tool_requests"]],
+            ["list_topic_memories", "read_memory_history", "list_memory_conflicts"],
+        )
+
+    def test_validate_rejects_bad_new_memory_management_read_tool_args(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "错误参数。",
+            "tool_requests": [
+                {
+                    "tool": "list_memory_conflicts",
+                    "memory_id": "mem_language",
+                    "topic_id": "topic_language",
+                    "reason": "不能同时给两个目标。",
+                    "limit": 99,
+                }
+            ],
+            "changes": [],
+        }
+
+        with self.assertRaisesRegex(Exception, "exactly one of memory_id/topic_id"):
+            validate_react_decision(
+                decision,
+                turn_id="turn_1",
+                available_ids={
+                    "topic_ids": {"topic_language"},
                     "memory_ids": {"mem_language"},
                     "pointer_ids": set(),
                 },

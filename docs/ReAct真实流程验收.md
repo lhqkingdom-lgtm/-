@@ -46,6 +46,9 @@ ReAct 测试不是验证“工具能不能写库”，而是验证大模型是�
 | 可能已有相似记忆 | 调用 `search_related_memories` 或读取相关 topic/memory |
 | 要修改已有 memory | 先 `read_memory_detail` 或通过自动读工具读取详情 |
 | 要判断主题是否已有覆盖 | 调用 `read_topic_detail` |
+| 要判断同一主题下是否已有重复 memory | 调用 `list_topic_memories` |
+| 要判断已有 memory 是否曾被补充/修正过 | 调用 `read_memory_history` |
+| 要处理偏好变化或冲突 | 调用 `list_memory_conflicts` 检查是否已有冲突记录 |
 | 当前 turn 证据不够 | 输出 `request_more_evidence` 或调用 `expand_pointer` |
 | 需要检查关系链 | 调用 `trace_memory_relations` |
 
@@ -247,7 +250,30 @@ action=merge_memory
 输出合法 memory-changes-v1
 ```
 
-## 5. 下一步建议
+## 5. P0 读工具补充验收
+
+本轮新增了三个给 ReAct 使用的确定性读工具：
+
+| 工具 | 验收重点 | 结果 |
+|---|---|---|
+| `list_topic_memories` | 只返回主题内 memory 摘要；主题不存在时返回 `not_found`；不泄露大段正文 | 通过 |
+| `read_memory_history` | 返回 memory 当前信息和版本历史摘要；用于判断补充/修正/重复 | 通过 |
+| `list_memory_conflicts` | `memory_id` 和 `topic_id` 必须二选一；可查已有冲突记录 | 通过 |
+
+真实 dry-run 补充结果：
+
+```text
+用户偏好冲突 turn：
+模型调用 read_memory_detail + read_topic_detail + list_memory_conflicts，
+确认“中文回复/英文回复”冲突记录已经存在，最终选择 noop，避免重复写冲突。
+
+编译修复 turn：
+模型调用 read_memory_detail 读取两条相关 memory，
+再调用 list_topic_memories 查看主题下是否已有重复 memory，
+最终判断已有记忆覆盖本轮证据，选择 noop。
+```
+
+## 6. 下一步建议
 
 下一阶段可以进入小范围真实 commit 测试。
 

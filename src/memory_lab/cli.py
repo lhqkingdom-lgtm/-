@@ -39,10 +39,13 @@ from .pg_store import (
     get_current_turn_evidence_summary,
     get_turn_evidence,
     ingest_turn_to_postgres,
+    list_memory_conflicts,
     list_memory_topics,
+    list_topic_memories,
     migrate_memory_versioning,
     postgres_quality_report,
     read_memory_detail,
+    read_memory_history,
     read_topic_detail,
     search_related_memories,
     show_postgres_turn,
@@ -413,6 +416,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pg_read_memory_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_read_memory_detail.add_argument("--memory-id", required=True)
+    pg_list_topic_memories = subparsers.add_parser(
+        "pg-list-topic-memories",
+        help="List bounded memory summaries under one topic",
+    )
+    pg_list_topic_memories.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_list_topic_memories.add_argument("--topic-id", required=True)
+    pg_list_topic_memories.add_argument("--include-inactive", action="store_true")
+    pg_list_topic_memories.add_argument("--limit", type=int, default=20)
+    pg_read_memory_history = subparsers.add_parser(
+        "pg-read-memory-history",
+        help="Read bounded revision history for one memory",
+    )
+    pg_read_memory_history.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_read_memory_history.add_argument("--memory-id", required=True)
+    pg_read_memory_history.add_argument("--limit", type=int, default=10)
+    pg_list_memory_conflicts = subparsers.add_parser(
+        "pg-list-memory-conflicts",
+        help="List conflict records for one memory or one topic",
+    )
+    pg_list_memory_conflicts.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_list_memory_conflicts.add_argument("--memory-id")
+    pg_list_memory_conflicts.add_argument("--topic-id")
+    pg_list_memory_conflicts.add_argument("--limit", type=int, default=20)
     pg_trace_memory_relations = subparsers.add_parser(
         "pg-trace-memory-relations",
         help="Read one memory's version history and direct relation links",
@@ -793,6 +819,26 @@ def main(argv: list[str] | None = None) -> int:
             report = read_memory_detail(
                 pg_config_path=args.pg_config,
                 memory_id=args.memory_id,
+            )
+        elif args.command == "pg-list-topic-memories":
+            report = list_topic_memories(
+                pg_config_path=args.pg_config,
+                topic_id=args.topic_id,
+                include_inactive=args.include_inactive,
+                limit=args.limit,
+            )
+        elif args.command == "pg-read-memory-history":
+            report = read_memory_history(
+                pg_config_path=args.pg_config,
+                memory_id=args.memory_id,
+                limit=args.limit,
+            )
+        elif args.command == "pg-list-memory-conflicts":
+            report = list_memory_conflicts(
+                pg_config_path=args.pg_config,
+                memory_id=args.memory_id,
+                topic_id=args.topic_id,
+                limit=args.limit,
             )
         elif args.command == "pg-trace-memory-relations":
             report = trace_memory_relations(

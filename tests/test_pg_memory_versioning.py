@@ -7,8 +7,11 @@ from unittest.mock import patch
 from memory_lab.pg_store import (
     MEMORY_RELATION_TYPES,
     TRUST_LEVELS,
+    list_memory_conflicts,
+    list_topic_memories,
     _memory_versioning_migration_sql,
     migrate_memory_versioning,
+    read_memory_history,
     trace_memory_relations,
 )
 
@@ -102,6 +105,124 @@ class PgMemoryVersioningTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "rejected")
         self.assertEqual(result["error_code"], "invalid_direction")
+
+    def test_list_topic_memories_returns_bounded_summaries(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "topic": {"topic_id": "topic_1", "title": "主题"},
+            "memories": [{"memory_id": "mem_1", "summary": "摘要"}],
+            "total_active_memory_count": 1,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_topic_memories(
+                pg_config_path=Path("unused.json"),
+                topic_id="topic_1",
+                limit=999,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["limit"], 50)
+        self.assertEqual(result["memories"][0]["memory_id"], "mem_1")
+        self.assertIn("read_memory_detail", result["guidance"])
+        sql = query_json.call_args.args[1]
+        self.assertIn("left(m.summary, 500)", sql)
+        self.assertIn("LIMIT 50", sql)
+        self.assertNotIn("m.content", sql)
+
+    def test_list_topic_memories_reports_missing_topic(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object",
+            return_value={"found": False, "topic": None, "memories": [], "total_active_memory_count": 0},
+        ):
+            result = list_topic_memories(
+                pg_config_path=Path("unused.json"),
+                topic_id="topic_missing",
+            )
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertFalse(result["found"])
+        self.assertIn("未找到 topic_id", result["guidance"])
+
+    def test_read_memory_history_returns_revisions(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "memory": {"memory_id": "mem_1", "summary": "当前摘要"},
+            "revisions": [{"revision_id": "rev_2", "revision_number": 2}],
+            "total_revision_count": 2,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = read_memory_history(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_1",
+                limit=999,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["limit"], 50)
+        self.assertEqual(result["revisions"][0]["revision_number"], 2)
+        self.assertIn("read_memory_detail", result["guidance"])
+        sql = query_json.call_args.args[1]
+        self.assertIn("memory_revisions", sql)
+        self.assertIn("content_preview", sql)
+        self.assertIn("LIMIT 50", sql)
+
+    def test_list_memory_conflicts_requires_exactly_one_target(self) -> None:
+        result = list_memory_conflicts(pg_config_path=Path("unused.json"))
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], "invalid_target")
+
+        result = list_memory_conflicts(
+            pg_config_path=Path("unused.json"),
+            memory_id="mem_1",
+            topic_id="topic_1",
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], "invalid_target")
+
+    def test_list_memory_conflicts_returns_conflicts(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "conflicts": [{"conflict_id": "conflict_1", "status": "resolved"}],
+            "total_conflict_count": 1,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_memory_conflicts(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_1",
+                limit=999,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["limit"], 50)
+        self.assertEqual(result["conflicts"][0]["conflict_id"], "conflict_1")
+        self.assertIn("避免重复记录", result["guidance"])
+        sql = query_json.call_args.args[1]
+        self.assertIn("memory_conflict_records", sql)
+        self.assertIn("ORDER BY c.created_at DESC", sql)
 
 
 if __name__ == "__main__":

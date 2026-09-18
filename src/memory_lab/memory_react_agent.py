@@ -38,7 +38,10 @@ from .pg_store import (
     DEFAULT_PG_CONFIG,
     expand_pointer,
     get_current_turn_evidence_summary,
+    list_memory_conflicts,
+    list_topic_memories,
     read_memory_detail,
+    read_memory_history,
     read_topic_detail,
     search_related_memories,
     trace_memory_relations,
@@ -54,6 +57,9 @@ ALLOWED_TOOLS = {
     "search_related_memories",
     "get_current_turn_evidence_summary",
     "trace_memory_relations",
+    "list_topic_memories",
+    "read_memory_history",
+    "list_memory_conflicts",
 }
 
 
@@ -82,8 +88,11 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - memory_index：记忆摘要，只能用于发现相似/重复/冲突候选。
 
 3. observations：
-- search_related_memories / read_memory_detail / read_topic_detail / expand_pointer / get_current_turn_evidence_summary 返回的详情。
+- search_related_memories / read_memory_detail / read_topic_detail / list_topic_memories / read_memory_history / list_memory_conflicts / expand_pointer / get_current_turn_evidence_summary 返回的详情。
 - search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
+- list_topic_memories 只列出某个主题下的 memory 摘要，用于判断是否需要继续 read_memory_detail。
+- read_memory_history 用于查看某条 memory 的版本历史，不授权修改。
+- list_memory_conflicts 用于查看已有冲突记录，避免重复记录冲突或判断是否需要补充冲突证据。
 - get_current_turn_evidence_summary 只用于回看当前 turn 的证据池，帮助确认 evidence_id 和本轮事实，不授权修改任何 memory。
 - trace_memory_relations 用于查看某条 memory 的版本历史和 supersedes/merges/conflicts_with 关系，不授权修改。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
@@ -216,6 +225,9 @@ request_more_evidence：证据不足
 如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
+如果主题下 memory 较多或不确定是否重复，应请求 list_topic_memories 先看轻量摘要，再决定是否 read_memory_detail。
+如果需要判断新证据是补充、修正还是已处理过，应请求 read_memory_history 查看版本时间线。
+如果要处理用户偏好变化或冲突，应请求 list_memory_conflicts 查看是否已有相同冲突记录。
 如果怀疑某条 memory 已被合并、替代或与其他 memory 冲突，应请求 trace_memory_relations 查看关系链。
 如果经过多轮工具调用后不确定当前 turn 的证据、evidence_id 或本轮是否足够支撑写入，可以请求 get_current_turn_evidence_summary 回看当前 turn 证据池。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
@@ -235,7 +247,10 @@ request_more_evidence：证据不足
   "tool_requests": [
     {"tool": "search_related_memories", "query": "症状/工具链/主题关键词", "reason": "为什么要搜旧记忆"},
     {"tool": "read_topic_detail", "topic_id": "已有 topic_id", "reason": "为什么查"},
+    {"tool": "list_topic_memories", "topic_id": "已有 topic_id", "reason": "为什么列出主题下记忆"},
     {"tool": "read_memory_detail", "memory_id": "已有 memory_id", "reason": "为什么查"},
+    {"tool": "read_memory_history", "memory_id": "已有 memory_id", "reason": "为什么查版本历史"},
+    {"tool": "list_memory_conflicts", "memory_id": "已有 memory_id", "reason": "为什么查冲突记录"},
     {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"},
     {"tool": "get_current_turn_evidence_summary", "reason": "为什么需要回看当前 turn 证据"},
     {"tool": "trace_memory_relations", "memory_id": "已有 memory_id", "reason": "为什么需要查版本/关系链"}
@@ -478,8 +493,14 @@ def _tool_key(request: Mapping[str, Any]) -> tuple[str, str]:
     tool = str(request.get("tool") or "")
     if tool == "read_topic_detail":
         return tool, str(request.get("topic_id") or "")
+    if tool == "list_topic_memories":
+        return tool, str(request.get("topic_id") or "")
     if tool == "read_memory_detail":
         return tool, str(request.get("memory_id") or "")
+    if tool == "read_memory_history":
+        return tool, str(request.get("memory_id") or "")
+    if tool == "list_memory_conflicts":
+        return tool, str(request.get("memory_id") or request.get("topic_id") or "")
     if tool == "expand_pointer":
         return tool, str(request.get("raw_pointer_id") or "")
     if tool == "search_related_memories":
@@ -556,7 +577,10 @@ def validate_react_decision(
             continue
         allowed_by_tool = {
             "read_topic_detail": {"tool", "topic_id", "reason"},
+            "list_topic_memories": {"tool", "topic_id", "reason", "limit"},
             "read_memory_detail": {"tool", "memory_id", "reason"},
+            "read_memory_history": {"tool", "memory_id", "reason", "limit"},
+            "list_memory_conflicts": {"tool", "memory_id", "topic_id", "reason", "limit"},
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {
                 "tool",
@@ -583,7 +607,10 @@ def validate_react_decision(
         }[str(tool)]
         required_by_tool = {
             "read_topic_detail": {"tool", "topic_id", "reason"},
+            "list_topic_memories": {"tool", "topic_id", "reason"},
             "read_memory_detail": {"tool", "memory_id", "reason"},
+            "read_memory_history": {"tool", "memory_id", "reason"},
+            "list_memory_conflicts": {"tool", "reason"},
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {"tool", "query", "reason"},
             "get_current_turn_evidence_summary": {"tool", "reason"},
@@ -636,8 +663,44 @@ def validate_react_decision(
                     errors.append(f"{prefix}.max_depth must be an integer")
         if tool == "read_topic_detail" and request.get("topic_id") not in topic_ids:
             errors.append(f"{prefix}.topic_id does not exist or is not active")
+        if tool == "list_topic_memories":
+            if request.get("topic_id") not in topic_ids:
+                errors.append(f"{prefix}.topic_id does not exist or is not active")
+            if "limit" in request:
+                try:
+                    limit_value = int(request.get("limit"))
+                    if limit_value < 1 or limit_value > 50:
+                        errors.append(f"{prefix}.limit must be between 1 and 50")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
         if tool == "read_memory_detail" and request.get("memory_id") not in memory_ids:
             errors.append(f"{prefix}.memory_id does not exist or is not active")
+        if tool == "read_memory_history":
+            if request.get("memory_id") not in memory_ids:
+                errors.append(f"{prefix}.memory_id does not exist or is not active")
+            if "limit" in request:
+                try:
+                    limit_value = int(request.get("limit"))
+                    if limit_value < 1 or limit_value > 50:
+                        errors.append(f"{prefix}.limit must be between 1 and 50")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
+        if tool == "list_memory_conflicts":
+            has_memory = _non_empty_string(request.get("memory_id"))
+            has_topic = _non_empty_string(request.get("topic_id"))
+            if has_memory == has_topic:
+                errors.append(f"{prefix} must contain exactly one of memory_id/topic_id")
+            if has_memory and request.get("memory_id") not in memory_ids:
+                errors.append(f"{prefix}.memory_id does not exist or is not active")
+            if has_topic and request.get("topic_id") not in topic_ids:
+                errors.append(f"{prefix}.topic_id does not exist or is not active")
+            if "limit" in request:
+                try:
+                    limit_value = int(request.get("limit"))
+                    if limit_value < 1 or limit_value > 50:
+                        errors.append(f"{prefix}.limit must be between 1 and 50")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
         if tool == "expand_pointer" and request.get("raw_pointer_id") not in pointer_ids:
             errors.append(f"{prefix}.raw_pointer_id does not belong to this turn")
         key = _tool_key(request)
@@ -688,6 +751,12 @@ def _execute_tool_request(
             topic_id=str(request["topic_id"]),
             max_chars=max_chars,
         )
+    if tool == "list_topic_memories":
+        return list_topic_memories(
+            pg_config_path=pg_config_path,
+            topic_id=str(request["topic_id"]),
+            limit=int(request.get("limit") or 20),
+        )
     if tool == "read_memory_detail":
         result = read_memory_detail(
             pg_config_path=pg_config_path,
@@ -702,6 +771,19 @@ def _execute_tool_request(
             memory["content_truncated"] = len(content) > max_chars
             result["memory"] = memory
         return result
+    if tool == "read_memory_history":
+        return read_memory_history(
+            pg_config_path=pg_config_path,
+            memory_id=str(request["memory_id"]),
+            limit=int(request.get("limit") or 10),
+        )
+    if tool == "list_memory_conflicts":
+        return list_memory_conflicts(
+            pg_config_path=pg_config_path,
+            memory_id=str(request["memory_id"]) if request.get("memory_id") else None,
+            topic_id=str(request["topic_id"]) if request.get("topic_id") else None,
+            limit=int(request.get("limit") or 20),
+        )
     if tool == "expand_pointer":
         return expand_pointer(
             source_database,
@@ -923,9 +1005,34 @@ def _react_payload(
                 "purpose": "读取主题正文和主题下的 active memories，用于判断合并/更新/冲突/重复",
             },
             {
+                "tool": "list_topic_memories",
+                "args": {
+                    "topic_id": "必须来自 available_ids.topic_ids",
+                    "limit": "可选；1-50，默认 20",
+                },
+                "purpose": "轻量列出某主题下的 memory 摘要，用于判断是否已有重复/相似 memory；如需修改仍必须 read_memory_detail",
+            },
+            {
                 "tool": "read_memory_detail",
                 "args": {"memory_id": "必须来自 available_ids.memory_ids"},
                 "purpose": "读取某条 memory 的完整内容，用于判断是否合并、更新或冲突",
+            },
+            {
+                "tool": "read_memory_history",
+                "args": {
+                    "memory_id": "必须来自 available_ids.memory_ids",
+                    "limit": "可选；1-50，默认 10",
+                },
+                "purpose": "读取 memory 的版本历史，用于判断新证据是补充、修正、已处理过，还是需要冲突记录；不授权直接修改",
+            },
+            {
+                "tool": "list_memory_conflicts",
+                "args": {
+                    "memory_id": "可选；必须来自 available_ids.memory_ids",
+                    "topic_id": "可选；必须来自 available_ids.topic_ids；memory_id/topic_id 二选一",
+                    "limit": "可选；1-50，默认 20",
+                },
+                "purpose": "查看某条 memory 或某个 topic 下已有冲突记录，避免重复记录冲突，或判断是否需要补充冲突证据",
             },
             {
                 "tool": "expand_pointer",
@@ -1012,6 +1119,15 @@ def _validate_or_repair_react(
                     "tool_request_expand_pointer": ["tool", "raw_pointer_id", "reason"],
                     "tool_request_read_memory_detail": ["tool", "memory_id", "reason"],
                     "tool_request_read_topic_detail": ["tool", "topic_id", "reason"],
+                    "tool_request_list_topic_memories": ["tool", "topic_id", "reason", "limit?"],
+                    "tool_request_read_memory_history": ["tool", "memory_id", "reason", "limit?"],
+                    "tool_request_list_memory_conflicts": [
+                        "tool",
+                        "memory_id?",
+                        "topic_id?",
+                        "reason",
+                        "limit?",
+                    ],
                     "tool_request_search_related_memories": [
                         "tool",
                         "query",
