@@ -40,6 +40,7 @@ from .pg_store import (
     postgres_quality_report,
     read_memory_detail,
     read_topic_detail,
+    search_related_memories,
     show_postgres_turn,
 )
 from .pg_markdown_export import export_pg_markdown
@@ -388,6 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
     pg_read_topic_detail.add_argument("--topic-id", required=True)
     pg_read_topic_detail.add_argument("--include-inactive", action="store_true")
     pg_read_topic_detail.add_argument("--max-chars", type=int, default=4000)
+    pg_search_related_memories = subparsers.add_parser(
+        "pg-search-related-memories",
+        help="Search topic titles/summaries and memory summaries/content for candidate memories",
+    )
+    pg_search_related_memories.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_search_related_memories.add_argument("--query", required=True)
+    pg_search_related_memories.add_argument("--memory-type")
+    pg_search_related_memories.add_argument("--domain")
+    pg_search_related_memories.add_argument("--project-key")
+    pg_search_related_memories.add_argument("--include-inactive", action="store_true")
+    pg_search_related_memories.add_argument("--limit", type=int, default=8)
     pg_export_markdown = subparsers.add_parser(
         "pg-export-markdown",
         help="Export lightweight PostgreSQL memory state to review Markdown files",
@@ -724,6 +736,16 @@ def main(argv: list[str] | None = None) -> int:
                 topic_id=args.topic_id,
                 include_inactive=args.include_inactive,
                 max_chars=args.max_chars,
+            )
+        elif args.command == "pg-search-related-memories":
+            report = search_related_memories(
+                pg_config_path=args.pg_config,
+                query=args.query,
+                memory_type=args.memory_type,
+                domain=args.domain,
+                project_key=args.project_key,
+                include_inactive=args.include_inactive,
+                limit=args.limit,
             )
         elif args.command == "pg-export-markdown":
             report = export_pg_markdown(

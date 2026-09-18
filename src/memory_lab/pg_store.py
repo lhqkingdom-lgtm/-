@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from contextlib import closing
@@ -643,6 +644,201 @@ SELECT COALESCE((
         "topic_id": topic_id,
         "found": bool(detail.get("found")),
         "detail": detail,
+    }
+
+
+def _search_terms(query: str, *, max_terms: int = 12) -> list[str]:
+    """Build bounded, explainable search terms for lightweight SQL recall."""
+
+    text = re.sub(r"\s+", " ", str(query or "").strip())[:240]
+    if not text:
+        return []
+    raw_terms = re.findall(r"[A-Za-z0-9_+#.-]+|[\u4e00-\u9fff]{2,}", text)
+    terms: list[str] = []
+    for term in raw_terms:
+        if len(term) < 2:
+            continue
+        terms.append(term)
+        if re.fullmatch(r"[\u4e00-\u9fff]{5,}", term):
+            for size in (2, 3):
+                for index in range(0, len(term) - size + 1):
+                    terms.append(term[index : index + size])
+    if not terms and len(text) >= 2:
+        terms.append(text)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(term)
+        if len(deduped) >= max_terms:
+            break
+    return deduped
+
+
+def search_related_memories(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    query: str,
+    memory_type: str | None = None,
+    domain: str | None = None,
+    project_key: str | None = None,
+    include_inactive: bool = False,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Search topic titles/summaries and memory summaries/content for candidates.
+
+    This is a recall tool only.  Results are intentionally summaries plus IDs;
+    callers must use ``read_memory_detail`` or ``read_topic_detail`` before
+    modifying any existing memory.
+    """
+
+    normalized_query = re.sub(r"\s+", " ", str(query or "").strip())[:240]
+    terms = _search_terms(normalized_query)
+    limit = max(1, min(int(limit), 20))
+    if not terms:
+        return {
+            "status": "rejected",
+            "tool": "search_related_memories",
+            "error_code": "empty_query",
+            "query": normalized_query,
+            "matches": [],
+            "count": 0,
+            "guidance": "query 为空或没有可搜索词；请根据当前 turn 的症状、主题或关键词重新搜索。",
+        }
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    values_sql = ", ".join(f"({_sql_literal(term)})" for term in terms)
+    min_term_matches = 2 if len(terms) >= 3 else 1
+    filters = [f"m.user_id = {_sql_literal(user_id)}"]
+    if not include_inactive:
+        filters.extend(["m.status = 'active'", "mt.status = 'active'"])
+    if memory_type:
+        filters.append(f"m.memory_type = {_sql_literal(str(memory_type).strip()[:120])}")
+    scope_filters: list[str] = []
+    if domain:
+        scope_filters.append(
+            f"(m.scope ->> 'level' = 'domain' AND m.scope ->> 'domain' = {_sql_literal(str(domain).strip()[:120])})"
+        )
+        scope_filters.append(
+            f"(mt.scope ->> 'level' = 'domain' AND mt.scope ->> 'domain' = {_sql_literal(str(domain).strip()[:120])})"
+        )
+    if project_key:
+        scope_filters.append(
+            f"(m.scope ->> 'level' = 'project' AND m.scope ->> 'project_key' = {_sql_literal(str(project_key).strip()[:160])})"
+        )
+        scope_filters.append(
+            f"(mt.scope ->> 'level' = 'project' AND mt.scope ->> 'project_key' = {_sql_literal(str(project_key).strip()[:160])})"
+        )
+    if scope_filters:
+        filters.append("(" + " OR ".join(scope_filters) + ")")
+    where_sql = " AND ".join(filters)
+    any_match_sql = """
+        mt.title ILIKE '%' || t.term || '%'
+        OR mt.summary ILIKE '%' || t.term || '%'
+        OR m.summary ILIKE '%' || t.term || '%'
+        OR m.content ILIKE '%' || t.term || '%'
+    """
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH terms(term) AS (VALUES {values_sql}),
+ranked AS (
+  SELECT
+    m.memory_id,
+    m.topic_id,
+    mt.topic_key,
+    mt.title AS topic_title,
+    mt.summary AS topic_summary,
+    mt.topic_type,
+    mt.scope AS topic_scope,
+    m.stable_key,
+    m.memory_type,
+    m.scope AS memory_scope,
+    m.summary AS memory_summary,
+    m.status AS memory_status,
+    m.confidence,
+    m.updated_at,
+    (
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE m.summary ILIKE '%' || t.term || '%') THEN 8 ELSE 0 END +
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE mt.title ILIKE '%' || t.term || '%') THEN 6 ELSE 0 END +
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE mt.summary ILIKE '%' || t.term || '%') THEN 4 ELSE 0 END +
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE m.content ILIKE '%' || t.term || '%') THEN 2 ELSE 0 END +
+      (SELECT count(*) FROM terms t WHERE {any_match_sql})
+    ) AS score,
+    to_jsonb(ARRAY(
+      SELECT DISTINCT t.term
+      FROM terms t
+      WHERE {any_match_sql}
+      ORDER BY t.term
+    )) AS matched_terms,
+    to_jsonb(array_remove(ARRAY[
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE mt.title ILIKE '%' || t.term || '%') THEN 'topic.title' END,
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE mt.summary ILIKE '%' || t.term || '%') THEN 'topic.summary' END,
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE m.summary ILIKE '%' || t.term || '%') THEN 'memory.summary' END,
+      CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE m.content ILIKE '%' || t.term || '%') THEN 'memory.content' END
+    ], NULL)) AS matched_fields
+  FROM memories m
+  JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+  WHERE {where_sql}
+    AND (SELECT count(*) FROM terms t WHERE {any_match_sql}) >= {min_term_matches}
+)
+SELECT COALESCE(jsonb_agg(
+  jsonb_build_object(
+    'memory_id', memory_id,
+    'topic_id', topic_id,
+    'topic_key', topic_key,
+    'topic_title', topic_title,
+    'topic_summary', topic_summary,
+    'topic_type', topic_type,
+    'topic_scope', topic_scope,
+    'stable_key', stable_key,
+    'memory_type', memory_type,
+    'memory_scope', memory_scope,
+    'summary', memory_summary,
+    'status', memory_status,
+    'confidence', confidence,
+    'updated_at', updated_at,
+    'matched_terms', matched_terms,
+    'matched_fields', matched_fields,
+    'score', score,
+    'score_reason', '命中字段=' || matched_fields::text || '；命中词=' || matched_terms::text,
+    'next_step', '如需合并、更新或冲突处理，请先调用 read_memory_detail 读取 memory 正文。'
+  )
+  ORDER BY score DESC, updated_at DESC, stable_key
+), '[]'::jsonb)::text
+FROM (
+  SELECT *
+  FROM ranked
+  ORDER BY score DESC, updated_at DESC, stable_key
+  LIMIT {limit}
+) limited;
+"""
+    matches = _json_from_psql_array(config, sql)
+    guidance = (
+        "已返回候选 memory；搜索结果只可用于发现候选，修改前必须 read_memory_detail。"
+        if matches
+        else "未找到候选；可尝试换用症状词、工具链词、主题词，或读取 turn pointer 补充原始证据。"
+    )
+    return {
+        "status": "complete",
+        "tool": "search_related_memories",
+        "query": normalized_query,
+        "terms": terms,
+        "filters": {
+            "memory_type": memory_type,
+            "domain": domain,
+            "project_key": project_key,
+            "include_inactive": include_inactive,
+            "limit": limit,
+            "min_term_matches": min_term_matches,
+        },
+        "matches": matches,
+        "count": len(matches),
+        "guidance": guidance,
     }
 
 

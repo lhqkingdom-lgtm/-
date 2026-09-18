@@ -39,12 +39,18 @@ from .pg_store import (
     expand_pointer,
     read_memory_detail,
     read_topic_detail,
+    search_related_memories,
 )
 
 
 MEMORY_REACT_SCHEMA_VERSION = "memory-react-v1"
 DEFAULT_REACT_RUN_DIR = Path(__file__).resolve().parents[2] / "reports" / "memory-react-runs"
-ALLOWED_TOOLS = {"read_topic_detail", "read_memory_detail", "expand_pointer"}
+ALLOWED_TOOLS = {
+    "read_topic_detail",
+    "read_memory_detail",
+    "expand_pointer",
+    "search_related_memories",
+}
 
 
 class MemoryReactValidationError(ValueError):
@@ -72,7 +78,8 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - memory_index：记忆摘要，只能用于发现相似/重复/冲突候选。
 
 3. observations：
-- read_memory_detail / read_topic_detail / expand_pointer 返回的详情。
+- search_related_memories / read_memory_detail / read_topic_detail / expand_pointer 返回的详情。
+- search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
 
 4. memory_access_state：
@@ -201,8 +208,10 @@ request_more_evidence：证据不足
 4. pointer 可补充原始证据，但不要把完整原文塞进 memory。
 
 如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
+如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
+禁止凭 search_related_memories 结果直接 update_memory / merge_memory / mark_conflict / record_conflict_decision；搜索结果只用于决定下一步读哪个 memory/topic 详情。
 
 ====================
 五、输出格式
@@ -214,6 +223,7 @@ request_more_evidence：证据不足
   "decision": "tool_requests",
   "reason": "中文说明为什么需要查",
   "tool_requests": [
+    {"tool": "search_related_memories", "query": "症状/工具链/主题关键词", "reason": "为什么要搜旧记忆"},
     {"tool": "read_topic_detail", "topic_id": "已有 topic_id", "reason": "为什么查"},
     {"tool": "read_memory_detail", "memory_id": "已有 memory_id", "reason": "为什么查"},
     {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"}
@@ -338,6 +348,7 @@ noop 示例：
 - 每轮最多请求 3 个工具。
 - 只能请求输入中真实存在的 topic_id / memory_id / raw_pointer_id。
 - 不能发明 evidence_id、memory_id、topic_id、raw_pointer_id。
+- search_related_memories 的 query 必须来自当前 turn 证据或已有 memory/topic 摘要中的真实词语，不能发明不存在的问题。
 - update_memory / merge_memory / mark_conflict 的 target_memory_id 必须在 modifiable_memory_ids 中；否则先请求只读工具。
 - record_conflict_decision 的 target_memory_id 也必须在 modifiable_memory_ids 中；否则先请求只读工具。
 - update_topic 的 target_topic_id 必须来自已知 topic_id；如果要判断主题是否应改名，优先先 read_topic_detail。
@@ -445,6 +456,14 @@ def _tool_key(request: Mapping[str, Any]) -> tuple[str, str]:
         return tool, str(request.get("memory_id") or "")
     if tool == "expand_pointer":
         return tool, str(request.get("raw_pointer_id") or "")
+    if tool == "search_related_memories":
+        parts = [
+            str(request.get("query") or ""),
+            str(request.get("memory_type") or ""),
+            str(request.get("domain") or ""),
+            str(request.get("project_key") or ""),
+        ]
+        return tool, "|".join(parts)
     return tool, ""
 
 
@@ -509,15 +528,40 @@ def validate_react_decision(
             "read_topic_detail": {"tool", "topic_id", "reason"},
             "read_memory_detail": {"tool", "memory_id", "reason"},
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
+            "search_related_memories": {
+                "tool",
+                "query",
+                "reason",
+                "memory_type",
+                "domain",
+                "project_key",
+                "limit",
+            },
+        }[str(tool)]
+        required_by_tool = {
+            "read_topic_detail": {"tool", "topic_id", "reason"},
+            "read_memory_detail": {"tool", "memory_id", "reason"},
+            "expand_pointer": {"tool", "raw_pointer_id", "reason"},
+            "search_related_memories": {"tool", "query", "reason"},
         }[str(tool)]
         extra_request = set(request) - allowed_by_tool
-        missing_request = allowed_by_tool - set(request)
+        missing_request = required_by_tool - set(request)
         if extra_request:
             errors.append(f"{prefix} has unsupported fields: {sorted(extra_request)}")
         if missing_request:
             errors.append(f"{prefix} missing fields: {sorted(missing_request)}")
         if not _non_empty_string(request.get("reason")):
             errors.append(f"{prefix}.reason must be a non-empty string")
+        if tool == "search_related_memories":
+            if not _non_empty_string(request.get("query")):
+                errors.append(f"{prefix}.query must be a non-empty string")
+            if "limit" in request:
+                try:
+                    limit_value = int(request.get("limit"))
+                    if limit_value < 1 or limit_value > 20:
+                        errors.append(f"{prefix}.limit must be between 1 and 20")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
         if tool == "read_topic_detail" and request.get("topic_id") not in topic_ids:
             errors.append(f"{prefix}.topic_id does not exist or is not active")
         if tool == "read_memory_detail" and request.get("memory_id") not in memory_ids:
@@ -591,6 +635,15 @@ def _execute_tool_request(
             pg_config_path=pg_config_path,
             raw_pointer_id=str(request["raw_pointer_id"]),
             max_chars=max_chars,
+        )
+    if tool == "search_related_memories":
+        return search_related_memories(
+            pg_config_path=pg_config_path,
+            query=str(request["query"]),
+            memory_type=str(request["memory_type"]) if request.get("memory_type") else None,
+            domain=str(request["domain"]) if request.get("domain") else None,
+            project_key=str(request["project_key"]) if request.get("project_key") else None,
+            limit=int(request.get("limit") or 8),
         )
     raise ValueError(f"unsupported tool: {tool}")
 
@@ -765,6 +818,17 @@ def _react_payload(
         },
         "available_tools": [
             {
+                "tool": "search_related_memories",
+                "args": {
+                    "query": "必填；来自当前 turn 证据或已有索引的真实关键词",
+                    "memory_type": "可选；限制 memory_type",
+                    "domain": "可选；限制领域 scope",
+                    "project_key": "可选；限制项目 scope",
+                    "limit": "可选；1-20，默认 8",
+                },
+                "purpose": "当当前 memory_index 摘要不足或怀疑旧记忆未出现在概览中时，搜索主题标题/摘要和 memory 摘要/正文，返回候选 memory_id/topic_id；搜索结果不能直接授权修改",
+            },
+            {
                 "tool": "read_topic_detail",
                 "args": {"topic_id": "必须来自 available_ids.topic_ids"},
                 "purpose": "读取主题正文和主题下的 active memories，用于判断合并/更新/冲突/重复",
@@ -842,6 +906,15 @@ def _validate_or_repair_react(
                     "tool_request_expand_pointer": ["tool", "raw_pointer_id", "reason"],
                     "tool_request_read_memory_detail": ["tool", "memory_id", "reason"],
                     "tool_request_read_topic_detail": ["tool", "topic_id", "reason"],
+                    "tool_request_search_related_memories": [
+                        "tool",
+                        "query",
+                        "reason",
+                        "memory_type?",
+                        "domain?",
+                        "project_key?",
+                        "limit?",
+                    ],
                 },
             }
             repaired_output = model.complete_json(
