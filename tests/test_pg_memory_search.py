@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from memory_lab.pg_store import _search_terms, search_related_memories
+from memory_lab.pg_store import (
+    _search_terms,
+    get_current_turn_evidence_summary,
+    search_related_memories,
+)
 
 
 class PgMemorySearchTests(unittest.TestCase):
@@ -62,6 +66,10 @@ class PgMemorySearchTests(unittest.TestCase):
         self.assertIn("mt.summary", sql)
         self.assertIn("m.summary", sql)
         self.assertIn("m.content", sql)
+        self.assertIn("trust_level", sql)
+        self.assertIn("source_rank", sql)
+        self.assertIn("verification_status", sql)
+        self.assertIn("next_steps", sql)
         self.assertIn("LIMIT 20", sql)
 
     def test_no_matches_returns_search_guidance(self) -> None:
@@ -81,6 +89,68 @@ class PgMemorySearchTests(unittest.TestCase):
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["matches"], [])
         self.assertIn("未找到候选", result["guidance"])
+
+    def test_current_turn_evidence_summary_compacts_layers_and_ids(self) -> None:
+        fake_detail = {
+            "status": "complete",
+            "tool": "get_turn_evidence",
+            "turn_id": "turn_1",
+            "found": True,
+            "evidence": {
+                "turn": {"turn_id": "turn_1", "phase_hint": "runtime_debug"},
+                "layers": {
+                    "core": [
+                        {
+                            "evidence_id": "ev_core_1",
+                            "layer": "core",
+                            "source_type": "user",
+                            "kind": "message",
+                            "text": "用户反馈风扇不转",
+                            "raw_pointer_id": None,
+                            "ordinal": 1,
+                            "truncated": False,
+                        },
+                        {
+                            "evidence_id": "ev_core_2",
+                            "layer": "core",
+                            "source_type": "assistant",
+                            "kind": "answer",
+                            "text": "定位 adc_sample 固定返回",
+                            "raw_pointer_id": None,
+                            "ordinal": 2,
+                            "truncated": False,
+                        },
+                    ],
+                    "candidate": [],
+                    "pointer": [
+                        {
+                            "evidence_id": "ptr_1",
+                            "layer": "pointer",
+                            "source_type": "tool",
+                            "kind": "read",
+                            "text": "read completed",
+                            "raw_pointer_id": "ptr_1",
+                            "ordinal": 3,
+                            "truncated": True,
+                        }
+                    ],
+                },
+            },
+        }
+        with patch("memory_lab.pg_store.get_turn_evidence", return_value=fake_detail):
+            result = get_current_turn_evidence_summary(
+                pg_config_path=Path("unused.json"),
+                turn_id="turn_1",
+                max_items_per_layer=1,
+                max_chars=80,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["counts"]["core"], 2)
+        self.assertEqual(len(result["layers"]["core"]), 1)
+        self.assertIn("ev_core_1", result["evidence_ids"])
+        self.assertIn("ptr_1", result["pointer_ids"])
+        self.assertIn("只能引用 evidence_ids", result["guidance"])
 
 
 if __name__ == "__main__":

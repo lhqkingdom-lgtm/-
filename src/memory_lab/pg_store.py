@@ -761,6 +761,9 @@ ranked AS (
     m.summary AS memory_summary,
     m.status AS memory_status,
     m.confidence,
+    COALESCE(m.metadata ->> 'trust_level', 'unknown') AS trust_level,
+    COALESCE(m.metadata ->> 'source_rank', 'unknown') AS source_rank,
+    COALESCE(m.metadata ->> 'verification_status', 'unknown') AS verification_status,
     m.updated_at,
     (
       CASE WHEN EXISTS (SELECT 1 FROM terms t WHERE m.summary ILIKE '%' || t.term || '%') THEN 8 ELSE 0 END +
@@ -801,11 +804,20 @@ SELECT COALESCE(jsonb_agg(
     'summary', memory_summary,
     'status', memory_status,
     'confidence', confidence,
+    'trust_level', trust_level,
+    'source_rank', source_rank,
+    'verification_status', verification_status,
     'updated_at', updated_at,
     'matched_terms', matched_terms,
     'matched_fields', matched_fields,
     'score', score,
     'score_reason', '命中字段=' || matched_fields::text || '；命中词=' || matched_terms::text,
+    'why_matched', '命中字段=' || matched_fields::text || '；命中词=' || matched_terms::text,
+    'next_steps', jsonb_build_array(
+      '搜索结果只用于召回候选，不代表已经读取正文。',
+      '如果只需查看完整内容，请调用 read_memory_detail。',
+      '如果需要判断合并、更新或冲突，请先调用 read_memory_detail 或 read_topic_detail。'
+    ),
     'next_step', '如需合并、更新或冲突处理，请先调用 read_memory_detail 读取 memory 正文。'
   )
   ORDER BY score DESC, updated_at DESC, stable_key
@@ -838,6 +850,89 @@ FROM (
         },
         "matches": matches,
         "count": len(matches),
+        "guidance": guidance,
+    }
+
+
+def get_current_turn_evidence_summary(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    turn_id: str,
+    layers: list[str] | None = None,
+    max_items_per_layer: int = 12,
+    max_chars: int = 800,
+) -> dict[str, Any]:
+    """Return a compact read-only summary of the current turn evidence pool.
+
+    This tool is meant for ReAct runs that have executed several other tools and
+    need to re-check the current turn before writing memory changes.  It does not
+    expand raw pointers; it only returns bounded evidence summaries and legal IDs.
+    """
+
+    max_items_per_layer = max(1, min(int(max_items_per_layer), 50))
+    max_chars = max(80, min(int(max_chars), 4000))
+    detail = get_turn_evidence(
+        pg_config_path=pg_config_path,
+        turn_id=turn_id,
+        layers=layers or ["core", "candidate", "pointer"],
+        max_chars=max_chars,
+    )
+    evidence = detail.get("evidence") if isinstance(detail.get("evidence"), Mapping) else {}
+    found = bool(detail.get("found"))
+    raw_layers = evidence.get("layers") if isinstance(evidence.get("layers"), Mapping) else {}
+    compact_layers: dict[str, list[dict[str, Any]]] = {}
+    counts: dict[str, int] = {}
+    evidence_ids: list[str] = []
+    pointer_ids: list[str] = []
+    for layer in (layers or ["core", "candidate", "pointer"]):
+        items = raw_layers.get(layer) if isinstance(raw_layers, Mapping) else []
+        if not isinstance(items, list):
+            items = []
+        counts[layer] = len(items)
+        compact: list[dict[str, Any]] = []
+        for item in items[:max_items_per_layer]:
+            if not isinstance(item, Mapping):
+                continue
+            evidence_id = str(item.get("evidence_id") or "")
+            raw_pointer_id = str(item.get("raw_pointer_id") or "")
+            if evidence_id:
+                evidence_ids.append(evidence_id)
+            if layer == "pointer" and evidence_id:
+                pointer_ids.append(evidence_id)
+            compact.append(
+                {
+                    "evidence_id": evidence_id,
+                    "layer": item.get("layer") or layer,
+                    "source_type": item.get("source_type"),
+                    "kind": item.get("kind"),
+                    "text": item.get("text"),
+                    "raw_pointer_id": raw_pointer_id or None,
+                    "message_id": item.get("message_id"),
+                    "part_id": item.get("part_id"),
+                    "ordinal": item.get("ordinal"),
+                    "truncated": bool(item.get("truncated")),
+                }
+            )
+        compact_layers[layer] = compact
+    guidance = (
+        "已返回当前 turn 的紧凑证据摘要；写入 memory_changes 时只能引用 evidence_ids 中真实存在的 evidence_id。"
+        if found
+        else "未找到当前 turn；请确认 turn_id 是否已经入库。"
+    )
+    return {
+        "status": "complete" if found else "not_found",
+        "tool": "get_current_turn_evidence_summary",
+        "turn_id": turn_id,
+        "found": found,
+        "turn": evidence.get("turn") if isinstance(evidence, Mapping) else None,
+        "counts": counts,
+        "layers": compact_layers,
+        "evidence_ids": evidence_ids,
+        "pointer_ids": pointer_ids,
+        "limits": {
+            "max_items_per_layer": max_items_per_layer,
+            "max_chars": max_chars,
+        },
         "guidance": guidance,
     }
 

@@ -37,6 +37,7 @@ from .memory_changes import (
 from .pg_store import (
     DEFAULT_PG_CONFIG,
     expand_pointer,
+    get_current_turn_evidence_summary,
     read_memory_detail,
     read_topic_detail,
     search_related_memories,
@@ -50,6 +51,7 @@ ALLOWED_TOOLS = {
     "read_memory_detail",
     "expand_pointer",
     "search_related_memories",
+    "get_current_turn_evidence_summary",
 }
 
 
@@ -78,8 +80,9 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - memory_index：记忆摘要，只能用于发现相似/重复/冲突候选。
 
 3. observations：
-- search_related_memories / read_memory_detail / read_topic_detail / expand_pointer 返回的详情。
+- search_related_memories / read_memory_detail / read_topic_detail / expand_pointer / get_current_turn_evidence_summary 返回的详情。
 - search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
+- get_current_turn_evidence_summary 只用于回看当前 turn 的证据池，帮助确认 evidence_id 和本轮事实，不授权修改任何 memory。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
 
 4. memory_access_state：
@@ -210,8 +213,10 @@ request_more_evidence：证据不足
 如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
+如果经过多轮工具调用后不确定当前 turn 的证据、evidence_id 或本轮是否足够支撑写入，可以请求 get_current_turn_evidence_summary 回看当前 turn 证据池。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
 禁止凭 search_related_memories 结果直接 update_memory / merge_memory / mark_conflict / record_conflict_decision；搜索结果只用于决定下一步读哪个 memory/topic 详情。
+禁止凭 get_current_turn_evidence_summary 直接修改已有 memory；它只用于确认当前 turn 证据，修改已有 memory 仍必须先 read_memory_detail 或 read_topic_detail。
 
 ====================
 五、输出格式
@@ -226,7 +231,8 @@ request_more_evidence：证据不足
     {"tool": "search_related_memories", "query": "症状/工具链/主题关键词", "reason": "为什么要搜旧记忆"},
     {"tool": "read_topic_detail", "topic_id": "已有 topic_id", "reason": "为什么查"},
     {"tool": "read_memory_detail", "memory_id": "已有 memory_id", "reason": "为什么查"},
-    {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"}
+    {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"},
+    {"tool": "get_current_turn_evidence_summary", "reason": "为什么需要回看当前 turn 证据"}
   ],
   "changes": []
 }
@@ -464,6 +470,8 @@ def _tool_key(request: Mapping[str, Any]) -> tuple[str, str]:
             str(request.get("project_key") or ""),
         ]
         return tool, "|".join(parts)
+    if tool == "get_current_turn_evidence_summary":
+        return tool, "current_turn"
     return tool, ""
 
 
@@ -537,12 +545,19 @@ def validate_react_decision(
                 "project_key",
                 "limit",
             },
+            "get_current_turn_evidence_summary": {
+                "tool",
+                "reason",
+                "max_items_per_layer",
+                "max_chars",
+            },
         }[str(tool)]
         required_by_tool = {
             "read_topic_detail": {"tool", "topic_id", "reason"},
             "read_memory_detail": {"tool", "memory_id", "reason"},
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {"tool", "query", "reason"},
+            "get_current_turn_evidence_summary": {"tool", "reason"},
         }[str(tool)]
         extra_request = set(request) - allowed_by_tool
         missing_request = required_by_tool - set(request)
@@ -562,6 +577,21 @@ def validate_react_decision(
                         errors.append(f"{prefix}.limit must be between 1 and 20")
                 except (TypeError, ValueError):
                     errors.append(f"{prefix}.limit must be an integer")
+        if tool == "get_current_turn_evidence_summary":
+            if "max_items_per_layer" in request:
+                try:
+                    max_items_value = int(request.get("max_items_per_layer"))
+                    if max_items_value < 1 or max_items_value > 50:
+                        errors.append(f"{prefix}.max_items_per_layer must be between 1 and 50")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.max_items_per_layer must be an integer")
+            if "max_chars" in request:
+                try:
+                    max_chars_value = int(request.get("max_chars"))
+                    if max_chars_value < 80 or max_chars_value > 4000:
+                        errors.append(f"{prefix}.max_chars must be between 80 and 4000")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.max_chars must be an integer")
         if tool == "read_topic_detail" and request.get("topic_id") not in topic_ids:
             errors.append(f"{prefix}.topic_id does not exist or is not active")
         if tool == "read_memory_detail" and request.get("memory_id") not in memory_ids:
@@ -606,6 +636,7 @@ def _execute_tool_request(
     *,
     source_database: Path,
     pg_config_path: Path,
+    turn_id: str,
     max_chars: int,
 ) -> dict[str, Any]:
     tool = str(request["tool"])
@@ -645,6 +676,13 @@ def _execute_tool_request(
             project_key=str(request["project_key"]) if request.get("project_key") else None,
             limit=int(request.get("limit") or 8),
         )
+    if tool == "get_current_turn_evidence_summary":
+        return get_current_turn_evidence_summary(
+            pg_config_path=pg_config_path,
+            turn_id=turn_id,
+            max_items_per_layer=int(request.get("max_items_per_layer") or 12),
+            max_chars=int(request.get("max_chars") or max_chars),
+        )
     raise ValueError(f"unsupported tool: {tool}")
 
 
@@ -653,6 +691,7 @@ def _execute_tool_requests(
     *,
     source_database: Path,
     pg_config_path: Path,
+    turn_id: str,
     seen_tool_keys: set[tuple[str, str]],
     max_chars: int,
 ) -> list[dict[str, Any]]:
@@ -676,6 +715,7 @@ def _execute_tool_requests(
                 request,
                 source_database=source_database,
                 pg_config_path=pg_config_path,
+                turn_id=turn_id,
                 max_chars=max_chars,
             )
             observations.append(
@@ -842,6 +882,14 @@ def _react_payload(
                 "tool": "expand_pointer",
                 "args": {"raw_pointer_id": "必须来自本轮 pointer id"},
                 "purpose": "从 CP SQLite 回查原始片段，补足 core/candidate 摘要不足的信息",
+            },
+            {
+                "tool": "get_current_turn_evidence_summary",
+                "args": {
+                    "max_items_per_layer": "可选；1-50，默认 12",
+                    "max_chars": "可选；80-4000，默认使用工具结果上限",
+                },
+                "purpose": "回看当前 turn 的 core/candidate/pointer 紧凑摘要和可引用 evidence_id；不能直接授权修改已有 memory",
             },
         ],
         "available_ids": _ids_for_log(available_ids),
@@ -1030,6 +1078,7 @@ def run_memory_react_agent(
                 auto_reads,
                 source_database=source_database,
                 pg_config_path=pg_config_path,
+                turn_id=turn_id,
                 seen_tool_keys=seen_tool_keys,
                 max_chars=4000,
             )
@@ -1106,6 +1155,7 @@ def run_memory_react_agent(
                 requests,
                 source_database=source_database,
                 pg_config_path=pg_config_path,
+                turn_id=turn_id,
                 seen_tool_keys=seen_tool_keys,
                 max_chars=4000,
             )

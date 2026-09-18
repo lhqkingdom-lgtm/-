@@ -35,6 +35,7 @@ from .pg_store import (
     DEFAULT_PG_CONFIG,
     build_writer_context,
     expand_pointer,
+    get_current_turn_evidence_summary,
     get_turn_evidence,
     ingest_turn_to_postgres,
     list_memory_topics,
@@ -365,6 +366,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evidence layer to include; repeatable. Defaults to all layers.",
     )
     pg_get_turn_evidence.add_argument("--max-chars", type=int, default=1200)
+    pg_current_turn_summary = subparsers.add_parser(
+        "pg-current-turn-evidence-summary",
+        help="Return a compact current-turn evidence summary for ReAct memory tools",
+    )
+    pg_current_turn_summary.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_current_turn_summary.add_argument("--turn-id", required=True)
+    pg_current_turn_summary.add_argument("--max-items-per-layer", type=int, default=12)
+    pg_current_turn_summary.add_argument("--max-chars", type=int, default=800)
     pg_list_memory_topics = subparsers.add_parser(
         "pg-list-memory-topics",
         help="List lightweight memory topic index entries without memory bodies",
@@ -734,6 +743,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.source_db,
                 pg_config_path=args.pg_config,
                 raw_pointer_id=args.raw_pointer_id,
+                max_chars=args.max_chars,
+            )
+        elif args.command == "pg-current-turn-evidence-summary":
+            report = get_current_turn_evidence_summary(
+                pg_config_path=args.pg_config,
+                turn_id=args.turn_id,
+                max_items_per_layer=args.max_items_per_layer,
                 max_chars=args.max_chars,
             )
         elif args.command == "pg-read-memory-detail":

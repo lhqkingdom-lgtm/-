@@ -76,6 +76,66 @@ class MemoryReactPromptTests(unittest.TestCase):
                 pg_config_path=Path("unused.json"),
             )
 
+    def test_validate_accepts_current_turn_evidence_summary_request(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "工具调用多轮后需要重新核对当前 turn 的证据。.",
+            "tool_requests": [
+                {
+                    "tool": "get_current_turn_evidence_summary",
+                    "reason": "回看当前 turn 的 evidence_id 和核心事实。",
+                    "max_items_per_layer": 5,
+                    "max_chars": 800,
+                }
+            ],
+            "changes": [],
+        }
+
+        validated = validate_react_decision(
+            decision,
+            turn_id="turn_1",
+            available_ids={
+                "topic_ids": set(),
+                "memory_ids": set(),
+                "pointer_ids": set(),
+            },
+            pg_config_path=Path("unused.json"),
+        )
+
+        self.assertEqual(
+            validated["tool_requests"][0]["tool"],
+            "get_current_turn_evidence_summary",
+        )
+
+    def test_validate_rejects_current_turn_summary_bad_bounds(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "需要回看证据。",
+            "tool_requests": [
+                {
+                    "tool": "get_current_turn_evidence_summary",
+                    "reason": "回看当前 turn。",
+                    "max_items_per_layer": 99,
+                    "max_chars": 10,
+                }
+            ],
+            "changes": [],
+        }
+
+        with self.assertRaisesRegex(Exception, "max_items_per_layer must be between 1 and 50"):
+            validate_react_decision(
+                decision,
+                turn_id="turn_1",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": set(),
+                    "pointer_ids": set(),
+                },
+                pg_config_path=Path("unused.json"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
