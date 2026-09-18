@@ -11,6 +11,7 @@ from pathlib import Path
 from .admission import run_rule_admission
 from .catalog import run_catalog, run_recall
 from .change_report import rebuild_auto_memory_change_report
+from .conflict_scenarios import build_conflict_scenarios_report
 from .cycle import run_memory_cycle, watch_memory_cycles
 from .config import DEFAULT_CONFIG
 from .consolidation import record_proposal_review, rollback_memory, run_consolidation
@@ -348,6 +349,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pg_quality_report.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_quality_report.add_argument("--limit", type=int, default=20)
+    conflict_scenarios = subparsers.add_parser(
+        "conflict-scenarios-report",
+        help="Generate deterministic conflict-handling scenario coverage report",
+    )
+    conflict_scenarios.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_REPORTS / "conflict-scenarios",
+    )
     pg_writer_context = subparsers.add_parser(
         "pg-writer-context",
         help="Build fixed Writer input from one turn plus lightweight memory index",
@@ -735,6 +745,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.source_db,
                 pg_config_path=args.pg_config,
                 limit=args.limit,
+            )
+        elif args.command == "conflict-scenarios-report":
+            report = build_conflict_scenarios_report(
+                output_dir=args.output_dir,
             )
         elif args.command == "pg-writer-context":
             report = build_writer_context(
