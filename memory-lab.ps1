@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -88,6 +88,9 @@ param(
     [string]$TargetRevisionId,
 
     [string]$Reason,
+
+    [ValidateSet('backward', 'forward', 'both')]
+    [string]$RelationDirection = 'both',
 
     [string]$Name,
 
@@ -229,6 +232,14 @@ try {
         }
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
             $Command --pg-config $PgConfigPath --memory-id $MemoryId
+    }
+    elseif ($Command -eq 'pg-trace-memory-relations') {
+        if (-not $MemoryId) {
+            throw 'pg-trace-memory-relations requires -MemoryId'
+        }
+        & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
+            $Command --pg-config $PgConfigPath --memory-id $MemoryId `
+            --direction $RelationDirection --max-depth $MaxIterations
     }
     elseif ($Command -eq 'pg-read-topic-detail') {
         if (-not $TopicId) {

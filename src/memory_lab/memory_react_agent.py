@@ -41,6 +41,7 @@ from .pg_store import (
     read_memory_detail,
     read_topic_detail,
     search_related_memories,
+    trace_memory_relations,
 )
 
 
@@ -52,6 +53,7 @@ ALLOWED_TOOLS = {
     "expand_pointer",
     "search_related_memories",
     "get_current_turn_evidence_summary",
+    "trace_memory_relations",
 }
 
 
@@ -83,6 +85,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - search_related_memories / read_memory_detail / read_topic_detail / expand_pointer / get_current_turn_evidence_summary 返回的详情。
 - search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
 - get_current_turn_evidence_summary 只用于回看当前 turn 的证据池，帮助确认 evidence_id 和本轮事实，不授权修改任何 memory。
+- trace_memory_relations 用于查看某条 memory 的版本历史和 supersedes/merges/conflicts_with 关系，不授权修改。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
 
 4. memory_access_state：
@@ -213,10 +216,12 @@ request_more_evidence：证据不足
 如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
+如果怀疑某条 memory 已被合并、替代或与其他 memory 冲突，应请求 trace_memory_relations 查看关系链。
 如果经过多轮工具调用后不确定当前 turn 的证据、evidence_id 或本轮是否足够支撑写入，可以请求 get_current_turn_evidence_summary 回看当前 turn 证据池。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
 禁止凭 search_related_memories 结果直接 update_memory / merge_memory / mark_conflict / record_conflict_decision；搜索结果只用于决定下一步读哪个 memory/topic 详情。
 禁止凭 get_current_turn_evidence_summary 直接修改已有 memory；它只用于确认当前 turn 证据，修改已有 memory 仍必须先 read_memory_detail 或 read_topic_detail。
+禁止凭 trace_memory_relations 直接修改已有 memory；关系链只用于理解来源/去向，修改已有 memory 仍必须先 read_memory_detail 或 read_topic_detail。
 
 ====================
 五、输出格式
@@ -232,7 +237,8 @@ request_more_evidence：证据不足
     {"tool": "read_topic_detail", "topic_id": "已有 topic_id", "reason": "为什么查"},
     {"tool": "read_memory_detail", "memory_id": "已有 memory_id", "reason": "为什么查"},
     {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"},
-    {"tool": "get_current_turn_evidence_summary", "reason": "为什么需要回看当前 turn 证据"}
+    {"tool": "get_current_turn_evidence_summary", "reason": "为什么需要回看当前 turn 证据"},
+    {"tool": "trace_memory_relations", "memory_id": "已有 memory_id", "reason": "为什么需要查版本/关系链"}
   ],
   "changes": []
 }
@@ -258,6 +264,7 @@ memory-changes-v1 changes 可用 action：
 - mark_conflict
 - update_topic
 - record_conflict_decision
+- record_memory_relation
 - noop
 - request_more_evidence
 
@@ -336,6 +343,19 @@ record_conflict_decision 示例：
     "reason": "新证据是用户对未来回复语言的明确要求，且与旧偏好属于同一语义槽位。"
   },
   "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "新偏好证据"}]
+}
+
+record_memory_relation 示例：
+{
+  "action": "record_memory_relation",
+  "reason": "用户明确纠正旧记忆，新记忆替代旧记忆",
+  "relation": {
+    "from_memory_id": "mem_old",
+    "to_memory_id": "mem_new",
+    "relation_type": "supersedes",
+    "reason": "同一语义槽位下，新证据来自更晚的用户明确纠正。"
+  },
+  "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "用户纠正证据"}]
 }
 
 noop 示例：
@@ -472,6 +492,8 @@ def _tool_key(request: Mapping[str, Any]) -> tuple[str, str]:
         return tool, "|".join(parts)
     if tool == "get_current_turn_evidence_summary":
         return tool, "current_turn"
+    if tool == "trace_memory_relations":
+        return tool, str(request.get("memory_id") or "")
     return tool, ""
 
 
@@ -551,6 +573,13 @@ def validate_react_decision(
                 "max_items_per_layer",
                 "max_chars",
             },
+            "trace_memory_relations": {
+                "tool",
+                "memory_id",
+                "reason",
+                "direction",
+                "max_depth",
+            },
         }[str(tool)]
         required_by_tool = {
             "read_topic_detail": {"tool", "topic_id", "reason"},
@@ -558,6 +587,7 @@ def validate_react_decision(
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {"tool", "query", "reason"},
             "get_current_turn_evidence_summary": {"tool", "reason"},
+            "trace_memory_relations": {"tool", "memory_id", "reason"},
         }[str(tool)]
         extra_request = set(request) - allowed_by_tool
         missing_request = required_by_tool - set(request)
@@ -592,6 +622,18 @@ def validate_react_decision(
                         errors.append(f"{prefix}.max_chars must be between 80 and 4000")
                 except (TypeError, ValueError):
                     errors.append(f"{prefix}.max_chars must be an integer")
+        if tool == "trace_memory_relations":
+            if request.get("memory_id") not in memory_ids:
+                errors.append(f"{prefix}.memory_id does not exist or is not active")
+            if "direction" in request and request.get("direction") not in {"backward", "forward", "both"}:
+                errors.append(f"{prefix}.direction must be backward, forward or both")
+            if "max_depth" in request:
+                try:
+                    max_depth_value = int(request.get("max_depth"))
+                    if max_depth_value < 1 or max_depth_value > 5:
+                        errors.append(f"{prefix}.max_depth must be between 1 and 5")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.max_depth must be an integer")
         if tool == "read_topic_detail" and request.get("topic_id") not in topic_ids:
             errors.append(f"{prefix}.topic_id does not exist or is not active")
         if tool == "read_memory_detail" and request.get("memory_id") not in memory_ids:
@@ -682,6 +724,13 @@ def _execute_tool_request(
             turn_id=turn_id,
             max_items_per_layer=int(request.get("max_items_per_layer") or 12),
             max_chars=int(request.get("max_chars") or max_chars),
+        )
+    if tool == "trace_memory_relations":
+        return trace_memory_relations(
+            pg_config_path=pg_config_path,
+            memory_id=str(request["memory_id"]),
+            direction=str(request.get("direction") or "both"),
+            max_depth=int(request.get("max_depth") or 1),
         )
     raise ValueError(f"unsupported tool: {tool}")
 
@@ -890,6 +939,15 @@ def _react_payload(
                     "max_chars": "可选；80-4000，默认使用工具结果上限",
                 },
                 "purpose": "回看当前 turn 的 core/candidate/pointer 紧凑摘要和可引用 evidence_id；不能直接授权修改已有 memory",
+            },
+            {
+                "tool": "trace_memory_relations",
+                "args": {
+                    "memory_id": "必须来自 available_ids.memory_ids",
+                    "direction": "可选；backward/forward/both，默认 both",
+                    "max_depth": "可选；1-5，默认 1",
+                },
+                "purpose": "查看某条 memory 的版本历史和 supersedes/merges/conflicts_with 关系；用于判断来源、去向、合并或冲突背景",
             },
         ],
         "available_ids": _ids_for_log(available_ids),

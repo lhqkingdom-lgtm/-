@@ -16,6 +16,8 @@ class MemoryReactPromptTests(unittest.TestCase):
     def test_prompt_documents_search_tool_boundary(self) -> None:
         self.assertIn("search_related_memories", REACT_SYSTEM_PROMPT)
         self.assertIn("搜索结果只用于决定下一步读哪个 memory/topic 详情", REACT_SYSTEM_PROMPT)
+        self.assertIn("trace_memory_relations", REACT_SYSTEM_PROMPT)
+        self.assertIn("record_memory_relation", REACT_SYSTEM_PROMPT)
 
     def test_validate_accepts_search_related_memories_request(self) -> None:
         decision = {
@@ -131,6 +133,65 @@ class MemoryReactPromptTests(unittest.TestCase):
                 available_ids={
                     "topic_ids": set(),
                     "memory_ids": set(),
+                    "pointer_ids": set(),
+                },
+                pg_config_path=Path("unused.json"),
+            )
+
+    def test_validate_accepts_trace_memory_relations_request(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "需要查看旧记忆是否已经被替代。",
+            "tool_requests": [
+                {
+                    "tool": "trace_memory_relations",
+                    "memory_id": "mem_language",
+                    "reason": "判断这条记忆是否已有去向或冲突关系。",
+                    "direction": "both",
+                    "max_depth": 2,
+                }
+            ],
+            "changes": [],
+        }
+
+        validated = validate_react_decision(
+            decision,
+            turn_id="turn_1",
+            available_ids={
+                "topic_ids": set(),
+                "memory_ids": {"mem_language"},
+                "pointer_ids": set(),
+            },
+            pg_config_path=Path("unused.json"),
+        )
+
+        self.assertEqual(validated["tool_requests"][0]["tool"], "trace_memory_relations")
+
+    def test_validate_rejects_trace_memory_relations_bad_target(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "需要查看关系链。",
+            "tool_requests": [
+                {
+                    "tool": "trace_memory_relations",
+                    "memory_id": "mem_missing",
+                    "reason": "目标不存在。",
+                    "direction": "sideways",
+                    "max_depth": 99,
+                }
+            ],
+            "changes": [],
+        }
+
+        with self.assertRaisesRegex(Exception, "memory_id does not exist"):
+            validate_react_decision(
+                decision,
+                turn_id="turn_1",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": {"mem_language"},
                     "pointer_ids": set(),
                 },
                 pg_config_path=Path("unused.json"),

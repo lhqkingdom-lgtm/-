@@ -1351,6 +1351,149 @@ LIMIT 1;
     return {"status": "complete", "tool": "read_memory_detail", "memory": memory}
 
 
+def trace_memory_relations(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    memory_id: str,
+    direction: str = "both",
+    max_depth: int = 1,
+) -> dict[str, Any]:
+    """Read one memory's lightweight version history and direct relations."""
+
+    direction = str(direction or "both")
+    if direction not in {"backward", "forward", "both"}:
+        return {
+            "status": "rejected",
+            "tool": "trace_memory_relations",
+            "memory_id": memory_id,
+            "error_code": "invalid_direction",
+            "guidance": "direction 只能是 backward、forward 或 both。",
+        }
+    max_depth = max(1, min(int(max_depth), 5))
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    include_backward = direction in {"backward", "both"}
+    include_forward = direction in {"forward", "both"}
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH selected_memory AS (
+  SELECT m.*, mt.title AS topic_title, mt.topic_key
+  FROM memories m
+  JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+  WHERE m.memory_id = {_sql_literal(memory_id)}
+    AND m.user_id = {_sql_literal(user_id)}
+),
+revision_rows AS (
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'revision_id', r.revision_id,
+      'revision_number', r.revision_number,
+      'summary', r.summary,
+      'confidence', r.confidence,
+      'trust_level', r.trust_level,
+      'status', r.status,
+      'change_type', r.change_type,
+      'reason', r.reason,
+      'source_turn_id', r.source_turn_id,
+      'created_at', r.created_at
+    )
+    ORDER BY r.revision_number DESC
+  ), '[]'::jsonb) AS items
+  FROM memory_revisions r
+  JOIN selected_memory m ON m.memory_id = r.memory_id AND m.user_id = r.user_id
+),
+backward_rows AS (
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'relation_id', rel.relation_id,
+      'relation_type', rel.relation_type,
+      'reason', rel.reason,
+      'source_turn_id', rel.source_turn_id,
+      'evidence_refs', rel.evidence_refs,
+      'created_at', rel.created_at,
+      'from_memory', jsonb_build_object(
+        'memory_id', src.memory_id,
+        'summary', src.summary,
+        'status', src.status,
+        'trust_level', src.trust_level,
+        'confidence', src.confidence
+      ),
+      'to_memory_id', rel.to_memory_id
+    )
+    ORDER BY rel.created_at DESC, rel.relation_id
+  ), '[]'::jsonb) AS items
+  FROM memory_relations rel
+  JOIN selected_memory m ON m.memory_id = rel.to_memory_id AND m.user_id = rel.user_id
+  JOIN memories src ON src.memory_id = rel.from_memory_id AND src.user_id = rel.user_id
+  WHERE {str(include_backward).lower()}
+),
+forward_rows AS (
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'relation_id', rel.relation_id,
+      'relation_type', rel.relation_type,
+      'reason', rel.reason,
+      'source_turn_id', rel.source_turn_id,
+      'evidence_refs', rel.evidence_refs,
+      'created_at', rel.created_at,
+      'from_memory_id', rel.from_memory_id,
+      'to_memory', jsonb_build_object(
+        'memory_id', dst.memory_id,
+        'summary', dst.summary,
+        'status', dst.status,
+        'trust_level', dst.trust_level,
+        'confidence', dst.confidence
+      )
+    )
+    ORDER BY rel.created_at DESC, rel.relation_id
+  ), '[]'::jsonb) AS items
+  FROM memory_relations rel
+  JOIN selected_memory m ON m.memory_id = rel.from_memory_id AND m.user_id = rel.user_id
+  JOIN memories dst ON dst.memory_id = rel.to_memory_id AND dst.user_id = rel.user_id
+  WHERE {str(include_forward).lower()}
+)
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'memory', jsonb_build_object(
+      'memory_id', m.memory_id,
+      'topic_id', m.topic_id,
+      'topic_key', m.topic_key,
+      'topic_title', m.topic_title,
+      'stable_key', m.stable_key,
+      'memory_type', m.memory_type,
+      'summary', m.summary,
+      'status', m.status,
+      'confidence', m.confidence,
+      'trust_level', m.trust_level,
+      'updated_at', m.updated_at
+    ),
+    'revisions', (SELECT items FROM revision_rows),
+    'backward', (SELECT items FROM backward_rows),
+    'forward', (SELECT items FROM forward_rows)
+  )
+  FROM selected_memory m
+), jsonb_build_object('found', false, 'memory', null, 'revisions', '[]'::jsonb, 'backward', '[]'::jsonb, 'forward', '[]'::jsonb))::text;
+"""
+    detail = _json_from_psql_object(config, sql)
+    guidance = (
+        "backward 表示哪些旧记忆指向当前记忆；forward 表示当前记忆后来指向哪些新记忆。"
+        if detail.get("found")
+        else "未找到 memory_id；请先通过 search_related_memories 或 read_topic_detail 获取有效 memory_id。"
+    )
+    return {
+        "status": "complete" if detail.get("found") else "not_found",
+        "tool": "trace_memory_relations",
+        "memory_id": memory_id,
+        "direction": direction,
+        "max_depth": max_depth,
+        "found": bool(detail.get("found")),
+        "detail": detail,
+        "guidance": guidance,
+    }
+
+
 def _query_json(config: Mapping[str, Any], sql: str) -> Any:
     output = _run_psql(config, sql).strip()
     start = output.find("[")

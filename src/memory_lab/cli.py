@@ -45,6 +45,7 @@ from .pg_store import (
     read_topic_detail,
     search_related_memories,
     show_postgres_turn,
+    trace_memory_relations,
 )
 from .pg_markdown_export import export_pg_markdown
 from .prepare import prepare_dataset
@@ -402,6 +403,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pg_read_memory_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_read_memory_detail.add_argument("--memory-id", required=True)
+    pg_trace_memory_relations = subparsers.add_parser(
+        "pg-trace-memory-relations",
+        help="Read one memory's version history and direct relation links",
+    )
+    pg_trace_memory_relations.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    pg_trace_memory_relations.add_argument("--memory-id", required=True)
+    pg_trace_memory_relations.add_argument(
+        "--direction",
+        choices=["backward", "forward", "both"],
+        default="both",
+    )
+    pg_trace_memory_relations.add_argument("--max-depth", type=int, default=1)
     pg_read_topic_detail = subparsers.add_parser(
         "pg-read-topic-detail",
         help="Read one lightweight memory topic and its memories",
@@ -766,6 +779,13 @@ def main(argv: list[str] | None = None) -> int:
             report = read_memory_detail(
                 pg_config_path=args.pg_config,
                 memory_id=args.memory_id,
+            )
+        elif args.command == "pg-trace-memory-relations":
+            report = trace_memory_relations(
+                pg_config_path=args.pg_config,
+                memory_id=args.memory_id,
+                direction=args.direction,
+                max_depth=args.max_depth,
             )
         elif args.command == "pg-read-topic-detail":
             report = read_topic_detail(

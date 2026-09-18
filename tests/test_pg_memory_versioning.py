@@ -9,6 +9,7 @@ from memory_lab.pg_store import (
     TRUST_LEVELS,
     _memory_versioning_migration_sql,
     migrate_memory_versioning,
+    trace_memory_relations,
 )
 
 
@@ -54,6 +55,53 @@ class PgMemoryVersioningTests(unittest.TestCase):
         self.assertIn("COMMIT;", sql)
         self.assertIn("memory_revisions", sql)
         self.assertIn("memory_relations", sql)
+
+    def test_trace_memory_relations_returns_history_and_links(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "memory": {"memory_id": "mem_new", "summary": "新记忆"},
+            "revisions": [{"revision_id": "rev_2", "revision_number": 2}],
+            "backward": [
+                {
+                    "relation_id": "rel_1",
+                    "relation_type": "supersedes",
+                    "from_memory": {"memory_id": "mem_old", "summary": "旧记忆"},
+                }
+            ],
+            "forward": [],
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = trace_memory_relations(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_new",
+                direction="backward",
+                max_depth=99,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["max_depth"], 5)
+        self.assertEqual(result["detail"]["backward"][0]["relation_type"], "supersedes")
+        self.assertIn("backward", result["guidance"])
+        sql = query_json.call_args.args[1]
+        self.assertIn("memory_revisions", sql)
+        self.assertIn("memory_relations", sql)
+        self.assertIn("WHERE true", sql)
+
+    def test_trace_memory_relations_rejects_bad_direction(self) -> None:
+        result = trace_memory_relations(
+            pg_config_path=Path("unused.json"),
+            memory_id="mem_new",
+            direction="sideways",
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], "invalid_direction")
 
 
 if __name__ == "__main__":

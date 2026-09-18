@@ -22,6 +22,11 @@ SNAPSHOT = {
     "stable_keys": ["general.user_preference.reply_language"],
 }
 
+RELATION_SNAPSHOT = {
+    **SNAPSHOT,
+    "memory_ids": ["mem_language", "mem_language_new"],
+}
+
 
 def base_proposal(change: dict) -> dict:
     return {
@@ -154,6 +159,70 @@ class MemoryChangesValidationTests(unittest.TestCase):
                     "evidence_refs": evidence_refs(),
                 }
             ),
+        )
+
+    def test_record_memory_relation_accepts_complete_payload(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "record_memory_relation",
+                "reason": "记录旧偏好被新偏好替代。",
+                "relation": {
+                    "from_memory_id": "mem_language",
+                    "to_memory_id": "mem_language_new",
+                    "relation_type": "supersedes",
+                    "reason": "用户后来明确改变回复语言偏好。",
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=RELATION_SNAPSHOT,
+        ):
+            normalized = validate_memory_changes(proposal, pg_config_path=Path("unused.json"))
+        self.assertEqual(normalized["changes"][0]["relation"]["relation_type"], "supersedes")
+
+    def test_record_memory_relation_rejects_bad_targets(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "record_memory_relation",
+                "reason": "错误关系。",
+                "relation": {
+                    "from_memory_id": "mem_language",
+                    "to_memory_id": "mem_missing",
+                    "relation_type": "supersedes",
+                    "reason": "目标不存在。",
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        assert_validation_errors(
+            self,
+            proposal,
+            "relation.to_memory_id does not exist",
+        )
+
+    def test_record_memory_relation_rejects_self_relation(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "record_memory_relation",
+                "reason": "错误关系。",
+                "relation": {
+                    "from_memory_id": "mem_language",
+                    "to_memory_id": "mem_language",
+                    "relation_type": "supersedes",
+                    "reason": "不能自己指向自己。",
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        assert_validation_errors(
+            self,
+            proposal,
+            "from/to memory must be different",
         )
 
     def test_record_conflict_decision_requires_claims_and_decision(self) -> None:
@@ -432,6 +501,74 @@ class MemoryChangesCommitIdempotencyTests(unittest.TestCase):
         self.assertEqual(result["applied"][0]["result"], "created")
         self.assertEqual(result["applied"][0]["target_id"], result["applied"][0]["conflict_id"])
         self.assertIn("message", result["applied"][0])
+
+    def test_record_memory_relation_creates_missing_record(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "record_memory_relation",
+                "reason": "记录旧偏好被新偏好替代。",
+                "relation": {
+                    "from_memory_id": "mem_language",
+                    "to_memory_id": "mem_language_new",
+                    "relation_type": "supersedes",
+                    "reason": "用户后来明确改变回复语言偏好。",
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=RELATION_SNAPSHOT,
+        ), patch(
+            "memory_lab.memory_changes._json_from_psql_object",
+            return_value={"found": False},
+        ), patch("memory_lab.memory_changes._run_psql") as run_psql:
+            result = commit_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+        run_psql.assert_called_once()
+        sql = run_psql.call_args.args[1]
+        self.assertIn("INSERT INTO memory_relations", sql)
+        self.assertIn("supersedes", sql)
+        self.assertEqual(result["counts"]["applied"], 1)
+        self.assertEqual(result["applied"][0]["result"], "created")
+
+    def test_record_memory_relation_skips_identical_existing_record(self) -> None:
+        proposal = base_proposal(
+            {
+                "action": "record_memory_relation",
+                "reason": "记录旧偏好被新偏好替代。",
+                "relation": {
+                    "from_memory_id": "mem_language",
+                    "to_memory_id": "mem_language_new",
+                    "relation_type": "supersedes",
+                    "reason": "用户后来明确改变回复语言偏好。",
+                },
+                "evidence_refs": evidence_refs(),
+            }
+        )
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=RELATION_SNAPSHOT,
+        ), patch(
+            "memory_lab.memory_changes._json_from_psql_object",
+            return_value={
+                "found": True,
+                "relation_id": "rel_existing",
+                "reason": "用户后来明确改变回复语言偏好。",
+                "evidence_refs": evidence_refs(),
+            },
+        ), patch("memory_lab.memory_changes._run_psql") as run_psql:
+            result = commit_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+        run_psql.assert_not_called()
+        self.assertEqual(result["counts"]["skipped"], 1)
+        self.assertEqual(result["skipped"][0]["result"], "skipped_existing")
 
     def test_update_memory_duplicate_turn_is_skipped_not_rejected(self) -> None:
         proposal = base_proposal(

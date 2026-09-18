@@ -32,6 +32,7 @@ ALLOWED_ACTIONS = {
     "mark_conflict",
     "update_topic",
     "record_conflict_decision",
+    "record_memory_relation",
     "noop",
     "request_more_evidence",
 }
@@ -57,6 +58,8 @@ def _error_codes_for_messages(errors: list[str]) -> list[str]:
     patterns = [
         ("target_memory_id does not exist", "MEMORY_NOT_FOUND"),
         ("memory_id does not exist", "MEMORY_NOT_FOUND"),
+        ("from_memory_id does not exist", "MEMORY_NOT_FOUND"),
+        ("to_memory_id does not exist", "MEMORY_NOT_FOUND"),
         ("target_topic_id does not exist", "TOPIC_NOT_FOUND"),
         ("topic_id does not exist", "TOPIC_NOT_FOUND"),
         ("evidence_id does not belong to this turn", "EVIDENCE_NOT_IN_TURN"),
@@ -261,6 +264,32 @@ def _check_evidence_refs(
             errors.append(f"{ref_prefix}.reason must be a non-empty string")
 
 
+def _check_memory_relation(relation: Any, errors: list[str], prefix: str) -> None:
+    if not _is_object(relation):
+        errors.append(f"{prefix}.relation must be an object")
+        return
+    allowed = {"from_memory_id", "to_memory_id", "relation_type", "reason", "metadata"}
+    required = {"from_memory_id", "to_memory_id", "relation_type", "reason"}
+    extra = set(relation) - allowed
+    missing = required - set(relation)
+    if extra:
+        errors.append(f"{prefix}.relation has unsupported fields: {sorted(extra)}")
+    if missing:
+        errors.append(f"{prefix}.relation missing fields: {sorted(missing)}")
+    if not _non_empty_string(relation.get("from_memory_id")):
+        errors.append(f"{prefix}.relation.from_memory_id must be a non-empty string")
+    if not _non_empty_string(relation.get("to_memory_id")):
+        errors.append(f"{prefix}.relation.to_memory_id must be a non-empty string")
+    if relation.get("from_memory_id") and relation.get("from_memory_id") == relation.get("to_memory_id"):
+        errors.append(f"{prefix}.relation from/to memory must be different")
+    if relation.get("relation_type") not in {"supersedes", "merges", "conflicts_with"}:
+        errors.append(f"{prefix}.relation.relation_type must be supersedes, merges or conflicts_with")
+    if not _non_empty_string(relation.get("reason")):
+        errors.append(f"{prefix}.relation.reason must be a non-empty string")
+    if "metadata" in relation and not _is_object(relation.get("metadata")):
+        errors.append(f"{prefix}.relation.metadata must be an object")
+
+
 def _check_topic_patch(patch: Any, errors: list[str], prefix: str) -> None:
     if not _is_object(patch):
         errors.append(f"{prefix}.topic must be an object")
@@ -446,6 +475,29 @@ def validate_memory_changes(
             elif target not in memory_ids:
                 errors.append(f"{prefix}.target_memory_id does not exist or is not active")
             _check_conflict_decision(change.get("conflict"), errors, prefix)
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "record_memory_relation":
+            allowed = {"action", "reason", "relation", "evidence_refs"}
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            _check_memory_relation(change.get("relation"), errors, prefix)
+            relation = change.get("relation")
+            if _is_object(relation):
+                from_memory_id = relation.get("from_memory_id")
+                to_memory_id = relation.get("to_memory_id")
+                if _non_empty_string(from_memory_id) and from_memory_id not in memory_ids:
+                    errors.append(f"{prefix}.relation.from_memory_id does not exist or is not active")
+                if _non_empty_string(to_memory_id) and to_memory_id not in memory_ids:
+                    errors.append(f"{prefix}.relation.to_memory_id does not exist or is not active")
             _check_evidence_refs(
                 change.get("evidence_refs"),
                 errors,
@@ -882,6 +934,78 @@ DO UPDATE SET
     return conflict_id, sql
 
 
+def _read_memory_relation_state(
+    *,
+    config: Mapping[str, Any],
+    user_id: str,
+    relation_id: str,
+) -> dict[str, Any]:
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+SELECT COALESCE((
+  SELECT jsonb_build_object(
+    'found', true,
+    'relation_id', relation_id,
+    'reason', reason,
+    'evidence_refs', evidence_refs
+  )
+  FROM memory_relations
+  WHERE relation_id = {_sql_literal(relation_id)}
+    AND user_id = {_sql_literal(user_id)}
+), jsonb_build_object('found', false))::text;
+"""
+    return _json_from_psql_object(config, sql)
+
+
+def _insert_memory_relation_sql(
+    *,
+    user_id: str,
+    turn_id: str,
+    relation: Mapping[str, Any],
+    evidence_refs: list[Any],
+    metadata: Mapping[str, Any],
+) -> tuple[str, str]:
+    from_memory_id = str(relation["from_memory_id"])
+    to_memory_id = str(relation["to_memory_id"])
+    relation_type = str(relation["relation_type"])
+    relation_id = _digest_id(
+        "rel",
+        user_id,
+        from_memory_id,
+        to_memory_id,
+        relation_type,
+    )
+    relation_metadata = {
+        **(relation.get("metadata") if isinstance(relation.get("metadata"), Mapping) else {}),
+        **metadata,
+    }
+    sql = f"""
+INSERT INTO memory_relations(
+  relation_id, user_id, from_memory_id, to_memory_id, relation_type,
+  reason, source_turn_id, evidence_refs, metadata
+)
+VALUES (
+  {_sql_literal(relation_id)},
+  {_sql_literal(user_id)},
+  {_sql_literal(from_memory_id)},
+  {_sql_literal(to_memory_id)},
+  {_sql_literal(relation_type)},
+  {_sql_literal(str(relation["reason"]))},
+  {_sql_literal(turn_id)},
+  {_json_literal(evidence_refs)},
+  {_json_literal(relation_metadata)}
+)
+ON CONFLICT (relation_id)
+DO UPDATE SET
+  reason = EXCLUDED.reason,
+  source_turn_id = EXCLUDED.source_turn_id,
+  evidence_refs = EXCLUDED.evidence_refs,
+  metadata = memory_relations.metadata || EXCLUDED.metadata;
+"""
+    return relation_id, sql
+
+
 def _memory_already_processed_turn(
     *,
     config: Mapping[str, Any],
@@ -1062,6 +1186,51 @@ def _commit_validated_change(
             "conflict_id": conflict_id,
             "status": str(change["conflict"].get("status") or "recorded"),
             "message": "conflict decision recorded" if result == "created" else "conflict decision updated",
+        }
+
+    if action == "record_memory_relation":
+        relation_id, sql = _insert_memory_relation_sql(
+            user_id=user_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            relation=change["relation"],
+            evidence_refs=change.get("evidence_refs") or [],
+            metadata=metadata,
+        )
+        current = _read_memory_relation_state(
+            config=config,
+            user_id=user_id,
+            relation_id=relation_id,
+        )
+        desired_reason = str(change["relation"]["reason"])
+        desired_evidence_refs = change.get("evidence_refs") or []
+        if (
+            current.get("found")
+            and str(current.get("reason") or "") == desired_reason
+            and current.get("evidence_refs") == desired_evidence_refs
+        ):
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_existing",
+                "target_id": relation_id,
+                "relation_id": relation_id,
+                "from_memory_id": change["relation"]["from_memory_id"],
+                "to_memory_id": change["relation"]["to_memory_id"],
+                "relation_type": change["relation"]["relation_type"],
+                "message": "memory relation already recorded with identical content",
+            }
+        result = "updated_existing" if current.get("found") else "created"
+        _run_psql(config, "BEGIN;\n" + sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": result,
+            "target_id": relation_id,
+            "relation_id": relation_id,
+            "from_memory_id": change["relation"]["from_memory_id"],
+            "to_memory_id": change["relation"]["to_memory_id"],
+            "relation_type": change["relation"]["relation_type"],
+            "message": "memory relation recorded" if result == "created" else "memory relation updated",
         }
 
     target_memory_id = str(change["target_memory_id"])
