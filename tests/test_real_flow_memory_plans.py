@@ -216,15 +216,16 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
         self.assertEqual(result["counts"]["requests"], 1)
         run_psql.assert_not_called()
 
-    def test_same_symptom_different_root_cause_can_be_created_then_linked_without_overwriting(self) -> None:
+    def test_same_symptom_different_root_cause_can_be_created_and_linked_in_one_plan(self) -> None:
         stable_key = "embedded.runtime.pwm_pin_mapping_fan_not_spin"
         new_memory_id = _digest_id("mem", "local-default-user", stable_key)
-        create_plan = proposal(
+        plan = proposal(
             "turn_fan_not_spin_pwm_root_cause",
-            "同样是风扇不转，但根因从 ADC 桩函数变为 PWM 引脚配置错误，应保留为新经验。",
+            "同样是风扇不转，但根因从 ADC 桩函数变为 PWM 引脚配置错误，应保留两条经验并建立相关关系。",
             [
                 {
                     "action": "create_memory",
+                    "client_temp_id": "temp:pwm_pin_mapping_memory",
                     "reason": "新增同现象不同根因的运行经验。",
                     "topic_id": "topic_embedded_runtime",
                     "memory": {
@@ -240,28 +241,12 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                         {"evidence_id": "ev_user", "reason": "用户确认修复后风扇运行。"},
                     ],
                 },
-            ],
-        )
-        create_snapshot = {
-            **BASE_SNAPSHOT,
-            "stable_keys": [key for key in BASE_SNAPSHOT["stable_keys"] if key != stable_key],
-        }
-        create_result, create_run_psql = self._commit(create_plan, snapshot=create_snapshot)
-        self.assertTrue(create_result["ok"])
-        self.assertEqual(create_result["counts"]["applied"], 1)
-        self.assertEqual(create_result["applied"][0]["memory_id"], new_memory_id)
-        self.assertIn("INSERT INTO memories", create_run_psql.call_args.args[1])
-
-        relation_plan = proposal(
-            "turn_fan_not_spin_pwm_relation",
-            "新根因记忆已经存在后，补充它和旧 ADC 桩函数经验的相关关系。",
-            [
                 {
                     "action": "record_memory_relation",
                     "reason": "同一现象存在不同根因，建立相关关系避免误合并。",
                     "relation": {
                         "from_memory_id": "mem_stub_adc_rule",
-                        "to_memory_id": new_memory_id,
+                        "to_memory_id": "temp:pwm_pin_mapping_memory",
                         "relation_type": "merges",
                         "reason": "二者都解释风扇不转类现象，但根因分别是 ADC 输入恒定和 PWM 引脚映射错误，应关联但不能互相覆盖。",
                     },
@@ -269,19 +254,19 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                 },
             ],
         )
-        relation_snapshot = {
+        snapshot = {
             **BASE_SNAPSHOT,
-            "memory_ids": [*BASE_SNAPSHOT["memory_ids"], new_memory_id],
-            "stable_keys": [*BASE_SNAPSHOT["stable_keys"], stable_key],
+            "stable_keys": [key for key in BASE_SNAPSHOT["stable_keys"] if key != stable_key],
         }
-        relation_result, relation_run_psql = self._commit(
-            relation_plan,
-            snapshot=relation_snapshot,
-            json_side_effect=[{"found": False}],
-        )
-        self.assertTrue(relation_result["ok"])
-        self.assertEqual(relation_result["counts"]["applied"], 1)
-        self.assertIn("INSERT INTO memory_relations", relation_run_psql.call_args.args[1])
+        result, run_psql = self._commit(plan, snapshot=snapshot, json_side_effect=[{"found": False}])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["counts"]["applied"], 2)
+        self.assertEqual(result["applied"][0]["memory_id"], new_memory_id)
+        self.assertEqual(result["applied"][0]["client_temp_id"], "temp:pwm_pin_mapping_memory")
+        self.assertEqual(result["applied"][1]["to_memory_id"], new_memory_id)
+        combined_sql = "\n".join(call.args[1] for call in run_psql.call_args_list)
+        self.assertIn("INSERT INTO memories", combined_sql)
+        self.assertIn("INSERT INTO memory_relations", combined_sql)
 
 
 if __name__ == "__main__":

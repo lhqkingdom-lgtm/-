@@ -185,6 +185,82 @@ class MemoryChangesValidationTests(unittest.TestCase):
             normalized = validate_memory_changes(proposal, pg_config_path=Path("unused.json"))
         self.assertEqual(normalized["changes"][0]["relation"]["relation_type"], "supersedes")
 
+    def test_record_memory_relation_accepts_prior_create_client_temp_id(self) -> None:
+        proposal = {
+            "schema_version": MEMORY_CHANGES_SCHEMA_VERSION,
+            "turn_id": "turn_language_change",
+            "reason": "同一计划内先创建新记忆再记录关系。",
+            "changes": [
+                {
+                    "action": "create_memory",
+                    "client_temp_id": "temp:new_language_preference",
+                    "reason": "新增用户语言偏好。",
+                    "topic_id": "topic_language",
+                    "memory": {
+                        "stable_key": "general.user_preference.reply_language.english",
+                        "memory_type": "collaboration_preference",
+                        "summary": "用户希望默认英文回复。",
+                        "content": "用户希望默认英文回复。",
+                        "scope": {"level": "global"},
+                        "confidence": 0.9,
+                    },
+                    "evidence_refs": evidence_refs(),
+                },
+                {
+                    "action": "record_memory_relation",
+                    "reason": "记录旧偏好被新偏好替代。",
+                    "relation": {
+                        "from_memory_id": "mem_language",
+                        "to_memory_id": "temp:new_language_preference",
+                        "relation_type": "supersedes",
+                        "reason": "用户后来明确改变回复语言偏好。",
+                    },
+                    "evidence_refs": evidence_refs(),
+                },
+            ],
+        }
+        assert_valid(self, proposal)
+
+    def test_record_memory_relation_rejects_future_client_temp_id(self) -> None:
+        proposal = {
+            "schema_version": MEMORY_CHANGES_SCHEMA_VERSION,
+            "turn_id": "turn_language_change",
+            "reason": "错误地先引用还未创建的临时记忆。",
+            "changes": [
+                {
+                    "action": "record_memory_relation",
+                    "reason": "关系写在创建之前。",
+                    "relation": {
+                        "from_memory_id": "mem_language",
+                        "to_memory_id": "temp:new_language_preference",
+                        "relation_type": "supersedes",
+                        "reason": "用户后来明确改变回复语言偏好。",
+                    },
+                    "evidence_refs": evidence_refs(),
+                },
+                {
+                    "action": "create_memory",
+                    "client_temp_id": "temp:new_language_preference",
+                    "reason": "新增用户语言偏好。",
+                    "topic_id": "topic_language",
+                    "memory": {
+                        "stable_key": "general.user_preference.reply_language.english",
+                        "memory_type": "collaboration_preference",
+                        "summary": "用户希望默认英文回复。",
+                        "content": "用户希望默认英文回复。",
+                        "scope": {"level": "global"},
+                        "confidence": 0.9,
+                    },
+                    "evidence_refs": evidence_refs(),
+                },
+            ],
+        }
+        assert_validation_errors(
+            self,
+            proposal,
+            "relation.to_memory_id does not exist or is not active",
+        )
+
     def test_record_memory_relation_rejects_bad_targets(self) -> None:
         proposal = base_proposal(
             {

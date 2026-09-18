@@ -38,6 +38,7 @@ ALLOWED_ACTIONS = {
 }
 ALLOWED_REQUEST_TOOLS = {"expand_pointer", "read_memory_detail", "read_topic_detail"}
 KEY_RE = re.compile(r"^[a-z0-9_]+(?:[._][a-z0-9_]+)*$")
+CLIENT_TEMP_ID_RE = re.compile(r"^temp:[a-z0-9_]+(?:[._-][a-z0-9_]+)*$")
 MAX_CHANGES = 10
 MAX_SUMMARY_CHARS = 500
 MAX_CONTENT_CHARS = 8000
@@ -107,6 +108,10 @@ def _non_empty_string(value: Any) -> bool:
 
 def _valid_key(value: Any) -> bool:
     return isinstance(value, str) and bool(KEY_RE.fullmatch(value))
+
+
+def _valid_client_temp_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(CLIENT_TEMP_ID_RE.fullmatch(value))
 
 
 def _valid_confidence(value: Any) -> bool:
@@ -331,6 +336,7 @@ def validate_memory_changes(
     proposal: Mapping[str, Any],
     *,
     pg_config_path: Path = DEFAULT_PG_CONFIG,
+    extra_memory_ids: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     config = load_pg_config(pg_config_path)
     user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
@@ -363,10 +369,18 @@ def validate_memory_changes(
     evidence_ids = {str(item) for item in snapshot.get("evidence_ids") or []}
     pointer_ids = {str(item) for item in snapshot.get("pointer_ids") or []}
     memory_ids = {str(item) for item in snapshot.get("memory_ids") or []}
+    extra_memory_ids = {
+        str(key): str(value)
+        for key, value in (extra_memory_ids or {}).items()
+        if _non_empty_string(key) and _non_empty_string(value)
+    }
+    memory_ids.update(extra_memory_ids)
+    memory_ids.update(extra_memory_ids.values())
     topic_ids = {str(item) for item in snapshot.get("topic_ids") or []}
     existing_stable_keys = {str(item) for item in snapshot.get("stable_keys") or []}
     batch_stable_keys: set[str] = set()
     batch_targets: dict[str, str] = {}
+    batch_temp_memory_ids: dict[str, str] = {}
 
     for index, change in enumerate(changes[:MAX_CHANGES]):
         prefix = f"changes[{index}]"
@@ -381,10 +395,24 @@ def validate_memory_changes(
             errors.append(f"{prefix}.reason must be a non-empty string")
 
         if action == "create_memory":
-            allowed = {"action", "reason", "topic", "topic_id", "memory", "evidence_refs"}
+            allowed = {
+                "action",
+                "reason",
+                "client_temp_id",
+                "topic",
+                "topic_id",
+                "memory",
+                "evidence_refs",
+            }
             extra = set(change) - allowed
             if extra:
                 errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            client_temp_id = change.get("client_temp_id")
+            if client_temp_id is not None:
+                if not _valid_client_temp_id(client_temp_id):
+                    errors.append(f"{prefix}.client_temp_id must use format temp:lowercase_id")
+                elif client_temp_id in memory_ids or client_temp_id in batch_temp_memory_ids:
+                    errors.append(f"{prefix}.client_temp_id is duplicated in this batch")
             has_topic = change.get("topic") is not None
             has_topic_id = change.get("topic_id") is not None
             if has_topic == has_topic_id:
@@ -403,6 +431,10 @@ def validate_memory_changes(
                     errors.append(f"{prefix}.memory.stable_key is duplicated in this batch")
                 if stable_key:
                     batch_stable_keys.add(stable_key)
+                    if _valid_client_temp_id(client_temp_id):
+                        memory_id = _digest_id("mem", user_id, stable_key)
+                        batch_temp_memory_ids[str(client_temp_id)] = memory_id
+                        memory_ids.add(str(client_temp_id))
             _check_evidence_refs(
                 change.get("evidence_refs"),
                 errors,
@@ -498,6 +530,14 @@ def validate_memory_changes(
                     errors.append(f"{prefix}.relation.from_memory_id does not exist or is not active")
                 if _non_empty_string(to_memory_id) and to_memory_id not in memory_ids:
                     errors.append(f"{prefix}.relation.to_memory_id does not exist or is not active")
+                resolved_from = batch_temp_memory_ids.get(str(from_memory_id), str(from_memory_id))
+                resolved_to = batch_temp_memory_ids.get(str(to_memory_id), str(to_memory_id))
+                if (
+                    _non_empty_string(from_memory_id)
+                    and _non_empty_string(to_memory_id)
+                    and resolved_from == resolved_to
+                ):
+                    errors.append(f"{prefix}.relation resolved from/to memory must be different")
             _check_evidence_refs(
                 change.get("evidence_refs"),
                 errors,
@@ -613,6 +653,23 @@ def _single_change_proposal(proposal: Mapping[str, Any], change: Mapping[str, An
         "reason": proposal.get("reason"),
         "changes": [dict(change)],
     }
+
+
+def _resolve_temp_memory_references(
+    change: Mapping[str, Any],
+    temp_memory_ids: Mapping[str, str],
+) -> dict[str, Any]:
+    resolved = json.loads(json.dumps(dict(change), ensure_ascii=False))
+    relation = resolved.get("relation")
+    if isinstance(relation, dict):
+        for field in ("from_memory_id", "to_memory_id"):
+            value = relation.get(field)
+            if isinstance(value, str) and value in temp_memory_ids:
+                relation[field] = temp_memory_ids[value]
+    target_memory_id = resolved.get("target_memory_id")
+    if isinstance(target_memory_id, str) and target_memory_id in temp_memory_ids:
+        resolved["target_memory_id"] = temp_memory_ids[target_memory_id]
+    return resolved
 
 
 def _evidence_metadata(proposal: Mapping[str, Any], change: Mapping[str, Any]) -> dict[str, Any]:
@@ -1309,6 +1366,7 @@ def commit_memory_changes(
     rejected: list[dict[str, Any]] = []
     noops: list[dict[str, Any]] = []
     requests: list[dict[str, Any]] = []
+    temp_memory_ids: dict[str, str] = {}
     for index, change in enumerate(changes):
         if not isinstance(change, Mapping):
             errors = [f"changes[{index}] must be an object"]
@@ -1323,14 +1381,19 @@ def commit_memory_changes(
                 }
             )
             continue
-        single = _single_change_proposal(proposal, change)
+        resolved_change = _resolve_temp_memory_references(change, temp_memory_ids)
+        single = _single_change_proposal(proposal, resolved_change)
         try:
-            validate_memory_changes(single, pg_config_path=pg_config_path)
+            validate_memory_changes(
+                single,
+                pg_config_path=pg_config_path,
+                extra_memory_ids=temp_memory_ids,
+            )
             result = _commit_validated_change(
                 config=config,
                 user_id=user_id,
                 proposal=single,
-                change=change,
+                change=resolved_change,
             )
         except MemoryChangesValidationError as error:
             codes = _error_codes_for_messages(error.errors)
@@ -1357,6 +1420,18 @@ def commit_memory_changes(
                 }
             )
             continue
+        client_temp_id = change.get("client_temp_id")
+        if (
+            resolved_change.get("action") == "create_memory"
+            and isinstance(client_temp_id, str)
+            and result.get("memory_id")
+        ):
+            temp_memory_ids[client_temp_id] = str(result["memory_id"])
+            result = {
+                **result,
+                "client_temp_id": client_temp_id,
+                "resolved_memory_id": str(result["memory_id"]),
+            }
         row = {"index": index, **result}
         if result["action"] == "noop":
             noops.append(row)

@@ -31,6 +31,7 @@ from .unified_model import UnifiedInputError, build_unified_model_request
 
 CYCLE_VERSION = "memory-lab-unified-cycle-v1"
 MAX_BATCH_SIZE = 32
+MAX_CYCLE_BATCH_OBSERVATION_CHARS = 50_000
 
 
 _AUDIT_SCHEMA = """
@@ -237,14 +238,22 @@ def _longest_model_compatible_prefix(
     bundles: Sequence[Mapping[str, Any]],
     existing_memories: Sequence[Mapping[str, Any]],
 ) -> int:
-    """Select the longest chronological prefix accepted by the model contract."""
+    """Select the longest chronological prefix accepted by the model contract.
+
+    The lower-level model contract is a hard transport limit.  The cycle uses
+    a smaller soft budget when batching multiple turns so long CP sessions do
+    not starve later turns or send an overly broad context window to the model.
+    A single accepted turn is still allowed even when it exceeds this soft
+    budget because otherwise an oversized but compacted turn could never make
+    progress.
+    """
 
     if not bundles:
         return 0
     accepted = 0
     for end in range(1, len(bundles) + 1):
         try:
-            build_unified_model_request(
+            _, catalog, _ = build_unified_model_request(
                 bundles[:end], existing_memories=existing_memories
             )
         except UnifiedInputError as error:
@@ -255,6 +264,13 @@ def _longest_model_compatible_prefix(
                 and "between 1 and" not in message
             ):
                 raise
+            break
+        total_chars = sum(
+            len(str(item.get("text") or ""))
+            for item in catalog.values()
+            if isinstance(item, Mapping)
+        )
+        if end > 1 and total_chars > MAX_CYCLE_BATCH_OBSERVATION_CHARS:
             break
         accepted = end
     if accepted < 1:
