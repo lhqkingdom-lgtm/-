@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-list-memory-topics', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -257,6 +257,9 @@ try {
         & $PythonExecutable -m memory_lab --source-db $SourceDatabase --lab-db $LabDatabase `
             $Command --pg-config $PgConfigPath --config $ConfigPath `
             --turn-id $TurnId --memory-limit $MemoryLimit
+    }
+    elseif ($Command -eq 'llm-smoke-test') {
+        & $PythonExecutable -m memory_lab $Command --config $ConfigPath
     }
     elseif ($Command -eq 'pg-commit-plan') {
         if (-not $PlanPath) {

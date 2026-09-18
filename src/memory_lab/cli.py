@@ -24,6 +24,7 @@ from .instructions import run_instruction_coverage
 from .longitudinal import run_status as longitudinal_status
 from .longitudinal import start_run as start_longitudinal_run
 from .llm_client import OpenAICompatibleJsonClient
+from .llm_smoke import run_llm_smoke_test
 from .markdown_store import run_markdown_preview, run_markdown_recall
 from .memory_changes import commit_memory_changes_file, validate_memory_changes_file
 from .memory_agent import run_memory_agent, run_memory_agent_batch
@@ -141,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Call the model again instead of replaying an exact prior result",
     )
+    llm_smoke = subparsers.add_parser(
+        "llm-smoke-test",
+        help="Call the configured OpenAI-compatible model with a tiny JSON request",
+    )
+    llm_smoke.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     report = subparsers.add_parser(
         "report",
         help="Evaluate a fresh shadow run against frozen gold",
@@ -481,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
     try:
-        if args.command not in {"markdown-recall", "formal-recall"}:
+        if args.command not in {"markdown-recall", "formal-recall", "llm-smoke-test"}:
             require_distinct_source_and_lab(args.source_db, args.lab_db)
             if args.lab_db.exists() or args.command != "baseline":
                 require_memory_lab_database(args.lab_db)
@@ -497,6 +503,8 @@ def main(argv: list[str] | None = None) -> int:
             report = run_deepseek_shadow(
                 args.lab_db, config_path=args.config, refresh=args.refresh
             )
+        elif args.command == "llm-smoke-test":
+            report = run_llm_smoke_test(config_path=args.config)
         elif args.command == "report":
             report = generate_shadow_report(
                 args.lab_db,

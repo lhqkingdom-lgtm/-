@@ -1,5 +1,6 @@
 # Local credentials and protected material
 memory-lab.secrets*.json
+memory-lab.*.local.json
 *.dpapi
 .env
 .env.*

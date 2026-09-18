@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,7 +24,8 @@ class LLMConfig:
     allow_remote: bool
     timeout_seconds: float
     max_attempts: int
-    credential_file: Path
+    credential_file: Path | None
+    credential_env: str | None = None
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:
@@ -53,20 +55,34 @@ def load_llm_config(path: Path = DEFAULT_CONFIG) -> LLMConfig:
         "timeout_seconds",
         "max_attempts",
         "credential_file",
+        "credential_env",
     }
     unknown = set(llm) - allowed
-    missing = allowed - set(llm)
+    required = allowed - {"credential_file", "credential_env"}
+    missing = required - set(llm)
     if missing:
         raise ConfigError(f"config.llm missing fields: {sorted(missing)}")
     if unknown:
         if "api_key" in unknown:
             raise ConfigError("do not store api_key in plaintext configuration")
         raise ConfigError(f"config.llm has unsupported fields: {sorted(unknown)}")
-    if llm["provider"] != "deepseek":
-        raise ConfigError("MVP currently supports provider=deepseek")
-    for field in ("base_url", "model", "credential_file"):
+    if llm["provider"] not in {"deepseek", "glm"}:
+        raise ConfigError("supported providers are deepseek and glm")
+    for field in ("base_url", "model"):
         if not isinstance(llm[field], str) or not llm[field].strip():
             raise ConfigError(f"config.llm.{field} must be a non-empty string")
+    credential_file_value = llm.get("credential_file")
+    credential_env_value = llm.get("credential_env")
+    if credential_file_value is not None and (
+        not isinstance(credential_file_value, str) or not credential_file_value.strip()
+    ):
+        raise ConfigError("config.llm.credential_file must be a non-empty string when set")
+    if credential_env_value is not None and (
+        not isinstance(credential_env_value, str) or not credential_env_value.strip()
+    ):
+        raise ConfigError("config.llm.credential_env must be a non-empty string when set")
+    if credential_file_value is None and credential_env_value is None:
+        raise ConfigError("config.llm must set credential_file or credential_env")
     if not isinstance(llm["allow_remote"], bool):
         raise ConfigError("config.llm.allow_remote must be boolean")
     timeout = llm["timeout_seconds"]
@@ -77,11 +93,13 @@ def load_llm_config(path: Path = DEFAULT_CONFIG) -> LLMConfig:
         raise ConfigError("config.llm.max_attempts must be an integer between 1 and 5")
 
     config_root = path.resolve().parent
-    key_file = (config_root / llm["credential_file"]).resolve()
-    try:
-        key_file.relative_to(config_root)
-    except ValueError as error:
-        raise ConfigError("credential_file must stay inside the Memory Lab directory") from error
+    key_file: Path | None = None
+    if credential_file_value is not None:
+        key_file = (config_root / credential_file_value).resolve()
+        try:
+            key_file.relative_to(config_root)
+        except ValueError as error:
+            raise ConfigError("credential_file must stay inside the Memory Lab directory") from error
     return LLMConfig(
         provider=llm["provider"],
         base_url=llm["base_url"].strip(),
@@ -90,12 +108,22 @@ def load_llm_config(path: Path = DEFAULT_CONFIG) -> LLMConfig:
         timeout_seconds=float(timeout),
         max_attempts=attempts,
         credential_file=key_file,
+        credential_env=credential_env_value.strip() if isinstance(credential_env_value, str) else None,
     )
 
 
 def load_api_key(config: LLMConfig) -> str:
-    """Read the user-selected local credential file without logging its value."""
+    """Read the selected local credential source without logging its value."""
 
+    if config.credential_env:
+        key = os.environ.get(config.credential_env, "")
+        if key.strip():
+            return key.strip()
+        if config.credential_file is None:
+            raise ConfigError(f"environment variable {config.credential_env} has not been configured")
+
+    if config.credential_file is None:
+        raise ConfigError("credential_file has not been configured")
     try:
         root = _object(
             json.loads(config.credential_file.read_text(encoding="utf-8")),
@@ -105,11 +133,13 @@ def load_api_key(config: LLMConfig) -> str:
         raise ConfigError(f"credential file not found: {config.credential_file}") from error
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid credential JSON: {error}") from error
-    if set(root) != {"schema_version", "deepseek_api_key"}:
-        raise ConfigError("credential file supports only schema_version and deepseek_api_key")
+    supported_key_fields = {"api_key", "deepseek_api_key", "glm_api_key"}
+    if "schema_version" not in root or len(set(root) - (supported_key_fields | {"schema_version"})) > 0:
+        raise ConfigError("credential file supports only schema_version and api_key/provider_api_key")
     if root["schema_version"] != "memory-lab-secrets-v1":
         raise ConfigError("unsupported credential schema_version")
-    key = root["deepseek_api_key"]
+    provider_key = f"{config.provider}_api_key"
+    key = root.get(provider_key) or root.get("api_key") or root.get("deepseek_api_key")
     if not isinstance(key, str) or not key.strip():
-        raise ConfigError("deepseek_api_key has not been configured")
+        raise ConfigError("api key has not been configured")
     return key.strip()
