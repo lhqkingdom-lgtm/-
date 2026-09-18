@@ -299,6 +299,9 @@ try {
             $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
             '--turn-id', $TurnId, '--memory-limit', $MemoryLimit
         )
+        if ($PSBoundParameters.ContainsKey('TopicLimit')) {
+            $Arguments += @('--topic-limit', $TopicLimit)
+        }
         if ($DryRun) {
             $Arguments += '--dry-run'
         }
@@ -316,6 +319,9 @@ try {
             $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
             '--turn-id', $TurnId, '--memory-limit', $MemoryLimit, '--max-iterations', $MaxIterations
         )
+        if ($PSBoundParameters.ContainsKey('TopicLimit')) {
+            $Arguments += @('--topic-limit', $TopicLimit)
+        }
         if ($DryRun) {
             $Arguments += '--dry-run'
         }
@@ -330,6 +336,9 @@ try {
             $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
             '--limit', $Limit, '--memory-limit', $MemoryLimit
         )
+        if ($PSBoundParameters.ContainsKey('TopicLimit')) {
+            $Arguments += @('--topic-limit', $TopicLimit)
+        }
         foreach ($Item in ($TurnIds | Where-Object { $_ })) {
             $Arguments += @('--turn-id', $Item)
         }

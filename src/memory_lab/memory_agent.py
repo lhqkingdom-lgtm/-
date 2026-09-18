@@ -166,6 +166,7 @@ def build_memory_agent_input(
     turn_id: str,
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     memory_limit: int = 80,
+    topic_limit: int = 200,
 ) -> dict[str, Any]:
     turn_evidence = get_turn_evidence(
         pg_config_path=pg_config_path,
@@ -184,7 +185,7 @@ def build_memory_agent_input(
         pg_config_path=pg_config_path,
         domain=filters["domain"],
         project_key=filters["project_key"],
-        limit=200,
+        limit=topic_limit,
     )
     writer_context = build_writer_context(
         pg_config_path=pg_config_path,
@@ -321,6 +322,7 @@ def run_memory_agent(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     config_path: Path = DEFAULT_CONFIG,
     memory_limit: int = 80,
+    topic_limit: int = 200,
     dry_run: bool = False,
     log_dir: Path = DEFAULT_AGENT_RUN_DIR,
     client: OpenAICompatibleJsonClient | None = None,
@@ -333,6 +335,7 @@ def run_memory_agent(
         turn_id=turn_id,
         pg_config_path=pg_config_path,
         memory_limit=memory_limit,
+        topic_limit=topic_limit,
     )
     if payload.get("status") != "complete":
         steps.append(
@@ -516,6 +519,7 @@ def run_memory_agent_batch(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     config_path: Path = DEFAULT_CONFIG,
     memory_limit: int = 80,
+    topic_limit: int = 200,
     dry_run: bool = True,
     log_dir: Path | None = DEFAULT_AGENT_RUN_DIR,
 ) -> dict[str, Any]:
@@ -544,6 +548,7 @@ def run_memory_agent_batch(
             pg_config_path=pg_config_path,
             config_path=config_path,
             memory_limit=memory_limit,
+            topic_limit=topic_limit,
             dry_run=dry_run,
             log_dir=log_dir,
         )

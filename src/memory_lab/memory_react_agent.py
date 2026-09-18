@@ -948,6 +948,7 @@ def run_memory_react_agent(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     config_path: Path = DEFAULT_CONFIG,
     memory_limit: int = 80,
+    topic_limit: int = 200,
     dry_run: bool = False,
     max_iterations: int = 3,
     log_dir: Path = DEFAULT_REACT_RUN_DIR,
@@ -961,6 +962,7 @@ def run_memory_react_agent(
         turn_id=turn_id,
         pg_config_path=pg_config_path,
         memory_limit=memory_limit,
+        topic_limit=topic_limit,
     )
     if initial_context.get("status") != "complete":
         steps.append(_step("build_react_input", "failed", f"turn unavailable: {turn_id}"))

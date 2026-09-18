@@ -455,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_memory_agent_run.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     pg_memory_agent_run.add_argument("--turn-id", required=True)
     pg_memory_agent_run.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_agent_run.add_argument("--topic-limit", type=int, default=200)
     pg_memory_agent_run.add_argument("--dry-run", action="store_true")
     pg_memory_agent_run.add_argument("--log-dir", type=Path)
     pg_memory_react_run = subparsers.add_parser(
@@ -465,6 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_memory_react_run.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     pg_memory_react_run.add_argument("--turn-id", required=True)
     pg_memory_react_run.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_react_run.add_argument("--topic-limit", type=int, default=200)
     pg_memory_react_run.add_argument("--max-iterations", type=int, default=3)
     pg_memory_react_run.add_argument("--dry-run", action="store_true")
     pg_memory_react_run.add_argument("--log-dir", type=Path)
@@ -477,6 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_memory_agent_batch.add_argument("--turn-id", action="append")
     pg_memory_agent_batch.add_argument("--limit", type=int, default=5)
     pg_memory_agent_batch.add_argument("--memory-limit", type=int, default=80)
+    pg_memory_agent_batch.add_argument("--topic-limit", type=int, default=200)
     pg_memory_agent_batch.add_argument("--dry-run", action="store_true")
     pg_memory_agent_batch.add_argument("--log-dir", type=Path)
     return parser
@@ -796,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 config_path=args.config,
                 memory_limit=args.memory_limit,
+                topic_limit=args.topic_limit,
                 dry_run=args.dry_run,
                 log_dir=args.log_dir if args.log_dir else None,
             )
@@ -806,6 +810,7 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 config_path=args.config,
                 memory_limit=args.memory_limit,
+                topic_limit=args.topic_limit,
                 max_iterations=args.max_iterations,
                 dry_run=args.dry_run,
                 log_dir=args.log_dir if args.log_dir else None,
@@ -817,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 config_path=args.config,
                 memory_limit=args.memory_limit,
+                topic_limit=args.topic_limit,
                 dry_run=args.dry_run,
                 log_dir=args.log_dir if args.log_dir else None,
             )
