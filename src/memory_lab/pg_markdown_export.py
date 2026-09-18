@@ -53,6 +53,10 @@ def _source_turns(metadata: Mapping[str, Any] | None) -> list[str]:
     return [str(value)] if value else []
 
 
+def _evidence_ref_count(refs: Any) -> int:
+    return len(refs) if isinstance(refs, list) else 0
+
+
 def _latest_memory_summary(topic: Mapping[str, Any]) -> str:
     memories = topic.get("memories") if isinstance(topic.get("memories"), list) else []
     for memory in memories:
@@ -126,6 +130,26 @@ FROM (
       WHERE m.topic_id = mt.topic_id
         AND m.user_id = mt.user_id
         {memory_status_filter}
+    ), '[]'::jsonb)
+    ,
+    'conflicts', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'conflict_id', c.conflict_id,
+        'memory_id', c.memory_id,
+        'turn_id', c.turn_id,
+        'conflict_type', c.conflict_type,
+        'old_claim', c.old_claim,
+        'new_claim', c.new_claim,
+        'decision', c.decision,
+        'reason', c.reason,
+        'evidence_refs', c.evidence_refs,
+        'status', c.status,
+        'metadata', c.metadata,
+        'created_at', c.created_at
+      ) ORDER BY c.created_at DESC, c.conflict_id)
+      FROM memory_conflict_records c
+      WHERE c.topic_id = mt.topic_id
+        AND c.user_id = mt.user_id
     ), '[]'::jsonb)
   ) AS topic_body
   FROM memory_topics mt
@@ -212,6 +236,27 @@ def export_pg_markdown(
                     "",
                 ]
             )
+        conflicts = topic.get("conflicts") if isinstance(topic.get("conflicts"), list) else []
+        if conflicts:
+            body.extend(["## 冲突记录", ""])
+            for conflict in conflicts:
+                refs = conflict.get("evidence_refs")
+                body.extend(
+                    [
+                        f"### `{conflict.get('conflict_id')}`",
+                        "",
+                        f"- 类型：`{conflict.get('conflict_type')}`",
+                        f"- 状态：`{conflict.get('status')}`",
+                        f"- 关联 memory：`{conflict.get('memory_id')}`",
+                        f"- 来源 turn：`{conflict.get('turn_id')}`",
+                        f"- 证据数量：{_evidence_ref_count(refs)}",
+                        f"- 旧说法：{conflict.get('old_claim')}",
+                        f"- 新说法：{conflict.get('new_claim')}",
+                        f"- 处理决定：{conflict.get('decision')}",
+                        f"- 原因：{conflict.get('reason')}",
+                        "",
+                    ]
+                )
         target = output_dir / filename
         target.write_text("\n".join(body).rstrip() + "\n", encoding="utf-8")
         written_files.append({"path": str(target), "topic_id": topic.get("topic_id"), "memory_count": len(memories)})
