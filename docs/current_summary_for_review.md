@@ -1,0 +1,407 @@
+# Memory Lab 当前进展简要说明
+
+本文面向项目同事和评审人员，快速说明当前 Memory Lab 的架构、已经实现的能力、测试验证情况、已经沉淀出的记忆，以及还没有完成的部分。
+
+## 1. 当前目标
+
+Memory Lab 的目标是从 CodePulse/CP 的真实开发对话中，自动沉淀长期记忆，让后续类似任务少问、少错、少返工。
+
+当前重点沉淀三类信息：
+
+1. 用户交互习惯  
+   例如用户希望如何协作、是否要先需求对齐、是否希望每阶段看到沉淀结果。
+
+2. 编译失败/成功经验  
+   例如 Keil C51 常见错误、最终有效修复方式、哪些错误是代码问题，哪些是工具链许可问题。
+
+3. 用户反馈现象后的问题定位经验  
+   例如板上现象是什么、根因是什么、如何修复、是否经过用户验证。
+
+一句话原则：
+
+```text
+需求文档存“当前项目最终要做什么”；
+长期记忆存“以后怎么少问、少错、少返工”。
+```
+
+## 2. 当前架构
+
+当前架构已经打通：
+
+```text
+CP SQLite 原始会话
+  ↓
+按一轮任务切分 turn
+  ↓
+生成三层证据池 core / candidate / pointer
+  ↓
+写入 PostgreSQL
+  ↓
+ReAct 记忆维护 Agent 判断是否需要沉淀
+  ↓
+必要时读取已有 memory / topic / pointer 补证据
+  ↓
+输出 memory-changes-v1 结构化计划
+  ↓
+本地程序校验、幂等处理、写入 PostgreSQL
+  ↓
+导出 Markdown 供人工查看
+```
+
+### 2.1 三层证据池
+
+| 层级 | 作用 |
+|---|---|
+| core | 用户明确表达、用户确认、关键结论 |
+| candidate | 助手总结、工具结果摘要、可能有价值的信息 |
+| pointer | 指向原始 CP 对话或工具输出，信息不足时可回查 |
+
+这样设计的原因是：不把整段长会话都塞给模型，而是先给关键证据，必要时再通过 pointer 回查原始信息。
+
+### 2.2 PostgreSQL 当前主要表
+
+| 表 | 作用 |
+|---|---|
+| turns | 存一轮 CP 对话任务 |
+| evidence_items | 存 core / candidate / pointer 证据 |
+| memory_topics | 存主题 |
+| memories | 存长期记忆正文 |
+| memory_conflict_records | 存冲突处理记录 |
+
+### 2.3 Markdown 展示
+
+当前可导出：
+
+```text
+reports/p0-memory-review/MEMORY.md
+reports/p0-memory-review/*.md
+```
+
+用于展示当前沉淀出的主题和记忆内容。
+
+## 3. 已实现功能
+
+### 3.1 真实 CP 会话读取与 turn 切分
+
+已实现从 CP SQLite 中读取真实对话，并按一轮任务切分 turn。
+
+已经在真实数据中识别过：
+
+- 需求/偏好类 turn；
+- 编译修复类 turn；
+- 运行现象诊断类 turn；
+- 用户确认修复类 turn。
+
+### 3.2 三层证据池生成
+
+已实现将 turn 拆成：
+
+```text
+core / candidate / pointer
+```
+
+并写入 PostgreSQL。
+
+### 3.3 ReAct 记忆维护流程
+
+已实现模型基于证据判断：
+
+- 是否新增记忆；
+- 是否更新已有记忆；
+- 是否合并同类经验；
+- 是否修正主题；
+- 是否记录冲突；
+- 是否无需操作。
+
+模型不能直接写数据库，只能输出结构化计划，最终由程序校验和写库。
+
+### 3.4 记忆写入工具
+
+当前支持：
+
+| action | 作用 |
+|---|---|
+| create_memory | 新增长期记忆 |
+| update_memory | 更新已有记忆 |
+| merge_memory | 合并同类证据 |
+| update_topic | 修正主题标题/概要 |
+| record_conflict_decision | 记录冲突处理过程 |
+| noop | 明确不沉淀 |
+
+### 3.5 幂等与错误返回
+
+已经实现：
+
+```text
+同一 turn 重跑不重复写 memory
+同一冲突重跑不重复创建 conflict
+topic 无变化时返回 skipped_no_change
+错误输入返回 error_code 和 suggested_next_actions
+```
+
+例如：
+
+```text
+重复 merge → skipped_duplicate_turn
+重复 conflict → skipped_existing / updated_existing
+不存在 topic → TOPIC_NOT_FOUND
+错误 evidence → EVIDENCE_NOT_IN_TURN
+```
+
+## 4. 已测试内容与结果
+
+### 4.1 用户偏好冲突测试
+
+测试场景：
+
+```text
+旧偏好：用户希望默认中文回复
+新偏好：用户要求以后所有对话统一英文回复
+```
+
+系统处理结果：
+
+```text
+memory 更新为：默认英文回复
+topic 从“默认使用中文回复”修正为“回复语言偏好”
+conflict 记录 old_claim / new_claim / decision / reason
+```
+
+当前沉淀结果：
+
+```text
+主题：回复语言偏好
+记忆：用户要求以后在所有对话中统一使用英文回复
+冲突记录数量：1
+```
+
+验证点：
+
+```text
+重复运行不会生成第二条冲突记录
+topic 和 memory 语义一致
+Markdown 展示正常
+```
+
+### 4.2 Keil C51 编译经验测试
+
+测试场景：
+
+CP 生成/修改 Keil C51 工程后，经历多轮编译错误修复。
+
+沉淀出的经验：
+
+1. Keil C51 编译前自检清单
+
+包括：
+
+```text
+storage modifier 位置
+code / const 写法
+ISR 只置标志
+static 函数先定义后调用
+头文件自给自足
+IncludePath / Define 配置
+```
+
+2. Keil C51 二次开发常见编译错误模式
+
+包括：
+
+```text
+C141：常见于 C51 存储修饰符顺序错误
+C202：常见于 IncludePath / Define / 头文件依赖缺失
+L250：Keil 受限版代码大小限制，不是代码错误
+```
+
+验证结果：
+
+```text
+编译修复 turn 重跑时不重复新增；
+已有记忆会返回 skipped_duplicate_turn；
+编译经验被拆成“自检清单”和“错误模式”两类，便于后续复用。
+```
+
+### 4.3 板上运行现象测试
+
+测试场景：
+
+用户反馈：
+
+```text
+温度在 36℃ 附近波动时，风扇频繁启停。
+```
+
+定位结果：
+
+```text
+根因：风扇电机 EMI 耦合回 ADC，形成自激闭环；
+仅靠空间滞回不够；
+需要增加连续 N 次采样一致才切换的时间滤波。
+```
+
+沉淀出的记忆：
+
+```text
+主题：阈值附近输出自激振荡需时间滤波
+```
+
+记忆内容包括：
+
+```text
+现象
+触发条件
+根因
+解决方法
+验证方式
+```
+
+用户后续确认：
+
+```text
+重新编译并烧录后，36℃ 附近不再频繁启停。
+```
+
+验证结果：
+
+```text
+修复确认 turn 重跑时返回 skipped_duplicate_turn；
+不会重复合并相同证据。
+```
+
+### 4.4 工具层单元测试
+
+新增测试覆盖：
+
+```text
+非法 action
+多余字段
+缺字段
+不存在 topic_id / memory_id
+错误 evidence_refs
+update_topic 禁止修改 topic_key
+record_conflict_decision 必填字段
+重复 update/merge 幂等
+错误返回 error_code
+```
+
+测试文件：
+
+```text
+tests/test_memory_changes_validation.py
+tests/test_memory_react_prompt.py
+```
+
+### 4.5 全量测试情况
+
+已跑全量测试：
+
+```text
+301 个测试，300 个通过，1 个失败
+```
+
+失败项：
+
+```text
+test_unified_cycle.UnifiedCycleTests.test_long_transcripts_use_longest_model_compatible_prefix_without_starvation
+```
+
+表现：
+
+```text
+期望 selected_turn_count = 1
+实际 selected_turn_count = 3
+```
+
+初步判断：
+
+该失败属于旧的 unified_cycle 长 transcript 批处理策略测试，不是本轮 memory 工具层优化直接导致，需要后续单独处理。
+
+## 5. 当前已经沉淀出的主要记忆
+
+当前 PostgreSQL 中已有的核心记忆包括：
+
+| 类型 | 记忆 |
+|---|---|
+| 用户偏好 | 用户要求所有对话统一英文回复 |
+| 用户偏好 | 用户要求单片机项目改码后必须实际编译 |
+| 用户偏好 | 嵌入式运行异常时先查工程代码，不要只猜硬件 |
+| 工程流程 | Keil C51 现有工程二次开发不要重建工程、不改 STARTUP.A51 |
+| 编译经验 | Keil C51 编译前自检清单 |
+| 编译经验 | Keil C51 二次开发常见编译错误模式 |
+| 运行现象 | 硬件输入桩函数固定返回常量会导致假数据 |
+| 运行现象 | 阈值附近输出自激振荡需时间滤波 |
+
+## 6. 未实现功能
+
+当前还没有完成：
+
+1. 召回使用测试  
+   目前重点是“沉淀”，还没有系统验证新任务开始时如何召回相关记忆并影响 CP 行为。
+
+2. search_related_memories  
+   目前模型主要依赖初始 memory index，还没有通用搜索工具。
+
+3. 主题结构维护  
+   已有 update_topic，但还没有：
+
+   ```text
+   move_memory_to_topic
+   split_memory
+   merge_topic
+   rename_topic_key
+   ```
+
+4. conflict 记录展示到 Markdown  
+   冲突记录已经进入 PostgreSQL，但还没有展示到主题 Markdown 中。
+
+5. 长期运行压测  
+   还没有做 20+ turn 连续运行后检查重复、污染、冲突增长的长期测试。
+
+6. 全量测试全绿  
+   当前还有 1 个旧测试失败。
+
+7. CP 主流程集成  
+   当前 Memory Lab 是旁路验证，还没有正式接入 CP 运行时流程。
+
+## 7. 下一步计划
+
+建议顺序：
+
+```text
+P0：处理唯一全量测试失败，保证全量测试全绿
+P1：Markdown 展示 conflict records
+P2：实现 search_related_memories
+P3：开始召回使用测试
+P4：实现 move_memory_to_topic / split_memory
+P5：做长期运行压测
+P6：评估是否迁移到 LangGraph
+P7：设计 CP 主流程接入点
+```
+
+## 8. 当前结论
+
+当前 Memory Lab 已经证明：
+
+```text
+真实 CP 对话 → 证据池 → 模型判断 → 结构化写库 → 幂等维护 → Markdown 展示
+```
+
+这条核心链路可运行。
+
+目前已经能展示：
+
+```text
+沉淀了什么记忆；
+为什么要这样沉淀；
+重复运行是否安全；
+冲突是否被记录；
+主题和记忆是否一致。
+```
+
+下一阶段重点应从“沉淀能力”转向：
+
+```text
+召回使用、冲突展示、结构维护、长期稳定运行。
+```
+
