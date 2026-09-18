@@ -53,11 +53,10 @@ create table if not exists evidence_items (
 );
 
 -- Lightweight Claude Code-style current-state memory tables.
--- Formal memory is intentionally not revisioned and does not maintain a
--- per-memory evidence graph in this MVP.  ``memory_agent_runs`` is optional
--- debug/audit metadata for the Writer call, not the source of truth.
+-- ``memories`` keeps the current value for fast recall. ``memory_revisions``
+-- records create/update/merge snapshots. ``memory_relations`` records
+-- supersede/merge/conflict links between memories.
 drop table if exists memory_evidence_links;
-drop table if exists memory_revisions;
 
 create table if not exists memory_topics (
   topic_id text primary key,
@@ -84,10 +83,47 @@ create table if not exists memories (
   content text not null,
   status text not null default 'active',
   confidence numeric(4,3),
+  trust_level text not null default 'inferred'
+    check (trust_level in ('user_confirmed', 'verified', 'observed', 'inferred', 'speculative')),
   metadata jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (user_id, stable_key)
+);
+
+create table if not exists memory_revisions (
+  revision_id text primary key,
+  user_id text not null references users(user_id) on delete cascade,
+  memory_id text not null references memories(memory_id) on delete cascade,
+  revision_number integer not null,
+  summary text not null,
+  content text not null,
+  confidence numeric(4,3),
+  trust_level text not null default 'inferred'
+    check (trust_level in ('user_confirmed', 'verified', 'observed', 'inferred', 'speculative')),
+  status text not null default 'current',
+  change_type text not null,
+  reason text not null,
+  source_turn_id text references turns(turn_id) on delete set null,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (user_id, memory_id, revision_number)
+);
+
+create table if not exists memory_relations (
+  relation_id text primary key,
+  user_id text not null references users(user_id) on delete cascade,
+  from_memory_id text not null references memories(memory_id) on delete cascade,
+  to_memory_id text not null references memories(memory_id) on delete cascade,
+  relation_type text not null
+    check (relation_type in ('supersedes', 'merges', 'conflicts_with')),
+  reason text not null,
+  source_turn_id text references turns(turn_id) on delete set null,
+  evidence_refs jsonb not null default '[]'::jsonb,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  check (from_memory_id <> to_memory_id),
+  unique (user_id, from_memory_id, to_memory_id, relation_type)
 );
 
 create table if not exists memory_agent_runs (
@@ -132,6 +168,10 @@ create index if not exists idx_memory_topics_scope_gin on memory_topics using gi
 create index if not exists idx_memories_user_type on memories(user_id, memory_type);
 create index if not exists idx_memories_topic on memories(topic_id);
 create index if not exists idx_memories_scope_gin on memories using gin(scope);
+create index if not exists idx_memory_revisions_memory on memory_revisions(user_id, memory_id, revision_number desc);
+create index if not exists idx_memory_revisions_turn on memory_revisions(user_id, source_turn_id);
+create index if not exists idx_memory_relations_from on memory_relations(user_id, from_memory_id, relation_type);
+create index if not exists idx_memory_relations_to on memory_relations(user_id, to_memory_id, relation_type);
 create index if not exists idx_memory_agent_runs_user_turn on memory_agent_runs(user_id, turn_id);
 create index if not exists idx_memory_conflict_records_memory on memory_conflict_records(user_id, memory_id);
 create index if not exists idx_memory_conflict_records_turn on memory_conflict_records(user_id, turn_id);

@@ -28,6 +28,8 @@ DEFAULT_PG_CONFIG = Path(__file__).resolve().parents[2] / "pg-memory-lab.local.j
 DEFAULT_PSQL = Path("D:/PostgreSQL/17/bin/psql.exe")
 PG_CONFIG_SCHEMA = "memory-lab-postgres-config-v1"
 DEFAULT_USER_ID = "local-default-user"
+TRUST_LEVELS = ("user_confirmed", "verified", "observed", "inferred", "speculative")
+MEMORY_RELATION_TYPES = ("supersedes", "merges", "conflicts_with")
 
 
 class PostgresConfigError(ValueError):
@@ -109,6 +111,155 @@ def _json_literal(value: Any) -> str:
     return _sql_literal(
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     ) + "::jsonb"
+
+
+def _memory_versioning_migration_sql(*, user_id: str) -> str:
+    """Return the idempotent PostgreSQL migration for lightweight versioning."""
+
+    del user_id  # Reserved for future per-user migration filtering.
+    return """
+ALTER TABLE memories
+  ADD COLUMN IF NOT EXISTS trust_level text NOT NULL DEFAULT 'inferred';
+
+ALTER TABLE memories
+  DROP CONSTRAINT IF EXISTS memories_trust_level_check;
+
+ALTER TABLE memories
+  ADD CONSTRAINT memories_trust_level_check
+  CHECK (trust_level IN ('user_confirmed', 'verified', 'observed', 'inferred', 'speculative'));
+
+UPDATE memories
+SET trust_level = CASE
+  WHEN metadata ->> 'trust_level' IN ('user_confirmed', 'verified', 'observed', 'inferred', 'speculative')
+    THEN metadata ->> 'trust_level'
+  ELSE COALESCE(NULLIF(trust_level, ''), 'inferred')
+END
+WHERE trust_level IS NULL
+   OR trust_level = ''
+   OR metadata ? 'trust_level';
+
+CREATE TABLE IF NOT EXISTS memory_revisions (
+  revision_id text PRIMARY KEY,
+  user_id text NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  memory_id text NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+  revision_number integer NOT NULL,
+  summary text NOT NULL,
+  content text NOT NULL,
+  confidence numeric(4,3),
+  trust_level text NOT NULL DEFAULT 'inferred'
+    CHECK (trust_level IN ('user_confirmed', 'verified', 'observed', 'inferred', 'speculative')),
+  status text NOT NULL DEFAULT 'current',
+  change_type text NOT NULL,
+  reason text NOT NULL,
+  source_turn_id text REFERENCES turns(turn_id) ON DELETE SET NULL,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, memory_id, revision_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory
+  ON memory_revisions(user_id, memory_id, revision_number DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_revisions_turn
+  ON memory_revisions(user_id, source_turn_id);
+
+CREATE TABLE IF NOT EXISTS memory_relations (
+  relation_id text PRIMARY KEY,
+  user_id text NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  from_memory_id text NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+  to_memory_id text NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+  relation_type text NOT NULL
+    CHECK (relation_type IN ('supersedes', 'merges', 'conflicts_with')),
+  reason text NOT NULL,
+  source_turn_id text REFERENCES turns(turn_id) ON DELETE SET NULL,
+  evidence_refs jsonb NOT NULL DEFAULT '[]'::jsonb,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (from_memory_id <> to_memory_id),
+  UNIQUE (user_id, from_memory_id, to_memory_id, relation_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relations_from
+  ON memory_relations(user_id, from_memory_id, relation_type);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relations_to
+  ON memory_relations(user_id, to_memory_id, relation_type);
+
+INSERT INTO memory_revisions(
+  revision_id, user_id, memory_id, revision_number, summary, content,
+  confidence, trust_level, status, change_type, reason, source_turn_id, metadata,
+  created_at
+)
+SELECT
+  'rev_' || substr(md5(m.user_id || '|' || m.memory_id || '|initial'), 1, 16),
+  m.user_id,
+  m.memory_id,
+  1,
+  m.summary,
+  m.content,
+  m.confidence,
+  m.trust_level,
+  'current',
+  'initial',
+  '迁移生成：把现有 memories 当前内容补为初始版本。',
+  NULL,
+  jsonb_build_object('migration', 'memory_versioning_v1'),
+  COALESCE(m.created_at, now())
+FROM memories m
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM memory_revisions r
+  WHERE r.user_id = m.user_id
+    AND r.memory_id = m.memory_id
+    AND r.revision_number = 1
+);
+"""
+
+
+def migrate_memory_versioning(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+) -> dict[str, Any]:
+    """Install lightweight memory versioning tables and backfill initial revisions."""
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    migration_sql = _memory_versioning_migration_sql(user_id=user_id)
+    report_sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+SELECT jsonb_build_object(
+  'memory_count', (SELECT count(*) FROM memories WHERE user_id = {_sql_literal(user_id)}),
+  'revision_count', (SELECT count(*) FROM memory_revisions WHERE user_id = {_sql_literal(user_id)}),
+  'initial_revision_count', (
+    SELECT count(*)
+    FROM memory_revisions
+    WHERE user_id = {_sql_literal(user_id)}
+      AND revision_number = 1
+      AND change_type = 'initial'
+  ),
+  'relation_count', (SELECT count(*) FROM memory_relations WHERE user_id = {_sql_literal(user_id)}),
+  'trust_level_counts', COALESCE((
+    SELECT jsonb_object_agg(trust_level, count)
+    FROM (
+      SELECT trust_level, count(*) AS count
+      FROM memories
+      WHERE user_id = {_sql_literal(user_id)}
+      GROUP BY trust_level
+      ORDER BY trust_level
+    ) grouped
+  ), '{{}}'::jsonb)
+)::text;
+"""
+    report = _json_from_psql_object(config, "BEGIN;\n" + migration_sql + "\nCOMMIT;\n" + report_sql)
+    return {
+        "status": "complete",
+        "tool": "migrate_memory_versioning",
+        "user_id": user_id,
+        "trust_levels": list(TRUST_LEVELS),
+        "relation_types": list(MEMORY_RELATION_TYPES),
+        "report": report,
+    }
 
 
 def _latest_terminal_turn(lab_database: Path, source_identifier: str) -> str:
@@ -622,6 +773,7 @@ SELECT COALESCE((
           'content_truncated', length(m.content) > {max_chars},
           'status', m.status,
           'confidence', m.confidence,
+          'trust_level', m.trust_level,
           'metadata', m.metadata,
           'created_at', m.created_at,
           'updated_at', m.updated_at
@@ -761,7 +913,7 @@ ranked AS (
     m.summary AS memory_summary,
     m.status AS memory_status,
     m.confidence,
-    COALESCE(m.metadata ->> 'trust_level', 'unknown') AS trust_level,
+    m.trust_level AS trust_level,
     COALESCE(m.metadata ->> 'source_rank', 'unknown') AS source_rank,
     COALESCE(m.metadata ->> 'verification_status', 'unknown') AS verification_status,
     m.updated_at,
@@ -1058,6 +1210,7 @@ memory_index AS (
           'scope', m.scope,
           'status', m.status,
           'confidence', m.confidence,
+          'trust_level', m.trust_level,
           'updated_at', m.updated_at
         )
         ORDER BY m.updated_at DESC, m.stable_key
@@ -1180,6 +1333,7 @@ SELECT jsonb_build_object(
   'content', m.content,
   'status', m.status,
   'confidence', m.confidence,
+  'trust_level', m.trust_level,
   'metadata', m.metadata,
   'created_at', m.created_at,
   'updated_at', m.updated_at

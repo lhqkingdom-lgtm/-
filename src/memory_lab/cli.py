@@ -39,6 +39,7 @@ from .pg_store import (
     get_turn_evidence,
     ingest_turn_to_postgres,
     list_memory_topics,
+    migrate_memory_versioning,
     postgres_quality_report,
     read_memory_detail,
     read_topic_detail,
@@ -366,6 +367,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evidence layer to include; repeatable. Defaults to all layers.",
     )
     pg_get_turn_evidence.add_argument("--max-chars", type=int, default=1200)
+    pg_migrate_memory_versioning = subparsers.add_parser(
+        "pg-migrate-memory-versioning",
+        help="Install lightweight memory versioning schema and backfill initial revisions",
+    )
+    pg_migrate_memory_versioning.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_current_turn_summary = subparsers.add_parser(
         "pg-current-turn-evidence-summary",
         help="Return a compact current-turn evidence summary for ReAct memory tools",
@@ -744,6 +750,10 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 raw_pointer_id=args.raw_pointer_id,
                 max_chars=args.max_chars,
+            )
+        elif args.command == "pg-migrate-memory-versioning":
+            report = migrate_memory_versioning(
+                pg_config_path=args.pg_config,
             )
         elif args.command == "pg-current-turn-evidence-summary":
             report = get_current_turn_evidence_summary(
