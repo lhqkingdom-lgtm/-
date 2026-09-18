@@ -351,8 +351,13 @@ class OpenAICompatibleJsonClient:
                 ) from error
             except urlerror.HTTPError as error:
                 last_error = error
+                try:
+                    body = error.read(1000).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    body = ""
                 if error.code not in {408, 409, 429, 500, 502, 503, 504}:
-                    break
+                    suffix = f": {body}" if body else ""
+                    raise JsonClientTransportError(f"provider HTTP {error.code}{suffix}") from error
                 if attempt < configured_attempts:
                     wait_before_retry(attempt, error.headers.get("Retry-After"))
             except (urlerror.URLError, TimeoutError, OSError) as error:
