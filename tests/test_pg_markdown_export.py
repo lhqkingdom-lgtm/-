@@ -17,7 +17,7 @@ class PgMarkdownExportTests(unittest.TestCase):
                     "topic_id": "topic_language",
                     "topic_key": "user_preference_reply_language",
                     "title": "回复语言偏好",
-                    "summary": "用户当前默认英文回复。",
+                    "summary": "主题概要：记录用户当前回复语言偏好。",
                     "topic_type": "user_preference",
                     "scope": {"level": "domain", "domain": "general"},
                     "status": "active",
@@ -65,6 +65,8 @@ class PgMarkdownExportTests(unittest.TestCase):
             text = topic_path.read_text(encoding="utf-8")
 
         self.assertTrue(report["ok"])
+        self.assertIn("主题概要：主题概要：记录用户当前回复语言偏好。", text)
+        self.assertIn("代表性记忆摘要：用户要求默认英文回复。", text)
         self.assertIn("## 冲突记录", text)
         self.assertIn("旧说法：用户希望默认中文回复。", text)
         self.assertIn("新说法：用户希望默认英文回复。", text)

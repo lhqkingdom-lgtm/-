@@ -66,6 +66,14 @@ def _latest_memory_summary(topic: Mapping[str, Any]) -> str:
     return str(topic.get("summary") or "").strip()
 
 
+def _topic_summary(topic: Mapping[str, Any]) -> str:
+    return str(topic.get("summary") or "").strip()
+
+
+def _index_summary(topic: Mapping[str, Any]) -> str:
+    return _topic_summary(topic) or _latest_memory_summary(topic)
+
+
 def _group_label(topic: Mapping[str, Any]) -> str:
     topic_type = str(topic.get("topic_type") or "")
     memories = topic.get("memories") if isinstance(topic.get("memories"), list) else []
@@ -195,7 +203,7 @@ def export_pg_markdown(
             current_group = group
             index_lines.extend(["", f"## {group}", ""])
         index_lines.append(
-            f"- [{topic.get('title')}](./{filename}) — {_latest_memory_summary(topic)}；"
+            f"- [{topic.get('title')}](./{filename}) — {_index_summary(topic)}；"
             f"{len(memories)} 条记忆；范围：{_scope_label(topic.get('scope'))}"
         )
         body = [
@@ -210,7 +218,8 @@ def export_pg_markdown(
             "",
             f"# {topic.get('title')}",
             "",
-            f"- 概要：{_latest_memory_summary(topic)}",
+            f"- 主题概要：{_topic_summary(topic) or '无'}",
+            f"- 代表性记忆摘要：{_latest_memory_summary(topic) or '无'}",
             f"- 范围：{_scope_label(topic.get('scope'))}",
             f"- 记忆数量：{len(memories)}",
             "",
