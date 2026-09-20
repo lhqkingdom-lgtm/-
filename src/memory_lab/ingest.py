@@ -22,9 +22,29 @@ from .store import (
 )
 
 
-def run_ingestion(source_database: Path, lab_database: Path, mode: str) -> dict:
-    if mode not in {"baseline", "ingest"}:
+def run_ingestion(
+    source_database: Path,
+    lab_database: Path,
+    mode: str,
+    *,
+    session_ids: set[str] | None = None,
+) -> dict:
+    """Import current CP events, or explicitly backfill selected old sessions.
+
+    ``baseline`` deliberately keeps all pre-existing CP data out of the normal
+    incremental pipeline.  ``historical_backfill`` is the narrow escape hatch
+    for evaluation/migration: callers must name every root session to import.
+    It never changes the source database.  The import run itself is the audit
+    trail; explicitly selected root-session events remain eligible so they can
+    proceed through the same turn/evidence pipeline as live observations.
+    """
+    if mode not in {"baseline", "ingest", "historical_backfill"}:
         raise ValueError(f"Unsupported ingestion mode: {mode}")
+    selected_sessions = {item.strip() for item in (session_ids or set()) if item.strip()}
+    if mode == "historical_backfill" and not selected_sessions:
+        raise ValueError("historical_backfill requires at least one explicit session_id")
+    if mode != "historical_backfill" and selected_sessions:
+        raise ValueError("session_ids are only supported by historical_backfill")
     require_distinct_source_and_lab(source_database, lab_database)
     if lab_database.exists():
         require_memory_lab_database(lab_database)
@@ -68,18 +88,51 @@ def run_ingestion(source_database: Path, lab_database: Path, mode: str) -> dict:
                 )
         run_id = begin_run(store, identifier, mode)
         cutoff_ms = baseline_cutoff_ms(store, identifier)
-        counters["reclassified_child_events"] = mark_child_session_events(
-            store, identifier
-        )
-        counters["reclassified_late_events"] = mark_prebaseline_events(
-            store, identifier, cutoff_ms
-        )
+        # The normal live lane must quarantine late/pre-baseline data.  An
+        # explicitly selected historical backfill is an opt-in exception and
+        # must not be reclassified away before turn detection can consume it.
+        if mode != "historical_backfill":
+            counters["reclassified_child_events"] = mark_child_session_events(
+                store, identifier
+            )
+            counters["reclassified_late_events"] = mark_prebaseline_events(
+                store, identifier, cutoff_ms
+            )
 
         with closing(open_read_only(source_database)) as source:
             source.execute("BEGIN")
             try:
                 for part in iter_parts(source):
+                    if mode == "historical_backfill" and part.session_id not in selected_sessions:
+                        continue
                     counters["scanned_parts"] += 1
+                    if mode == "historical_backfill":
+                        disposition, reason = classify(part)
+                        if disposition == "event":
+                            event = to_event(part, identifier)
+                            if event["parent_session_id"] and event["parent_session_id"].strip():
+                                disposition = "isolated"
+                                reason = "child_or_fork_session_user_message"
+                                if not store.execute(
+                                    "SELECT 1 FROM event WHERE event_id = ?", (event["event_id"],)
+                                ).fetchone():
+                                    record_event(store, event, eligibility_status=reason)
+                                    isolated_events.append({**event, "eligibility_status": reason})
+                                    counters["isolated_user_events"] += 1
+                                else:
+                                    counters["duplicate_parts"] += 1
+                            elif not store.execute(
+                                "SELECT 1 FROM event WHERE event_id = ?", (event["event_id"],)
+                            ).fetchone():
+                                record_event(store, event)
+                                new_events.append(event)
+                                counters["user_events"] += 1
+                            else:
+                                counters["duplicate_parts"] += 1
+                        else:
+                            counters["filtered_parts"] += 1
+                        reasons[reason] += 1
+                        continue
                     if already_processed(store, identifier, part.part_id):
                         counters["duplicate_parts"] += 1
                         continue

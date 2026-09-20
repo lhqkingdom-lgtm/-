@@ -95,6 +95,39 @@ class IngestionTests(unittest.TestCase):
         with closing(sqlite3.connect(self.store)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM event").fetchone()[0], 1)
 
+    def test_explicit_historical_backfill_imports_only_named_session_and_is_idempotent(self) -> None:
+        with closing(sqlite3.connect(self.source)) as connection, connection:
+            connection.execute(
+                "INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("ses_other", "global", None, r"D:\\project-b", "other", "1.0", 1001),
+            )
+        self.add_part("prt_selected", "用户确认修复后可以继续", session_id="ses_1")
+        self.add_part("prt_other", "不应导入的会话", session_id="ses_other")
+        run_ingestion(self.source, self.store, "baseline")
+
+        first = run_ingestion(
+            self.source,
+            self.store,
+            "historical_backfill",
+            session_ids={"ses_1"},
+        )
+        second = run_ingestion(
+            self.source,
+            self.store,
+            "historical_backfill",
+            session_ids={"ses_1"},
+        )
+
+        self.assertEqual(first["user_events"], 1)
+        self.assertEqual(first["events"][0]["part_id"], "prt_selected")
+        self.assertEqual(second["user_events"], 0)
+        self.assertEqual(second["duplicate_parts"], 1)
+        with closing(sqlite3.connect(self.store)) as connection:
+            rows = connection.execute(
+                "SELECT part_id, eligibility_status FROM event ORDER BY part_id"
+            ).fetchall()
+        self.assertEqual(rows, [("prt_selected", "eligible")])
+
     def test_source_database_can_never_be_used_as_lab_database(self) -> None:
         with closing(sqlite3.connect(self.source)) as connection:
             before = {

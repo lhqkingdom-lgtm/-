@@ -292,3 +292,65 @@ memory 主题 summary 是否仍合理
 Markdown 导出是否可读
 重复运行是否不会重复写
 ```
+
+## 7. P0 合并粒度优化验收（2026-09-20）
+
+### 背景
+
+19 条真实 CP turn 回归发现：模型能找对相关 memory，但 `merge_memory` 容易把不同类型信息继续塞进宽泛旧 memory，导致长期记忆逐步变长、变杂。
+
+### 本轮优化
+
+提示词新增三类约束：
+
+```text
+1. 只有新证据能用目标 memory 的同一句核心结论解释时，才允许 merge_memory。
+2. 如果新信息是新的独立规则，应 create_memory，不要强行 merge 到宽泛旧 memory。
+3. 用户协作习惯、工程流程、编译失败经验、运行现象经验应尽量保持原子化。
+```
+
+同时补充 ReAct 工具调用规则：
+
+```text
+如果理想动作是 merge/update/conflict，但目标 memory 未读取、没有修改权限，
+不能用 noop 代替，应先请求 read_memory_detail / read_topic_detail / list_topic_memories。
+```
+
+### 回归范围
+
+```text
+真实 turn：19 条
+执行模式：dry-run
+日志目录：reports/large-turn-regression-20260920-p0-merge-policy
+补丁验证：reports/large-turn-regression-20260920-p0-merge-policy-fix
+单测：100 个全部通过
+```
+
+### 结果摘要
+
+```text
+record_conflict_decision：2
+update_memory：1
+update_topic：1
+merge_memory：13
+noop：8
+create_memory：7
+```
+
+### 关键验收点
+
+| 场景 | 优化前风险 | 优化后表现 | 结论 |
+|---|---|---|---|
+| “不清楚就问，不要瞎猜” | 容易合并进 Keil 工程流程 memory | 新建独立用户协作偏好 memory | 通过 |
+| “优先复用现有 ADC 库/接口” | 容易塞进宽泛二次开发流程 memory | 新建独立工程协作偏好 memory | 通过 |
+| ADC 桩固定 2048 重复证据 | 容易继续扩写已有 memory | 无新增验证时选择 noop，避免重复膨胀 | 通过 |
+| 当前项目需求参数 | 容易误写长期记忆 | 需求参数、阈值、PWM、NTC 规格等选择 noop | 通过 |
+| 未读取目标 memory | 曾出现“理想应 merge，但因未读而 noop” | 补规则后重跑同一 turn，变为读取后 merge_memory | 通过 |
+
+### 仍保留的问题
+
+这次优化主要解决“跨类型乱合并”和“权限不足误 noop”。部分复杂 `merge_memory` 的正文仍偏长，下一步需要进一步优化合并后的表达：
+
+```text
+目标：merge_memory 合并后只保留短结论、关键新增证据、验证状态，不再生成完整报告。
+```

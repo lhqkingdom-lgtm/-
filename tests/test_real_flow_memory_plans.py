@@ -93,7 +93,7 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                         "new_claim": "演示前用户希望少卡确认、先跑通结果。",
                         "decision": "保留长期偏好，同时增加演示/时间压力场景的例外规则。",
                         "reason": "新证据不是完全推翻旧偏好，而是给出适用场景边界。",
-                        "status": "resolved",
+                        "status": "resolved_by_update",
                     },
                     "evidence_refs": ev("ev_user", "用户明确说先跑结果最重要。"),
                 },

@@ -28,15 +28,27 @@ MEMORY_CHANGES_SCHEMA_VERSION = "memory-changes-v1"
 ALLOWED_ACTIONS = {
     "create_memory",
     "merge_memory",
+    "merge_existing_memories",
     "update_memory",
+    "retire_memory",
     "mark_conflict",
     "update_topic",
+    "move_memory_topic",
+    "merge_topics",
     "record_conflict_decision",
     "record_memory_relation",
     "noop",
     "request_more_evidence",
 }
 ALLOWED_REQUEST_TOOLS = {"expand_pointer", "read_memory_detail", "read_topic_detail"}
+CONFLICT_RECORD_STATUSES = (
+    "needs_review",
+    "resolved_by_update",
+    "resolved_by_merge",
+    "discarded_as_stale",
+    "carried_forward",
+)
+ACTIVE_CONFLICT_RECORD_STATUSES = ("needs_review", "carried_forward")
 KEY_RE = re.compile(r"^[a-z0-9_]+(?:[._][a-z0-9_]+)*$")
 CLIENT_TEMP_ID_RE = re.compile(r"^temp:[a-z0-9_]+(?:[._-][a-z0-9_]+)*$")
 MAX_CHANGES = 10
@@ -57,6 +69,7 @@ class MemoryChangesCommitError(ValueError):
 def _error_codes_for_messages(errors: list[str]) -> list[str]:
     codes: list[str] = []
     patterns = [
+        ("topic.topic_key already exists", "TOPIC_KEY_EXISTS"),
         ("target_memory_id does not exist", "MEMORY_NOT_FOUND"),
         ("memory_id does not exist", "MEMORY_NOT_FOUND"),
         ("from_memory_id does not exist", "MEMORY_NOT_FOUND"),
@@ -88,6 +101,7 @@ def _suggestions_for_error_codes(codes: list[str]) -> list[str]:
         "UNSUPPORTED_FIELD": "Remove unsupported fields and keep only the schema fields allowed for this action.",
         "MISSING_REQUIRED_FIELD": "Add the missing required field using the action schema.",
         "DUPLICATE_STABLE_KEY": "Update or merge the existing memory instead of creating a new memory with the same stable_key.",
+        "TOPIC_KEY_EXISTS": "Use topic_id to create a memory under the existing topic, or emit a separate update_topic action if the topic title/summary should change.",
         "UNKNOWN_ACTION": "Use one of the allowed memory-changes-v1 actions.",
         "VALIDATION_ERROR": "Fix the reported validation errors and resubmit the corrected change.",
     }
@@ -166,14 +180,39 @@ SELECT jsonb_build_object(
     FROM memories
     WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
   ), '[]'::jsonb),
+  'memory_topics', COALESCE((
+    SELECT jsonb_object_agg(memory_id, topic_id)
+    FROM memories
+    WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
+  ), '{{}}'::jsonb),
+  'conflict_memory_ids', COALESCE((
+    SELECT jsonb_agg(memory_id)
+    FROM memories
+    WHERE user_id = {_sql_literal(user_id)} AND status = 'conflict'
+  ), '[]'::jsonb),
   'topic_ids', COALESCE((
     SELECT jsonb_agg(topic_id)
     FROM memory_topics
     WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
   ), '[]'::jsonb),
+  'topic_keys', COALESCE((
+    SELECT jsonb_agg(topic_key)
+    FROM memory_topics
+    WHERE user_id = {_sql_literal(user_id)}
+  ), '[]'::jsonb),
   'stable_keys', COALESCE((
     SELECT jsonb_agg(stable_key)
     FROM memories
+    WHERE user_id = {_sql_literal(user_id)}
+  ), '[]'::jsonb),
+  'conflict_records', COALESCE((
+    SELECT jsonb_agg(jsonb_build_object(
+      'conflict_id', conflict_id,
+      'memory_id', memory_id,
+      'topic_id', topic_id,
+      'status', status
+    ))
+    FROM memory_conflict_records
     WHERE user_id = {_sql_literal(user_id)}
   ), '[]'::jsonb)
 )::text;
@@ -326,10 +365,90 @@ def _check_conflict_decision(decision: Any, errors: list[str], prefix: str) -> N
     for field in required:
         if not _non_empty_string(decision.get(field)):
             errors.append(f"{prefix}.conflict.{field} must be a non-empty string")
-    if "status" in decision and str(decision.get("status")) not in {"recorded", "resolved", "needs_review"}:
-        errors.append(f"{prefix}.conflict.status must be recorded/resolved/needs_review")
+    if "status" in decision and str(decision.get("status")) not in set(CONFLICT_RECORD_STATUSES):
+        errors.append(
+            f"{prefix}.conflict.status must be one of {', '.join(CONFLICT_RECORD_STATUSES)}"
+        )
     if "metadata" in decision and not _is_object(decision.get("metadata")):
         errors.append(f"{prefix}.conflict.metadata must be an object")
+
+
+def _check_conflict_resolution(resolution: Any, errors: list[str], prefix: str) -> None:
+    if not _is_object(resolution):
+        errors.append(f"{prefix}.conflict_resolution must be an object")
+        return
+    allowed = {"conflict_ids", "status", "reason", "metadata"}
+    required = {"conflict_ids", "status", "reason"}
+    extra = set(resolution) - allowed
+    missing = required - set(resolution)
+    if extra:
+        errors.append(f"{prefix}.conflict_resolution has unsupported fields: {sorted(extra)}")
+    if missing:
+        errors.append(f"{prefix}.conflict_resolution missing fields: {sorted(missing)}")
+    conflict_ids = resolution.get("conflict_ids")
+    if not isinstance(conflict_ids, list) or not conflict_ids:
+        errors.append(f"{prefix}.conflict_resolution.conflict_ids must be a non-empty array")
+    elif len(conflict_ids) > 20:
+        errors.append(f"{prefix}.conflict_resolution.conflict_ids exceeds 20")
+    else:
+        seen: set[str] = set()
+        for item_index, conflict_id in enumerate(conflict_ids):
+            if not _non_empty_string(conflict_id):
+                errors.append(f"{prefix}.conflict_resolution.conflict_ids[{item_index}] must be a non-empty string")
+            elif str(conflict_id) in seen:
+                errors.append(f"{prefix}.conflict_resolution.conflict_ids[{item_index}] is duplicated")
+            else:
+                seen.add(str(conflict_id))
+    if resolution.get("status") != "resolved_by_update":
+        errors.append(f"{prefix}.conflict_resolution.status must be resolved_by_update")
+    if not _non_empty_string(resolution.get("reason")):
+        errors.append(f"{prefix}.conflict_resolution.reason must be a non-empty string")
+    if "metadata" in resolution and not _is_object(resolution.get("metadata")):
+        errors.append(f"{prefix}.conflict_resolution.metadata must be an object")
+
+
+def _check_conflict_disposition(
+    disposition: Any,
+    errors: list[str],
+    prefix: str,
+    *,
+    allowed_statuses: set[str] | None = None,
+) -> None:
+    if not _is_object(disposition):
+        errors.append(f"{prefix}.conflict_disposition must be an object")
+        return
+    allowed_statuses = allowed_statuses or {"discarded_as_stale", "carried_forward"}
+    allowed = {"conflict_ids", "status", "reason", "metadata"}
+    required = {"status", "reason"}
+    extra = set(disposition) - allowed
+    missing = required - set(disposition)
+    if extra:
+        errors.append(f"{prefix}.conflict_disposition has unsupported fields: {sorted(extra)}")
+    if missing:
+        errors.append(f"{prefix}.conflict_disposition missing fields: {sorted(missing)}")
+    if disposition.get("status") not in allowed_statuses:
+        errors.append(
+            f"{prefix}.conflict_disposition.status must be one of {', '.join(sorted(allowed_statuses))}"
+        )
+    if not _non_empty_string(disposition.get("reason")):
+        errors.append(f"{prefix}.conflict_disposition.reason must be a non-empty string")
+    conflict_ids = disposition.get("conflict_ids")
+    if conflict_ids is not None:
+        if not isinstance(conflict_ids, list) or not conflict_ids:
+            errors.append(f"{prefix}.conflict_disposition.conflict_ids must be a non-empty array when provided")
+        elif len(conflict_ids) > 20:
+            errors.append(f"{prefix}.conflict_disposition.conflict_ids exceeds 20")
+        else:
+            seen: set[str] = set()
+            for item_index, conflict_id in enumerate(conflict_ids):
+                if not _non_empty_string(conflict_id):
+                    errors.append(f"{prefix}.conflict_disposition.conflict_ids[{item_index}] must be a non-empty string")
+                elif str(conflict_id) in seen:
+                    errors.append(f"{prefix}.conflict_disposition.conflict_ids[{item_index}] is duplicated")
+                else:
+                    seen.add(str(conflict_id))
+    if "metadata" in disposition and not _is_object(disposition.get("metadata")):
+        errors.append(f"{prefix}.conflict_disposition.metadata must be an object")
 
 
 def validate_memory_changes(
@@ -369,6 +488,12 @@ def validate_memory_changes(
     evidence_ids = {str(item) for item in snapshot.get("evidence_ids") or []}
     pointer_ids = {str(item) for item in snapshot.get("pointer_ids") or []}
     memory_ids = {str(item) for item in snapshot.get("memory_ids") or []}
+    memory_topics = {
+        str(key): str(value)
+        for key, value in (snapshot.get("memory_topics") or {}).items()
+        if _non_empty_string(key) and _non_empty_string(value)
+    }
+    conflict_memory_ids = {str(item) for item in snapshot.get("conflict_memory_ids") or []}
     extra_memory_ids = {
         str(key): str(value)
         for key, value in (extra_memory_ids or {}).items()
@@ -377,7 +502,12 @@ def validate_memory_changes(
     memory_ids.update(extra_memory_ids)
     memory_ids.update(extra_memory_ids.values())
     topic_ids = {str(item) for item in snapshot.get("topic_ids") or []}
+    existing_topic_keys = {str(item) for item in snapshot.get("topic_keys") or []}
     existing_stable_keys = {str(item) for item in snapshot.get("stable_keys") or []}
+    conflict_records: dict[str, Mapping[str, Any]] = {}
+    for item in snapshot.get("conflict_records") or []:
+        if isinstance(item, Mapping) and item.get("conflict_id"):
+            conflict_records[str(item["conflict_id"])] = item
     batch_stable_keys: set[str] = set()
     batch_targets: dict[str, str] = {}
     batch_temp_memory_ids: dict[str, str] = {}
@@ -419,6 +549,12 @@ def validate_memory_changes(
                 errors.append(f"{prefix} must contain exactly one of topic/topic_id")
             if has_topic:
                 _check_topic(change.get("topic"), errors, prefix)
+                if _is_object(change.get("topic")):
+                    topic_key = str(change["topic"].get("topic_key") or "")
+                    if topic_key in existing_topic_keys:
+                        errors.append(
+                            f"{prefix}.topic.topic_key already exists; use topic_id for existing topics or update_topic to change title/summary"
+                        )
             if has_topic_id and change.get("topic_id") not in topic_ids:
                 errors.append(f"{prefix}.topic_id does not exist")
             _check_memory(change.get("memory"), errors, prefix, create=True)
@@ -446,6 +582,8 @@ def validate_memory_changes(
 
         elif action in {"merge_memory", "update_memory", "mark_conflict"}:
             allowed = {"action", "reason", "target_memory_id", "memory", "evidence_refs"}
+            if action == "update_memory":
+                allowed = {*allowed, "conflict_resolution"}
             extra = set(change) - allowed
             if extra:
                 errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
@@ -461,6 +599,181 @@ def validate_memory_changes(
             else:
                 batch_targets[str(target)] = action
             _check_memory(change.get("memory"), errors, prefix, create=False)
+            if "conflict_resolution" in change:
+                _check_conflict_resolution(change.get("conflict_resolution"), errors, prefix)
+                resolution = change.get("conflict_resolution")
+                if _is_object(resolution) and isinstance(resolution.get("conflict_ids"), list):
+                    for conflict_id in resolution.get("conflict_ids") or []:
+                        conflict_id = str(conflict_id)
+                        conflict_record = conflict_records.get(conflict_id)
+                        if not conflict_record:
+                            errors.append(f"{prefix}.conflict_resolution.conflict_ids contains unknown conflict_id: {conflict_id}")
+                            continue
+                        if str(conflict_record.get("memory_id") or "") != str(target or ""):
+                            errors.append(
+                                f"{prefix}.conflict_resolution.conflict_id {conflict_id} does not belong to target_memory_id"
+                            )
+                        if str(conflict_record.get("status") or "") not in set(ACTIVE_CONFLICT_RECORD_STATUSES):
+                            errors.append(
+                                f"{prefix}.conflict_resolution.conflict_id {conflict_id} is not an active conflict"
+                            )
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "retire_memory":
+            allowed = {"action", "reason", "target_memory_id", "evidence_refs", "conflict_disposition"}
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target = change.get("target_memory_id")
+            if not _non_empty_string(target):
+                errors.append(f"{prefix}.target_memory_id must be a non-empty string")
+            elif target not in memory_ids:
+                errors.append(f"{prefix}.target_memory_id does not exist or is not active")
+            elif target in batch_targets:
+                errors.append(
+                    f"{prefix}.target_memory_id already used by {batch_targets[target]} in this batch"
+                )
+            else:
+                batch_targets[str(target)] = action
+
+            active_conflicts_for_target = [
+                conflict_id
+                for conflict_id, conflict_record in conflict_records.items()
+                if str(conflict_record.get("memory_id") or "") == str(target or "")
+                and str(conflict_record.get("status") or "") in set(ACTIVE_CONFLICT_RECORD_STATUSES)
+            ]
+            if "conflict_disposition" in change:
+                _check_conflict_disposition(change.get("conflict_disposition"), errors, prefix)
+                disposition = change.get("conflict_disposition")
+                if _is_object(disposition):
+                    provided_conflict_ids = disposition.get("conflict_ids")
+                    if isinstance(provided_conflict_ids, list):
+                        for conflict_id in provided_conflict_ids:
+                            conflict_id = str(conflict_id)
+                            conflict_record = conflict_records.get(conflict_id)
+                            if not conflict_record:
+                                errors.append(f"{prefix}.conflict_disposition.conflict_ids contains unknown conflict_id: {conflict_id}")
+                                continue
+                            if str(conflict_record.get("memory_id") or "") != str(target or ""):
+                                errors.append(
+                                    f"{prefix}.conflict_disposition.conflict_id {conflict_id} does not belong to target_memory_id"
+                                )
+                            if str(conflict_record.get("status") or "") not in set(ACTIVE_CONFLICT_RECORD_STATUSES):
+                                errors.append(
+                                    f"{prefix}.conflict_disposition.conflict_id {conflict_id} is not an active conflict"
+                                )
+            elif active_conflicts_for_target:
+                errors.append(
+                    f"{prefix}.conflict_disposition is required because target memory has active conflicts"
+                )
+
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "merge_existing_memories":
+            allowed = {
+                "action",
+                "reason",
+                "target_memory_id",
+                "source_memory_ids",
+                "memory",
+                "evidence_refs",
+                "conflict_disposition",
+            }
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target = change.get("target_memory_id")
+            if not _non_empty_string(target):
+                errors.append(f"{prefix}.target_memory_id must be a non-empty string")
+            elif target not in memory_ids:
+                errors.append(f"{prefix}.target_memory_id does not exist or is not active")
+            elif target in batch_targets:
+                errors.append(
+                    f"{prefix}.target_memory_id already used by {batch_targets[target]} in this batch"
+                )
+            else:
+                batch_targets[str(target)] = action
+
+            source_memory_ids = change.get("source_memory_ids")
+            normalized_sources: list[str] = []
+            if not isinstance(source_memory_ids, list) or not source_memory_ids:
+                errors.append(f"{prefix}.source_memory_ids must be a non-empty array")
+            elif len(source_memory_ids) > 20:
+                errors.append(f"{prefix}.source_memory_ids exceeds 20")
+            else:
+                seen_sources: set[str] = set()
+                for source_index, source_id in enumerate(source_memory_ids):
+                    if not _non_empty_string(source_id):
+                        errors.append(f"{prefix}.source_memory_ids[{source_index}] must be a non-empty string")
+                        continue
+                    source_id = str(source_id)
+                    if source_id in seen_sources:
+                        errors.append(f"{prefix}.source_memory_ids[{source_index}] is duplicated")
+                    elif source_id == str(target or ""):
+                        errors.append(f"{prefix}.source_memory_ids[{source_index}] must not equal target_memory_id")
+                    elif source_id not in memory_ids:
+                        errors.append(f"{prefix}.source_memory_ids[{source_index}] does not exist or is not active")
+                    elif source_id in batch_targets:
+                        errors.append(
+                            f"{prefix}.source_memory_ids[{source_index}] already used by {batch_targets[source_id]} in this batch"
+                        )
+                    else:
+                        seen_sources.add(source_id)
+                        normalized_sources.append(source_id)
+                        batch_targets[source_id] = action
+
+            _check_memory(change.get("memory"), errors, prefix, create=False)
+
+            active_conflicts_for_sources = [
+                conflict_id
+                for conflict_id, conflict_record in conflict_records.items()
+                if str(conflict_record.get("memory_id") or "") in set(normalized_sources)
+                and str(conflict_record.get("status") or "") in set(ACTIVE_CONFLICT_RECORD_STATUSES)
+            ]
+            if "conflict_disposition" in change:
+                _check_conflict_disposition(
+                    change.get("conflict_disposition"),
+                    errors,
+                    prefix,
+                    allowed_statuses={"resolved_by_merge", "discarded_as_stale", "carried_forward"},
+                )
+                disposition = change.get("conflict_disposition")
+                if _is_object(disposition):
+                    provided_conflict_ids = disposition.get("conflict_ids")
+                    if isinstance(provided_conflict_ids, list):
+                        for conflict_id in provided_conflict_ids:
+                            conflict_id = str(conflict_id)
+                            conflict_record = conflict_records.get(conflict_id)
+                            if not conflict_record:
+                                errors.append(f"{prefix}.conflict_disposition.conflict_ids contains unknown conflict_id: {conflict_id}")
+                                continue
+                            if str(conflict_record.get("memory_id") or "") not in set(normalized_sources):
+                                errors.append(
+                                    f"{prefix}.conflict_disposition.conflict_id {conflict_id} does not belong to source_memory_ids"
+                                )
+                            if str(conflict_record.get("status") or "") not in set(ACTIVE_CONFLICT_RECORD_STATUSES):
+                                errors.append(
+                                    f"{prefix}.conflict_disposition.conflict_id {conflict_id} is not an active conflict"
+                                )
+            elif active_conflicts_for_sources:
+                errors.append(
+                    f"{prefix}.conflict_disposition is required because source memories have active conflicts"
+                )
+
             _check_evidence_refs(
                 change.get("evidence_refs"),
                 errors,
@@ -490,6 +803,100 @@ def validate_memory_changes(
                 required=True,
             )
 
+        elif action == "move_memory_topic":
+            allowed = {
+                "action",
+                "reason",
+                "target_memory_id",
+                "from_topic_id",
+                "to_topic_id",
+                "evidence_refs",
+            }
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target = change.get("target_memory_id")
+            from_topic_id = change.get("from_topic_id")
+            to_topic_id = change.get("to_topic_id")
+            if not _non_empty_string(target):
+                errors.append(f"{prefix}.target_memory_id must be a non-empty string")
+            elif target not in memory_ids:
+                errors.append(f"{prefix}.target_memory_id does not exist or is not active")
+            elif target in batch_targets:
+                errors.append(
+                    f"{prefix}.target_memory_id already used by {batch_targets[target]} in this batch"
+                )
+            else:
+                batch_targets[str(target)] = action
+                actual_topic_id = memory_topics.get(str(target))
+                if actual_topic_id and _non_empty_string(from_topic_id) and str(from_topic_id) != actual_topic_id:
+                    errors.append(
+                        f"{prefix}.from_topic_id does not match current memory topic"
+                    )
+            if not _non_empty_string(from_topic_id):
+                errors.append(f"{prefix}.from_topic_id must be a non-empty string")
+            elif from_topic_id not in topic_ids:
+                errors.append(f"{prefix}.from_topic_id does not exist or is not active")
+            if not _non_empty_string(to_topic_id):
+                errors.append(f"{prefix}.to_topic_id must be a non-empty string")
+            elif to_topic_id not in topic_ids:
+                errors.append(f"{prefix}.to_topic_id does not exist or is not active")
+            if _non_empty_string(from_topic_id) and _non_empty_string(to_topic_id) and str(from_topic_id) == str(to_topic_id):
+                errors.append(f"{prefix}.to_topic_id must be different from from_topic_id")
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
+        elif action == "merge_topics":
+            allowed = {
+                "action",
+                "reason",
+                "target_topic_id",
+                "source_topic_ids",
+                "evidence_refs",
+            }
+            extra = set(change) - allowed
+            if extra:
+                errors.append(f"{prefix} has unsupported fields: {sorted(extra)}")
+            target_topic_id = change.get("target_topic_id")
+            if not _non_empty_string(target_topic_id):
+                errors.append(f"{prefix}.target_topic_id must be a non-empty string")
+            elif target_topic_id not in topic_ids:
+                errors.append(f"{prefix}.target_topic_id does not exist or is not active")
+            source_topic_ids = change.get("source_topic_ids")
+            if not isinstance(source_topic_ids, list) or not source_topic_ids:
+                errors.append(f"{prefix}.source_topic_ids must be a non-empty array")
+            elif len(source_topic_ids) > 20:
+                errors.append(f"{prefix}.source_topic_ids exceeds 20")
+            else:
+                seen_topics: set[str] = set()
+                for source_index, source_topic_id in enumerate(source_topic_ids):
+                    if not _non_empty_string(source_topic_id):
+                        errors.append(f"{prefix}.source_topic_ids[{source_index}] must be a non-empty string")
+                        continue
+                    source_topic_id = str(source_topic_id)
+                    if source_topic_id in seen_topics:
+                        errors.append(f"{prefix}.source_topic_ids[{source_index}] is duplicated")
+                    elif source_topic_id == str(target_topic_id or ""):
+                        errors.append(f"{prefix}.source_topic_ids[{source_index}] must not equal target_topic_id")
+                    elif source_topic_id not in topic_ids:
+                        errors.append(f"{prefix}.source_topic_ids[{source_index}] does not exist or is not active")
+                    else:
+                        seen_topics.add(source_topic_id)
+            _check_evidence_refs(
+                change.get("evidence_refs"),
+                errors,
+                prefix,
+                evidence_ids=evidence_ids,
+                pointer_ids=pointer_ids,
+                required=True,
+            )
+
         elif action == "record_conflict_decision":
             allowed = {
                 "action",
@@ -504,8 +911,8 @@ def validate_memory_changes(
             target = change.get("target_memory_id")
             if not _non_empty_string(target):
                 errors.append(f"{prefix}.target_memory_id must be a non-empty string")
-            elif target not in memory_ids:
-                errors.append(f"{prefix}.target_memory_id does not exist or is not active")
+            elif target not in memory_ids and target not in conflict_memory_ids:
+                errors.append(f"{prefix}.target_memory_id does not exist or is not active/conflict")
             _check_conflict_decision(change.get("conflict"), errors, prefix)
             _check_evidence_refs(
                 change.get("evidence_refs"),
@@ -698,14 +1105,7 @@ VALUES (
   {_json_literal(topic["scope"])},
   'active',
   now()
-)
-ON CONFLICT (user_id, topic_key) DO UPDATE SET
-  title = EXCLUDED.title,
-  summary = EXCLUDED.summary,
-  topic_type = EXCLUDED.topic_type,
-  scope = EXCLUDED.scope,
-  status = 'active',
-  updated_at = now();
+);
 """
     return topic_id, sql
 
@@ -814,7 +1214,6 @@ def _update_memory_sql(
     status_sql = f"status = {_sql_literal(status)}," if status else ""
     metadata_json = _json_literal(metadata)
     return f"""
-WITH updated AS (
 UPDATE memories
 SET {status_sql}
     summary = {_sql_literal(str(memory["summary"]))},
@@ -847,15 +1246,7 @@ SET {status_sql}
     updated_at = now()
 WHERE memory_id = {_sql_literal(memory_id)}
   AND user_id = {_sql_literal(user_id)}
-  AND status = 'active'
-RETURNING topic_id, summary
-)
-UPDATE memory_topics mt
-SET summary = updated.summary,
-    updated_at = now()
-FROM updated
-WHERE mt.topic_id = updated.topic_id
-  AND mt.user_id = {_sql_literal(user_id)};
+  AND status = 'active';
 """
 
 
@@ -877,6 +1268,120 @@ SET {", ".join(assignments)}
 WHERE topic_id = {_sql_literal(topic_id)}
   AND user_id = {_sql_literal(user_id)}
   AND status = 'active';
+"""
+
+
+def _move_memory_topic_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    from_topic_id: str,
+    to_topic_id: str,
+    metadata: Mapping[str, Any],
+    reason: str,
+) -> str:
+    move_metadata = {
+        **metadata,
+        "move_reason": reason,
+        "old_topic_id": from_topic_id,
+        "new_topic_id": to_topic_id,
+    }
+    metadata_json = _json_literal(move_metadata)
+    return f"""
+UPDATE memories
+SET topic_id = {_sql_literal(to_topic_id)},
+    metadata =
+      (metadata || {metadata_json})
+      || jsonb_build_object(
+        'source_turn_ids',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+          FROM jsonb_array_elements_text(
+            COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'source_turn_ids', '[]'::jsonb)
+            || CASE
+                 WHEN metadata ? 'source_turn_id' THEN jsonb_build_array(metadata ->> 'source_turn_id')
+                 ELSE '[]'::jsonb
+               END
+          ) AS merged(value)
+        ),
+        'evidence_refs',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT item), '[]'::jsonb)
+          FROM jsonb_array_elements(
+            COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'evidence_refs', '[]'::jsonb)
+          ) AS merged(item)
+        )
+      ),
+    updated_at = now()
+WHERE memory_id = {_sql_literal(memory_id)}
+  AND user_id = {_sql_literal(user_id)}
+  AND status = 'active'
+  AND topic_id = {_sql_literal(from_topic_id)};
+"""
+
+
+def _merge_topics_sql(
+    *,
+    user_id: str,
+    target_topic_id: str,
+    source_topic_ids: list[str],
+    metadata: Mapping[str, Any],
+    reason: str,
+) -> str:
+    source_values = ", ".join(_sql_literal(item) for item in source_topic_ids)
+    merge_metadata = {
+        **metadata,
+        "merge_topics_reason": reason,
+        "target_topic_id": target_topic_id,
+        "source_topic_ids": source_topic_ids,
+    }
+    metadata_json = _json_literal(merge_metadata)
+    return f"""
+UPDATE memories
+SET topic_id = {_sql_literal(target_topic_id)},
+    metadata =
+      (metadata || {metadata_json})
+      || jsonb_build_object(
+        'source_turn_ids',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+          FROM jsonb_array_elements_text(
+            COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'source_turn_ids', '[]'::jsonb)
+            || CASE
+                 WHEN metadata ? 'source_turn_id' THEN jsonb_build_array(metadata ->> 'source_turn_id')
+                 ELSE '[]'::jsonb
+               END
+          ) AS merged(value)
+        ),
+        'evidence_refs',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT item), '[]'::jsonb)
+          FROM jsonb_array_elements(
+            COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'evidence_refs', '[]'::jsonb)
+          ) AS merged(item)
+        )
+      ),
+    updated_at = now()
+WHERE user_id = {_sql_literal(user_id)}
+  AND status = 'active'
+  AND topic_id IN ({source_values});
+
+UPDATE memory_topics
+SET status = 'merged',
+    metadata = metadata || jsonb_build_object(
+      'merged_into', {_sql_literal(target_topic_id)},
+      'merge_reason', {_sql_literal(reason)},
+      'source_turn_id', {_sql_literal(str(metadata.get("source_turn_id") or ""))},
+      'source_topic_ids', {metadata_json} -> 'source_topic_ids'
+    ),
+    updated_at = now()
+WHERE user_id = {_sql_literal(user_id)}
+  AND status = 'active'
+  AND topic_id IN ({source_values});
 """
 
 
@@ -917,10 +1422,12 @@ def _read_conflict_state(
 SELECT COALESCE((
   SELECT jsonb_build_object(
     'found', true,
-    'conflict_id', conflict_id,
-    'reason', reason,
-    'status', status,
-    'evidence_refs', evidence_refs
+      'conflict_id', conflict_id,
+      'memory_id', memory_id,
+      'topic_id', topic_id,
+      'reason', reason,
+      'status', status,
+      'evidence_refs', evidence_refs
   )
   FROM memory_conflict_records
   WHERE conflict_id = {_sql_literal(conflict_id)}
@@ -928,6 +1435,189 @@ SELECT COALESCE((
 ), jsonb_build_object('found', false))::text;
 """
     return _json_from_psql_object(config, sql)
+
+
+def _resolve_conflicts_by_update_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    conflict_resolution: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> str:
+    conflict_ids = [str(item) for item in conflict_resolution.get("conflict_ids") or []]
+    values = ", ".join(_sql_literal(item) for item in conflict_ids)
+    resolution_metadata = {
+        **(conflict_resolution.get("metadata") if isinstance(conflict_resolution.get("metadata"), Mapping) else {}),
+        **metadata,
+        "resolution_status": "resolved_by_update",
+        "resolution_reason": str(conflict_resolution.get("reason") or ""),
+    }
+    return f"""
+UPDATE memory_conflict_records
+SET status = 'resolved_by_update',
+    metadata = metadata || {_json_literal(resolution_metadata)}
+WHERE user_id = {_sql_literal(user_id)}
+  AND memory_id = {_sql_literal(memory_id)}
+  AND conflict_id IN ({values})
+  AND status IN ('needs_review', 'carried_forward');
+"""
+
+
+def _retire_memory_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    metadata: Mapping[str, Any],
+    reason: str,
+) -> str:
+    retirement_metadata = {
+        **metadata,
+        "retirement_reason": reason,
+    }
+    metadata_json = _json_literal(retirement_metadata)
+    return f"""
+UPDATE memories
+SET status = 'retired',
+    metadata =
+      (metadata || {metadata_json})
+      || jsonb_build_object(
+        'source_turn_ids',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+          FROM jsonb_array_elements_text(
+            COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'source_turn_ids', '[]'::jsonb)
+            || CASE
+                 WHEN metadata ? 'source_turn_id' THEN jsonb_build_array(metadata ->> 'source_turn_id')
+                 ELSE '[]'::jsonb
+               END
+          ) AS merged(value)
+        ),
+        'evidence_refs',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT item), '[]'::jsonb)
+          FROM jsonb_array_elements(
+            COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'evidence_refs', '[]'::jsonb)
+          ) AS merged(item)
+        )
+      ),
+    updated_at = now()
+WHERE memory_id = {_sql_literal(memory_id)}
+  AND user_id = {_sql_literal(user_id)}
+  AND status = 'active';
+"""
+
+
+def _dispose_conflicts_for_retire_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    disposition: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> str:
+    conflict_ids = disposition.get("conflict_ids")
+    if isinstance(conflict_ids, list) and conflict_ids:
+        conflict_filter = "AND conflict_id IN (" + ", ".join(_sql_literal(str(item)) for item in conflict_ids) + ")"
+    else:
+        conflict_filter = ""
+    status = str(disposition["status"])
+    disposition_metadata = {
+        **(disposition.get("metadata") if isinstance(disposition.get("metadata"), Mapping) else {}),
+        **metadata,
+        "retire_disposition_status": status,
+        "retire_disposition_reason": str(disposition.get("reason") or ""),
+    }
+    return f"""
+UPDATE memory_conflict_records
+SET status = {_sql_literal(status)},
+    metadata = metadata || {_json_literal(disposition_metadata)}
+WHERE user_id = {_sql_literal(user_id)}
+  AND memory_id = {_sql_literal(memory_id)}
+  AND status IN ('needs_review', 'carried_forward')
+  {conflict_filter};
+"""
+
+
+def _mark_source_memory_merged_sql(
+    *,
+    user_id: str,
+    memory_id: str,
+    target_memory_id: str,
+    metadata: Mapping[str, Any],
+    reason: str,
+) -> str:
+    merge_metadata = {
+        **metadata,
+        "merge_target_memory_id": target_memory_id,
+        "merge_reason": reason,
+    }
+    metadata_json = _json_literal(merge_metadata)
+    return f"""
+UPDATE memories
+SET status = 'merged',
+    metadata =
+      (metadata || {metadata_json})
+      || jsonb_build_object(
+        'source_turn_ids',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT value), '[]'::jsonb)
+          FROM jsonb_array_elements_text(
+            COALESCE(metadata -> 'source_turn_ids', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'source_turn_ids', '[]'::jsonb)
+            || CASE
+                 WHEN metadata ? 'source_turn_id' THEN jsonb_build_array(metadata ->> 'source_turn_id')
+                 ELSE '[]'::jsonb
+               END
+          ) AS merged(value)
+        ),
+        'evidence_refs',
+        (
+          SELECT COALESCE(jsonb_agg(DISTINCT item), '[]'::jsonb)
+          FROM jsonb_array_elements(
+            COALESCE(metadata -> 'evidence_refs', '[]'::jsonb)
+            || COALESCE({metadata_json} -> 'evidence_refs', '[]'::jsonb)
+          ) AS merged(item)
+        )
+      ),
+    updated_at = now()
+WHERE memory_id = {_sql_literal(memory_id)}
+  AND user_id = {_sql_literal(user_id)}
+  AND status = 'active';
+"""
+
+
+def _dispose_conflicts_for_merge_sql(
+    *,
+    user_id: str,
+    source_memory_ids: list[str],
+    disposition: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> str:
+    if not source_memory_ids:
+        return ""
+    source_filter = ", ".join(_sql_literal(item) for item in source_memory_ids)
+    conflict_ids = disposition.get("conflict_ids")
+    if isinstance(conflict_ids, list) and conflict_ids:
+        conflict_filter = "AND conflict_id IN (" + ", ".join(_sql_literal(str(item)) for item in conflict_ids) + ")"
+    else:
+        conflict_filter = ""
+    status = str(disposition["status"])
+    disposition_metadata = {
+        **(disposition.get("metadata") if isinstance(disposition.get("metadata"), Mapping) else {}),
+        **metadata,
+        "merge_disposition_status": status,
+        "merge_disposition_reason": str(disposition.get("reason") or ""),
+    }
+    return f"""
+UPDATE memory_conflict_records
+SET status = {_sql_literal(status)},
+    metadata = metadata || {_json_literal(disposition_metadata)}
+WHERE user_id = {_sql_literal(user_id)}
+  AND memory_id IN ({source_filter})
+  AND status IN ('needs_review', 'carried_forward')
+  {conflict_filter};
+"""
 
 
 def _insert_conflict_decision_sql(
@@ -950,7 +1640,7 @@ def _insert_conflict_decision_sql(
         turn_id,
         conflict_type,
     )
-    status = str(conflict.get("status") or "recorded")
+    status = str(conflict.get("status") or "needs_review")
     conflict_metadata = {
         **(conflict.get("metadata") if isinstance(conflict.get("metadata"), Mapping) else {}),
         **metadata,
@@ -977,7 +1667,7 @@ SELECT
 FROM memories m
 WHERE m.memory_id = {_sql_literal(memory_id)}
   AND m.user_id = {_sql_literal(user_id)}
-  AND m.status = 'active'
+  AND m.status IN ('active', 'conflict')
 ON CONFLICT (conflict_id)
 DO UPDATE SET
   old_claim = EXCLUDED.old_claim,
@@ -1198,6 +1888,127 @@ def _commit_validated_change(
             "message": "topic title/summary updated",
         }
 
+    if action == "move_memory_topic":
+        target_memory_id = str(change["target_memory_id"])
+        from_topic_id = str(change["from_topic_id"])
+        to_topic_id = str(change["to_topic_id"])
+        if _memory_already_processed_turn(
+            config=config,
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+        ):
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_duplicate_turn",
+                "target_id": target_memory_id,
+                "memory_id": target_memory_id,
+                "from_topic_id": from_topic_id,
+                "to_topic_id": to_topic_id,
+                "message": "target memory already processed this source_turn_id; skipping duplicate topic move",
+            }
+        sql = _move_memory_topic_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            from_topic_id=from_topic_id,
+            to_topic_id=to_topic_id,
+            metadata=metadata,
+            reason=str(change.get("reason") or action),
+        )
+        revision_sql = _insert_memory_revision_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            change_type=action,
+            reason=str(change.get("reason") or action),
+            metadata={
+                **metadata,
+                "old_topic_id": from_topic_id,
+                "new_topic_id": to_topic_id,
+            },
+            initial=False,
+        )
+        _run_psql(config, "BEGIN;\n" + sql + revision_sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": "moved",
+            "target_id": target_memory_id,
+            "memory_id": target_memory_id,
+            "from_topic_id": from_topic_id,
+            "to_topic_id": to_topic_id,
+            "message": "memory moved to target topic",
+        }
+
+    if action == "merge_topics":
+        target_topic_id = str(change["target_topic_id"])
+        source_topic_ids = [str(item) for item in change.get("source_topic_ids") or []]
+        sql = _merge_topics_sql(
+            user_id=user_id,
+            target_topic_id=target_topic_id,
+            source_topic_ids=source_topic_ids,
+            metadata=metadata,
+            reason=str(change.get("reason") or action),
+        )
+        revision_sql = f"""
+UPDATE memory_revisions
+SET status = 'superseded'
+WHERE user_id = {_sql_literal(user_id)}
+  AND status = 'current'
+  AND memory_id IN (
+    SELECT memory_id
+    FROM memories
+    WHERE user_id = {_sql_literal(user_id)}
+      AND topic_id = {_sql_literal(target_topic_id)}
+      AND metadata ->> 'source_turn_id' = {_sql_literal(str(proposal.get("turn_id") or ""))}
+  );
+
+INSERT INTO memory_revisions(
+  revision_id, user_id, memory_id, revision_number, summary, content,
+  confidence, trust_level, status, change_type, reason, source_turn_id, metadata
+)
+SELECT
+  'rev_' || substr(md5(
+    m.user_id || '|' || m.memory_id || '|merge_topics|' ||
+    COALESCE({_sql_literal(str(proposal.get("turn_id") or ""))}, '') || '|' ||
+    m.summary || '|' || m.content
+  ), 1, 16),
+  m.user_id,
+  m.memory_id,
+  COALESCE((
+    SELECT max(r.revision_number)
+    FROM memory_revisions r
+    WHERE r.user_id = m.user_id
+      AND r.memory_id = m.memory_id
+  ), 0) + 1,
+  m.summary,
+  m.content,
+  m.confidence,
+  m.trust_level,
+  'current',
+  'merge_topics',
+  {_sql_literal(str(change.get("reason") or action))},
+  {_sql_literal(str(proposal.get("turn_id") or ""))}::text,
+  {_json_literal({"change_metadata": {**metadata, "target_topic_id": target_topic_id, "source_topic_ids": source_topic_ids}})}
+FROM memories m
+WHERE m.user_id = {_sql_literal(user_id)}
+  AND m.status = 'active'
+  AND m.topic_id = {_sql_literal(target_topic_id)}
+  AND m.metadata ->> 'source_turn_id' = {_sql_literal(str(proposal.get("turn_id") or ""))}
+ON CONFLICT (revision_id) DO NOTHING;
+"""
+        _run_psql(config, "BEGIN;\n" + sql + revision_sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": "merged",
+            "target_id": target_topic_id,
+            "target_topic_id": target_topic_id,
+            "source_topic_ids": source_topic_ids,
+            "message": "source topics merged into target topic",
+        }
+
     if action == "record_conflict_decision":
         target_memory_id = str(change["target_memory_id"])
         conflict_id, sql = _insert_conflict_decision_sql(
@@ -1213,7 +2024,7 @@ def _commit_validated_change(
             user_id=user_id,
             conflict_id=conflict_id,
         )
-        desired_status = str(change["conflict"].get("status") or "recorded")
+        desired_status = str(change["conflict"].get("status") or "needs_review")
         desired_reason = str(change["conflict"]["reason"])
         desired_evidence_refs = change.get("evidence_refs") or []
         if (
@@ -1241,7 +2052,7 @@ def _commit_validated_change(
             "target_id": conflict_id,
             "memory_id": target_memory_id,
             "conflict_id": conflict_id,
-            "status": str(change["conflict"].get("status") or "recorded"),
+            "status": str(change["conflict"].get("status") or "needs_review"),
             "message": "conflict decision recorded" if result == "created" else "conflict decision updated",
         }
 
@@ -1290,6 +2101,151 @@ def _commit_validated_change(
             "message": "memory relation recorded" if result == "created" else "memory relation updated",
         }
 
+    if action == "retire_memory":
+        target_memory_id = str(change["target_memory_id"])
+        if _memory_already_processed_turn(
+            config=config,
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+        ):
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_duplicate_turn",
+                "target_id": target_memory_id,
+                "memory_id": target_memory_id,
+                "message": "target memory already processed this source_turn_id; skipping duplicate retire",
+            }
+        sql = _retire_memory_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            metadata=metadata,
+            reason=str(change.get("reason") or action),
+        )
+        revision_sql = _insert_memory_revision_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            change_type=action,
+            reason=str(change.get("reason") or action),
+            metadata=metadata,
+            initial=False,
+        )
+        conflict_disposition_sql = ""
+        disposed_conflict_ids: list[str] = []
+        if isinstance(change.get("conflict_disposition"), Mapping):
+            disposition = change["conflict_disposition"]
+            disposed_conflict_ids = [str(item) for item in disposition.get("conflict_ids") or []]
+            conflict_disposition_sql = _dispose_conflicts_for_retire_sql(
+                user_id=user_id,
+                memory_id=target_memory_id,
+                disposition=disposition,
+                metadata=metadata,
+            )
+        _run_psql(config, "BEGIN;\n" + sql + revision_sql + conflict_disposition_sql + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": "retired",
+            "target_id": target_memory_id,
+            "memory_id": target_memory_id,
+            "status": "retired",
+            "disposed_conflict_ids": disposed_conflict_ids,
+            "message": "memory retired",
+        }
+
+    if action == "merge_existing_memories":
+        target_memory_id = str(change["target_memory_id"])
+        source_memory_ids = [str(item) for item in change.get("source_memory_ids") or []]
+        all_processed = [_memory_already_processed_turn(
+            config=config,
+            user_id=user_id,
+            memory_id=memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+        ) for memory_id in [target_memory_id, *source_memory_ids]]
+        if all(all_processed):
+            return {
+                "action": action,
+                "committed": False,
+                "result": "skipped_duplicate_turn",
+                "target_id": target_memory_id,
+                "memory_id": target_memory_id,
+                "source_memory_ids": source_memory_ids,
+                "message": "target and source memories already processed this source_turn_id; skipping duplicate merge",
+            }
+        sql_parts: list[str] = []
+        sql_parts.append(_update_memory_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            memory=change["memory"],
+            metadata=metadata,
+            status=None,
+        ))
+        sql_parts.append(_insert_memory_revision_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            turn_id=str(proposal.get("turn_id") or ""),
+            change_type=action,
+            reason=str(change.get("reason") or action),
+            metadata=metadata,
+            initial=False,
+        ))
+        for source_memory_id in source_memory_ids:
+            sql_parts.append(_mark_source_memory_merged_sql(
+                user_id=user_id,
+                memory_id=source_memory_id,
+                target_memory_id=target_memory_id,
+                metadata=metadata,
+                reason=str(change.get("reason") or action),
+            ))
+            sql_parts.append(_insert_memory_revision_sql(
+                user_id=user_id,
+                memory_id=source_memory_id,
+                turn_id=str(proposal.get("turn_id") or ""),
+                change_type=action,
+                reason=str(change.get("reason") or action),
+                metadata={**metadata, "merge_target_memory_id": target_memory_id},
+                initial=False,
+            ))
+            relation = {
+                "from_memory_id": source_memory_id,
+                "to_memory_id": target_memory_id,
+                "relation_type": "merges",
+                "reason": str(change.get("reason") or action),
+                "metadata": {"created_by": "merge_existing_memories"},
+            }
+            _, relation_sql = _insert_memory_relation_sql(
+                user_id=user_id,
+                turn_id=str(proposal.get("turn_id") or ""),
+                relation=relation,
+                evidence_refs=change.get("evidence_refs") or [],
+                metadata=metadata,
+            )
+            sql_parts.append(relation_sql)
+        disposed_conflict_ids: list[str] = []
+        if isinstance(change.get("conflict_disposition"), Mapping):
+            disposition = change["conflict_disposition"]
+            disposed_conflict_ids = [str(item) for item in disposition.get("conflict_ids") or []]
+            sql_parts.append(_dispose_conflicts_for_merge_sql(
+                user_id=user_id,
+                source_memory_ids=source_memory_ids,
+                disposition=disposition,
+                metadata=metadata,
+            ))
+        _run_psql(config, "BEGIN;\n" + "\n".join(sql_parts) + "\nCOMMIT;")
+        return {
+            "action": action,
+            "committed": True,
+            "result": "merged",
+            "target_id": target_memory_id,
+            "memory_id": target_memory_id,
+            "source_memory_ids": source_memory_ids,
+            "status": "active",
+            "disposed_conflict_ids": disposed_conflict_ids,
+            "message": "existing memories merged",
+        }
+
     target_memory_id = str(change["target_memory_id"])
     if _memory_already_processed_turn(
         config=config,
@@ -1322,7 +2278,15 @@ def _commit_validated_change(
         metadata=metadata,
         initial=False,
     )
-    _run_psql(config, "BEGIN;\n" + sql + revision_sql + "\nCOMMIT;")
+    conflict_resolution_sql = ""
+    if action == "update_memory" and isinstance(change.get("conflict_resolution"), Mapping):
+        conflict_resolution_sql = _resolve_conflicts_by_update_sql(
+            user_id=user_id,
+            memory_id=target_memory_id,
+            conflict_resolution=change["conflict_resolution"],
+            metadata=metadata,
+        )
+    _run_psql(config, "BEGIN;\n" + sql + revision_sql + conflict_resolution_sql + "\nCOMMIT;")
     return {
         "action": action,
         "committed": True,
@@ -1330,6 +2294,11 @@ def _commit_validated_change(
         "target_id": target_memory_id,
         "memory_id": target_memory_id,
         "status": status or "active",
+        "resolved_conflict_ids": (
+            list(change["conflict_resolution"].get("conflict_ids") or [])
+            if action == "update_memory" and isinstance(change.get("conflict_resolution"), Mapping)
+            else []
+        ),
         "message": "memory marked as conflict" if action == "mark_conflict" else "memory updated",
     }
 

@@ -123,6 +123,16 @@ def build_parser() -> argparse.ArgumentParser:
         "ingest",
         help="Import newly observed user text as normalized events",
     )
+    historical_backfill = subparsers.add_parser(
+        "historical-backfill",
+        help="Explicitly import selected historical root sessions for evaluation/migration",
+    )
+    historical_backfill.add_argument(
+        "--session-id",
+        action="append",
+        required=True,
+        help="Root CP session to import; repeat to import another selected session",
+    )
     subparsers.add_parser(
         "prepare",
         help="Bind events to session/project contexts and separate test case markers",
@@ -402,6 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_list_memory_topics.add_argument("--domain")
     pg_list_memory_topics.add_argument("--project-key")
     pg_list_memory_topics.add_argument("--include-inactive", action="store_true")
+    pg_list_memory_topics.add_argument("--include-test-data", action="store_true")
     pg_list_memory_topics.add_argument("--limit", type=int, default=200)
     pg_expand_pointer = subparsers.add_parser(
         "pg-expand-pointer",
@@ -423,6 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_list_topic_memories.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_list_topic_memories.add_argument("--topic-id", required=True)
     pg_list_topic_memories.add_argument("--include-inactive", action="store_true")
+    pg_list_topic_memories.add_argument("--include-test-data", action="store_true")
     pg_list_topic_memories.add_argument("--limit", type=int, default=20)
     pg_read_memory_history = subparsers.add_parser(
         "pg-read-memory-history",
@@ -438,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     pg_list_memory_conflicts.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_list_memory_conflicts.add_argument("--memory-id")
     pg_list_memory_conflicts.add_argument("--topic-id")
+    pg_list_memory_conflicts.add_argument("--include-test-data", action="store_true")
+    pg_list_memory_conflicts.add_argument("--status", dest="conflict_status")
+    pg_list_memory_conflicts.add_argument("--include-resolved", action="store_true")
     pg_list_memory_conflicts.add_argument("--limit", type=int, default=20)
     pg_trace_memory_relations = subparsers.add_parser(
         "pg-trace-memory-relations",
@@ -451,6 +466,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
     )
     pg_trace_memory_relations.add_argument("--max-depth", type=int, default=1)
+    pg_trace_memory_relations.add_argument("--include-test-data", action="store_true")
     pg_read_topic_detail = subparsers.add_parser(
         "pg-read-topic-detail",
         help="Read one lightweight memory topic and its memories",
@@ -458,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_read_topic_detail.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
     pg_read_topic_detail.add_argument("--topic-id", required=True)
     pg_read_topic_detail.add_argument("--include-inactive", action="store_true")
+    pg_read_topic_detail.add_argument("--include-test-data", action="store_true")
     pg_read_topic_detail.add_argument("--max-chars", type=int, default=4000)
     pg_search_related_memories = subparsers.add_parser(
         "pg-search-related-memories",
@@ -469,6 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     pg_search_related_memories.add_argument("--domain")
     pg_search_related_memories.add_argument("--project-key")
     pg_search_related_memories.add_argument("--include-inactive", action="store_true")
+    pg_search_related_memories.add_argument("--include-test-data", action="store_true")
     pg_search_related_memories.add_argument("--limit", type=int, default=8)
     pg_export_markdown = subparsers.add_parser(
         "pg-export-markdown",
@@ -795,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
                 domain=args.domain,
                 project_key=args.project_key,
                 include_inactive=args.include_inactive,
+                include_test_data=args.include_test_data,
                 limit=args.limit,
             )
         elif args.command == "pg-expand-pointer":
@@ -825,6 +844,7 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 topic_id=args.topic_id,
                 include_inactive=args.include_inactive,
+                include_test_data=args.include_test_data,
                 limit=args.limit,
             )
         elif args.command == "pg-read-memory-history":
@@ -838,6 +858,9 @@ def main(argv: list[str] | None = None) -> int:
                 pg_config_path=args.pg_config,
                 memory_id=args.memory_id,
                 topic_id=args.topic_id,
+                include_test_data=args.include_test_data,
+                status_filter=args.conflict_status,
+                include_resolved=args.include_resolved,
                 limit=args.limit,
             )
         elif args.command == "pg-trace-memory-relations":
@@ -846,12 +869,14 @@ def main(argv: list[str] | None = None) -> int:
                 memory_id=args.memory_id,
                 direction=args.direction,
                 max_depth=args.max_depth,
+                include_test_data=args.include_test_data,
             )
         elif args.command == "pg-read-topic-detail":
             report = read_topic_detail(
                 pg_config_path=args.pg_config,
                 topic_id=args.topic_id,
                 include_inactive=args.include_inactive,
+                include_test_data=args.include_test_data,
                 max_chars=args.max_chars,
             )
         elif args.command == "pg-search-related-memories":
@@ -862,6 +887,7 @@ def main(argv: list[str] | None = None) -> int:
                 domain=args.domain,
                 project_key=args.project_key,
                 include_inactive=args.include_inactive,
+                include_test_data=args.include_test_data,
                 limit=args.limit,
             )
         elif args.command == "pg-export-markdown":
@@ -934,6 +960,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command in {"baseline", "ingest"}:
             report = run_ingestion(args.source_db, args.lab_db, args.command)
+        elif args.command == "historical-backfill":
+            report = run_ingestion(
+                args.source_db,
+                args.lab_db,
+                "historical_backfill",
+                session_ids=set(args.session_id),
+            )
         else:
             raise ValueError(f"unsupported command: {args.command}")
     except Exception as error:

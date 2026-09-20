@@ -28,6 +28,14 @@ DEFAULT_PG_CONFIG = Path(__file__).resolve().parents[2] / "pg-memory-lab.local.j
 DEFAULT_PSQL = Path("D:/PostgreSQL/17/bin/psql.exe")
 PG_CONFIG_SCHEMA = "memory-lab-postgres-config-v1"
 DEFAULT_USER_ID = "local-default-user"
+CONFLICT_RECORD_STATUSES = (
+    "needs_review",
+    "resolved_by_update",
+    "resolved_by_merge",
+    "discarded_as_stale",
+    "carried_forward",
+)
+ACTIVE_CONFLICT_RECORD_STATUSES = ("needs_review", "carried_forward")
 TRUST_LEVELS = ("user_confirmed", "verified", "observed", "inferred", "speculative")
 MEMORY_RELATION_TYPES = ("supersedes", "merges", "conflicts_with")
 
@@ -118,6 +126,9 @@ def _memory_versioning_migration_sql(*, user_id: str) -> str:
 
     del user_id  # Reserved for future per-user migration filtering.
     return """
+ALTER TABLE memory_topics
+  ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+
 ALTER TABLE memories
   ADD COLUMN IF NOT EXISTS trust_level text NOT NULL DEFAULT 'inferred';
 
@@ -229,6 +240,13 @@ def migrate_memory_versioning(
 \\pset format unaligned
 \\pset tuples_only on
 SELECT jsonb_build_object(
+  'topic_count', (SELECT count(*) FROM memory_topics WHERE user_id = {_sql_literal(user_id)}),
+  'topic_metadata_count', (
+    SELECT count(*)
+    FROM memory_topics
+    WHERE user_id = {_sql_literal(user_id)}
+      AND metadata IS NOT NULL
+  ),
   'memory_count', (SELECT count(*) FROM memories WHERE user_id = {_sql_literal(user_id)}),
   'revision_count', (SELECT count(*) FROM memory_revisions WHERE user_id = {_sql_literal(user_id)}),
   'initial_revision_count', (
@@ -654,6 +672,7 @@ def list_memory_topics(
     domain: str | None = None,
     project_key: str | None = None,
     include_inactive: bool = False,
+    include_test_data: bool = False,
     limit: int = 200,
 ) -> dict[str, Any]:
     """List lightweight memory topic index entries without reading memory bodies."""
@@ -664,6 +683,8 @@ def list_memory_topics(
     filters = [f"mt.user_id = {_sql_literal(user_id)}"]
     if not include_inactive:
         filters.append("mt.status = 'active'")
+    if not include_test_data:
+        filters.append(_exclude_test_topic_sql("mt"))
     scope_filters = ["mt.scope ->> 'level' = 'global'"]
     if domain:
         scope_filters.append(
@@ -716,6 +737,7 @@ FROM (
             "domain": domain,
             "project_key": project_key,
             "include_inactive": include_inactive,
+            "include_test_data": include_test_data,
             "limit": limit,
         },
         "topics": topics,
@@ -728,6 +750,7 @@ def read_topic_detail(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     topic_id: str,
     include_inactive: bool = False,
+    include_test_data: bool = False,
     max_chars: int = 4000,
 ) -> dict[str, Any]:
     """Read one topic and its memories after the topic has been selected."""
@@ -737,6 +760,8 @@ def read_topic_detail(
     max_chars = max(200, min(int(max_chars), 12000))
     topic_status_filter = "true" if include_inactive else "mt.status = 'active'"
     memory_status_filter = "true" if include_inactive else "m.status = 'active'"
+    topic_test_filter = "true" if include_test_data else _exclude_test_topic_sql("mt")
+    memory_test_filter = "true" if include_test_data else _exclude_test_memory_sql("m", None)
     sql = f"""
 \\pset format unaligned
 \\pset tuples_only on
@@ -746,6 +771,7 @@ WITH selected_topic AS (
   WHERE mt.topic_id = {_sql_literal(topic_id)}
     AND mt.user_id = {_sql_literal(user_id)}
     AND {topic_status_filter}
+    AND {topic_test_filter}
 )
 SELECT COALESCE((
   SELECT jsonb_build_object(
@@ -784,6 +810,7 @@ SELECT COALESCE((
       WHERE m.topic_id = mt.topic_id
         AND m.user_id = mt.user_id
         AND {memory_status_filter}
+        AND {memory_test_filter}
     ), '[]'::jsonb)
   )
   FROM selected_topic mt
@@ -830,6 +857,39 @@ def _search_terms(query: str, *, max_terms: int = 12) -> list[str]:
     return deduped
 
 
+def _exclude_test_memory_sql(memory_alias: str = "m", topic_alias: str | None = "mt") -> str:
+    """SQL predicate that hides acceptance/test memory rows from normal recall."""
+
+    memory_parts = [
+        f"COALESCE({memory_alias}.metadata ->> 'is_test', 'false') = 'true'",
+        f"{memory_alias}.metadata ? 'test_namespace'",
+        f"{memory_alias}.stable_key LIKE 'acceptance.%'",
+        f"{memory_alias}.stable_key LIKE 'test.%'",
+    ]
+    topic_parts: list[str] = []
+    if topic_alias:
+        topic_parts = [
+            f"COALESCE({topic_alias}.metadata ->> 'is_test', 'false') = 'true'",
+            f"{topic_alias}.metadata ? 'test_namespace'",
+            f"{topic_alias}.topic_key LIKE 'acceptance.%'",
+            f"{topic_alias}.topic_key LIKE 'test.%'",
+        ]
+    return "NOT (" + " OR ".join(memory_parts + topic_parts) + ")"
+
+
+def _exclude_test_topic_sql(topic_alias: str = "mt") -> str:
+    """SQL predicate that hides acceptance/test topics from normal topic indexes."""
+
+    return "NOT (" + " OR ".join(
+        [
+            f"COALESCE({topic_alias}.metadata ->> 'is_test', 'false') = 'true'",
+            f"{topic_alias}.metadata ? 'test_namespace'",
+            f"{topic_alias}.topic_key LIKE 'acceptance.%'",
+            f"{topic_alias}.topic_key LIKE 'test.%'",
+        ]
+    ) + ")"
+
+
 def search_related_memories(
     *,
     pg_config_path: Path = DEFAULT_PG_CONFIG,
@@ -838,6 +898,7 @@ def search_related_memories(
     domain: str | None = None,
     project_key: str | None = None,
     include_inactive: bool = False,
+    include_test_data: bool = False,
     limit: int = 8,
 ) -> dict[str, Any]:
     """Search topic titles/summaries and memory summaries/content for candidates.
@@ -868,6 +929,8 @@ def search_related_memories(
     filters = [f"m.user_id = {_sql_literal(user_id)}"]
     if not include_inactive:
         filters.extend(["m.status = 'active'", "mt.status = 'active'"])
+    if not include_test_data:
+        filters.append(_exclude_test_memory_sql("m", "mt"))
     if memory_type:
         filters.append(f"m.memory_type = {_sql_literal(str(memory_type).strip()[:120])}")
     scope_filters: list[str] = []
@@ -997,6 +1060,7 @@ FROM (
             "domain": domain,
             "project_key": project_key,
             "include_inactive": include_inactive,
+            "include_test_data": include_test_data,
             "limit": limit,
             "min_term_matches": min_term_matches,
         },
@@ -1129,6 +1193,8 @@ def build_writer_context(
 
     config = load_pg_config(pg_config_path)
     user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    topic_test_filter = _exclude_test_topic_sql("mt")
+    memory_test_filter = _exclude_test_memory_sql("m", "mt")
     sql = f"""
 \\pset format unaligned
 \\pset tuples_only on
@@ -1197,7 +1263,9 @@ memory_index AS (
         ORDER BY mt.updated_at DESC, mt.topic_key
       )
       FROM memory_topics mt
-      WHERE mt.user_id = {_sql_literal(user_id)} AND mt.status = 'active'
+      WHERE mt.user_id = {_sql_literal(user_id)}
+        AND mt.status = 'active'
+        AND {topic_test_filter}
     ), '[]'::jsonb),
     'memories', COALESCE((
       SELECT jsonb_agg(
@@ -1216,10 +1284,14 @@ memory_index AS (
         ORDER BY m.updated_at DESC, m.stable_key
       )
       FROM (
-        SELECT *
-        FROM memories
-        WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
-        ORDER BY updated_at DESC, stable_key
+        SELECT m.*
+        FROM memories m
+        JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+        WHERE m.user_id = {_sql_literal(user_id)}
+          AND m.status = 'active'
+          AND mt.status = 'active'
+          AND {memory_test_filter}
+        ORDER BY m.updated_at DESC, m.stable_key
         LIMIT {int(memory_limit)}
       ) m
     ), '[]'::jsonb)
@@ -1356,6 +1428,7 @@ def list_topic_memories(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     topic_id: str,
     include_inactive: bool = False,
+    include_test_data: bool = False,
     limit: int = 20,
 ) -> dict[str, Any]:
     """List bounded current-state memory summaries under one topic."""
@@ -1365,6 +1438,8 @@ def list_topic_memories(
     user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
     topic_status_filter = "true" if include_inactive else "mt.status = 'active'"
     memory_status_filter = "true" if include_inactive else "m.status = 'active'"
+    topic_test_filter = "true" if include_test_data else _exclude_test_topic_sql("mt")
+    memory_test_filter = "true" if include_test_data else _exclude_test_memory_sql("m", None)
     sql = f"""
 \\pset format unaligned
 \\pset tuples_only on
@@ -1374,6 +1449,7 @@ WITH selected_topic AS (
   WHERE mt.topic_id = {_sql_literal(topic_id)}
     AND mt.user_id = {_sql_literal(user_id)}
     AND {topic_status_filter}
+    AND {topic_test_filter}
 )
 SELECT COALESCE((
   SELECT jsonb_build_object(
@@ -1410,6 +1486,7 @@ SELECT COALESCE((
         WHERE m.topic_id = mt.topic_id
           AND m.user_id = mt.user_id
           AND {memory_status_filter}
+          AND {memory_test_filter}
         ORDER BY m.updated_at DESC, m.stable_key
         LIMIT {limit}
       ) m
@@ -1420,6 +1497,7 @@ SELECT COALESCE((
       WHERE m.topic_id = mt.topic_id
         AND m.user_id = mt.user_id
         AND {memory_status_filter}
+        AND {memory_test_filter}
     )
   )
   FROM selected_topic mt
@@ -1557,12 +1635,29 @@ def list_memory_conflicts(
     pg_config_path: Path = DEFAULT_PG_CONFIG,
     memory_id: str | None = None,
     topic_id: str | None = None,
+    include_test_data: bool = False,
+    status_filter: str | None = None,
+    include_resolved: bool = False,
     limit: int = 20,
 ) -> dict[str, Any]:
     """List bounded conflict decisions for one memory or one topic."""
 
     memory_id = str(memory_id or "").strip() or None
     topic_id = str(topic_id or "").strip() or None
+    status_filter = str(status_filter or "").strip() or None
+    if status_filter and status_filter not in set(CONFLICT_RECORD_STATUSES):
+        return {
+            "status": "rejected",
+            "tool": "list_memory_conflicts",
+            "error_code": "invalid_conflict_status",
+            "memory_id": memory_id,
+            "topic_id": topic_id,
+            "status_filter": status_filter,
+            "include_resolved": include_resolved,
+            "conflicts": [],
+            "count": 0,
+            "guidance": f"status 只能是 {', '.join(CONFLICT_RECORD_STATUSES)}。旧版状态可用 include_resolved 审计查询，但不能作为过滤条件。",
+        }
     if bool(memory_id) == bool(topic_id):
         return {
             "status": "rejected",
@@ -1577,6 +1672,13 @@ def list_memory_conflicts(
     limit = max(1, min(int(limit), 50))
     config = load_pg_config(pg_config_path)
     user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    if status_filter:
+        conflict_status_filter = f"c.status = {_sql_literal(status_filter)}"
+    elif include_resolved:
+        conflict_status_filter = "true"
+    else:
+        active_values = ", ".join(_sql_literal(item) for item in ACTIVE_CONFLICT_RECORD_STATUSES)
+        conflict_status_filter = f"c.status IN ({active_values})"
     target_filter = (
         f"c.memory_id = {_sql_literal(memory_id)}"
         if memory_id
@@ -1585,17 +1687,45 @@ def list_memory_conflicts(
     target_exists_sql = (
         f"""
         SELECT EXISTS(
-          SELECT 1 FROM memories
-          WHERE user_id = {_sql_literal(user_id)}
-            AND memory_id = {_sql_literal(memory_id or '')}
+          SELECT 1
+          FROM memories m
+          JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+          WHERE m.user_id = {_sql_literal(user_id)}
+            AND m.memory_id = {_sql_literal(memory_id or '')}
+            AND {'true' if include_test_data else _exclude_test_memory_sql('m', 'mt')}
         )
         """
         if memory_id
         else f"""
         SELECT EXISTS(
-          SELECT 1 FROM memory_topics
-          WHERE user_id = {_sql_literal(user_id)}
-            AND topic_id = {_sql_literal(topic_id or '')}
+          SELECT 1 FROM memory_topics mt
+          WHERE mt.user_id = {_sql_literal(user_id)}
+            AND mt.topic_id = {_sql_literal(topic_id or '')}
+            AND {'true' if include_test_data else _exclude_test_topic_sql('mt')}
+        )
+        """
+    )
+    conflict_test_filter = (
+        "true"
+        if include_test_data
+        else f"""
+        (
+          (c.memory_id IS NULL OR EXISTS (
+            SELECT 1
+            FROM memories m
+            JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
+            WHERE m.user_id = c.user_id
+              AND m.memory_id = c.memory_id
+              AND {_exclude_test_memory_sql('m', 'mt')}
+          ))
+          AND
+          (c.topic_id IS NULL OR EXISTS (
+            SELECT 1
+            FROM memory_topics mt
+            WHERE mt.user_id = c.user_id
+              AND mt.topic_id = c.topic_id
+              AND {_exclude_test_topic_sql('mt')}
+          ))
         )
         """
     )
@@ -1628,6 +1758,8 @@ conflict_rows AS (
     FROM memory_conflict_records c
     WHERE c.user_id = {_sql_literal(user_id)}
       AND {target_filter}
+      AND {conflict_test_filter}
+      AND {conflict_status_filter}
     ORDER BY c.created_at DESC, c.conflict_id
     LIMIT {limit}
   ) c
@@ -1640,6 +1772,8 @@ SELECT jsonb_build_object(
     FROM memory_conflict_records c
     WHERE c.user_id = {_sql_literal(user_id)}
       AND {target_filter}
+      AND {conflict_test_filter}
+      AND {conflict_status_filter}
   )
 )::text;
 """
@@ -1653,6 +1787,10 @@ SELECT jsonb_build_object(
         "topic_id": topic_id,
         "found": found,
         "limit": limit,
+        "include_test_data": include_test_data,
+        "status_filter": status_filter,
+        "include_resolved": include_resolved,
+        "active_conflict_statuses": list(ACTIVE_CONFLICT_RECORD_STATUSES),
         "conflicts": conflicts,
         "count": len(conflicts),
         "total_conflict_count": int(detail.get("total_conflict_count") or 0),
@@ -1670,6 +1808,7 @@ def trace_memory_relations(
     memory_id: str,
     direction: str = "both",
     max_depth: int = 1,
+    include_test_data: bool = False,
 ) -> dict[str, Any]:
     """Read one memory's lightweight version history and direct relations."""
 
@@ -1696,6 +1835,7 @@ WITH selected_memory AS (
   JOIN memory_topics mt ON mt.topic_id = m.topic_id AND mt.user_id = m.user_id
   WHERE m.memory_id = {_sql_literal(memory_id)}
     AND m.user_id = {_sql_literal(user_id)}
+    AND {'true' if include_test_data else _exclude_test_memory_sql('m', 'mt')}
 ),
 revision_rows AS (
   SELECT COALESCE(jsonb_agg(
@@ -1739,7 +1879,9 @@ backward_rows AS (
   FROM memory_relations rel
   JOIN selected_memory m ON m.memory_id = rel.to_memory_id AND m.user_id = rel.user_id
   JOIN memories src ON src.memory_id = rel.from_memory_id AND src.user_id = rel.user_id
+  JOIN memory_topics src_mt ON src_mt.topic_id = src.topic_id AND src_mt.user_id = src.user_id
   WHERE {str(include_backward).lower()}
+    AND {'true' if include_test_data else _exclude_test_memory_sql('src', 'src_mt')}
 ),
 forward_rows AS (
   SELECT COALESCE(jsonb_agg(
@@ -1764,7 +1906,9 @@ forward_rows AS (
   FROM memory_relations rel
   JOIN selected_memory m ON m.memory_id = rel.from_memory_id AND m.user_id = rel.user_id
   JOIN memories dst ON dst.memory_id = rel.to_memory_id AND dst.user_id = rel.user_id
+  JOIN memory_topics dst_mt ON dst_mt.topic_id = dst.topic_id AND dst_mt.user_id = dst.user_id
   WHERE {str(include_forward).lower()}
+    AND {'true' if include_test_data else _exclude_test_memory_sql('dst', 'dst_mt')}
 )
 SELECT COALESCE((
   SELECT jsonb_build_object(
@@ -1801,6 +1945,7 @@ SELECT COALESCE((
         "memory_id": memory_id,
         "direction": direction,
         "max_depth": max_depth,
+        "include_test_data": include_test_data,
         "found": bool(detail.get("found")),
         "detail": detail,
         "guidance": guidance,

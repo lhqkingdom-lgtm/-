@@ -20,6 +20,8 @@ class PgMemoryVersioningTests(unittest.TestCase):
     def test_migration_sql_adds_minimal_versioning_schema(self) -> None:
         sql = _memory_versioning_migration_sql(user_id="local-default-user")
 
+        self.assertIn("ALTER TABLE memory_topics", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS metadata jsonb", sql)
         self.assertIn("ADD COLUMN IF NOT EXISTS trust_level", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS memory_revisions", sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS memory_relations", sql)
@@ -95,6 +97,7 @@ class PgMemoryVersioningTests(unittest.TestCase):
         self.assertIn("memory_revisions", sql)
         self.assertIn("memory_relations", sql)
         self.assertIn("WHERE true", sql)
+        self.assertIn("stable_key LIKE 'acceptance.%'", sql)
 
     def test_trace_memory_relations_rejects_bad_direction(self) -> None:
         result = trace_memory_relations(
@@ -133,7 +136,33 @@ class PgMemoryVersioningTests(unittest.TestCase):
         sql = query_json.call_args.args[1]
         self.assertIn("left(m.summary, 500)", sql)
         self.assertIn("LIMIT 50", sql)
+        self.assertIn("stable_key LIKE 'acceptance.%'", sql)
         self.assertNotIn("m.content", sql)
+
+    def test_list_topic_memories_can_explicitly_include_test_data(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "topic": {"topic_id": "topic_1", "title": "测试主题"},
+            "memories": [],
+            "total_active_memory_count": 0,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_topic_memories(
+                pg_config_path=Path("unused.json"),
+                topic_id="topic_1",
+                include_test_data=True,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        sql = query_json.call_args.args[1]
+        self.assertNotIn("stable_key LIKE 'acceptance.%'", sql)
+        self.assertNotIn("topic_key LIKE 'acceptance.%'", sql)
 
     def test_list_topic_memories_reports_missing_topic(self) -> None:
         config = {
@@ -204,7 +233,7 @@ class PgMemoryVersioningTests(unittest.TestCase):
         }
         detail = {
             "found": True,
-            "conflicts": [{"conflict_id": "conflict_1", "status": "resolved"}],
+            "conflicts": [{"conflict_id": "conflict_1", "status": "needs_review"}],
             "total_conflict_count": 1,
         }
         with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
@@ -223,6 +252,85 @@ class PgMemoryVersioningTests(unittest.TestCase):
         sql = query_json.call_args.args[1]
         self.assertIn("memory_conflict_records", sql)
         self.assertIn("ORDER BY c.created_at DESC", sql)
+        self.assertIn("topic_key LIKE 'acceptance.%'", sql)
+        self.assertIn("c.status IN ('needs_review', 'carried_forward')", sql)
+        self.assertFalse(result["include_resolved"])
+
+    def test_list_memory_conflicts_include_resolved_removes_active_filter(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "conflicts": [{"conflict_id": "conflict_1", "status": "resolved_by_update"}],
+            "total_conflict_count": 1,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_memory_conflicts(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_1",
+                include_resolved=True,
+            )
+
+        self.assertTrue(result["include_resolved"])
+        sql = query_json.call_args.args[1]
+        self.assertNotIn("c.status IN ('needs_review', 'carried_forward')", sql)
+
+    def test_list_memory_conflicts_status_filter(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {
+            "found": True,
+            "conflicts": [{"conflict_id": "conflict_1", "status": "resolved_by_update"}],
+            "total_conflict_count": 1,
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_memory_conflicts(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_1",
+                status_filter="resolved_by_update",
+            )
+
+        self.assertEqual(result["status_filter"], "resolved_by_update")
+        sql = query_json.call_args.args[1]
+        self.assertIn("c.status = 'resolved_by_update'", sql)
+
+    def test_list_memory_conflicts_rejects_invalid_status_filter(self) -> None:
+        result = list_memory_conflicts(
+            pg_config_path=Path("unused.json"),
+            memory_id="mem_1",
+            status_filter="resolved",
+        )
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(result["error_code"], "invalid_conflict_status")
+
+    def test_list_memory_conflicts_can_explicitly_include_test_data(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        detail = {"found": True, "conflicts": [], "total_conflict_count": 0}
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=detail
+        ) as query_json:
+            result = list_memory_conflicts(
+                pg_config_path=Path("unused.json"),
+                memory_id="mem_1",
+                include_test_data=True,
+            )
+
+        self.assertTrue(result["include_test_data"])
+        sql = query_json.call_args.args[1]
+        self.assertNotIn("stable_key LIKE 'acceptance.%'", sql)
+        self.assertNotIn("topic_key LIKE 'acceptance.%'", sql)
 
 
 if __name__ == "__main__":

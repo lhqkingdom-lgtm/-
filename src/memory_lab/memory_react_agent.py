@@ -61,6 +61,13 @@ ALLOWED_TOOLS = {
     "read_memory_history",
     "list_memory_conflicts",
 }
+CONFLICT_RECORD_STATUSES = {
+    "needs_review",
+    "resolved_by_update",
+    "resolved_by_merge",
+    "discarded_as_stale",
+    "carried_forward",
+}
 
 
 class MemoryReactValidationError(ValueError):
@@ -92,7 +99,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
 - list_topic_memories 只列出某个主题下的 memory 摘要，用于判断是否需要继续 read_memory_detail。
 - read_memory_history 用于查看某条 memory 的版本历史，不授权修改。
-- list_memory_conflicts 用于查看已有冲突记录，避免重复记录冲突或判断是否需要补充冲突证据。
+- list_memory_conflicts 用于查看已有冲突记录，避免重复记录冲突或判断是否需要补充冲突证据；默认只返回 needs_review/carried_forward 这类活跃风险，只有审计历史时才请求 include_resolved=true。
 - get_current_turn_evidence_summary 只用于回看当前 turn 的证据池，帮助确认 evidence_id 和本轮事实，不授权修改任何 memory。
 - trace_memory_relations 用于查看某条 memory 的版本历史和 supersedes/merges/conflicts_with 关系，不授权修改。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
@@ -100,7 +107,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 4. memory_access_state：
 - summary_only_memory_ids：只看过摘要，不能直接 update/merge/conflict。
 - observed_memory_ids：已经读取过正文。
-- modifiable_memory_ids：允许在 final_changes 中 update/merge/mark_conflict/record_conflict_decision。
+- modifiable_memory_ids：允许在 final_changes 中 update/merge/merge_existing/retire/move_memory_topic/mark_conflict/record_conflict_decision。
 
 ====================
 二、长期记忆沉淀标准
@@ -161,34 +168,83 @@ create_memory：新增记忆
 - 没有已有 memory 能覆盖。
 - 可以形成清晰 stable_key。
 - 有足够 evidence_refs。
+- 只负责创建 memory；如果使用已有主题，必须使用 topic_id。
+- 只有确实需要创建全新主题时才携带 topic 对象；create_memory 不能修改已有 topic。
+- stable_key 和 topic_key 是创建时的路由标识，本阶段不可修改；不要为了“修正 key 语义”而 update_memory 或 update_topic。
+- 如果新信息虽然属于同一个大主题，但形成了新的独立规则，应 create_memory，不要为了减少条目数强行 merge 到宽泛旧 memory。
+- 用户协作习惯、工程流程、编译失败经验、运行现象经验应尽量保持原子化；一轮 turn 同时包含多类长期价值时，可以拆成多条 memory。
 例：第一次发现“硬件输入桩函数固定返回值会导致主流程跑通但输入恒定，下游状态机无响应”。
 
 merge_memory：合并证据
 - 已有 memory 是同一模式。
 - 本轮只是新增证据、补充例子、增强置信度。
 - 不改变原结论。
+- 判断“同一模式”时要严格：新证据必须能用目标 memory 的同一句核心结论解释；如果需要新增另一个结论、另一个协作偏好、另一个失败原因或另一个修复方法，就不要 merge，应 create_memory 或 update_memory。
+- 只表示“把当前 turn 证据合并到一个已有 memory”，不是多个已有 memory 合并。
+- 不能借 merge_memory 修改 topic；如果 topic 标题/概要需要变化，单独输出 update_topic。
+- merge_memory 不是重新写一篇报告：优先保留已有 memory 的核心 summary/content，只添加本轮真正新增的事实、验证状态、适用条件或反例。
+- 如果本轮只是重复证明同一结论，content 只需补一句“新增证据：……”，不要复制完整日志、完整执行流、完整错误列表或大段会话。
+- 如果目标 memory 已经很宽泛或内容已经较长，默认不要继续扩写；除非本轮证据直接增强同一句核心结论，否则应新建更小的 memory，或 noop。
+- 不要把用户习惯塞进工程流程记忆，也不要把编译失败经验塞进运行现象记忆；这些只是在同一主题下相关，不等于同一条 memory。
+- 如果本轮只提供未验证现象或助手推测，只能标为“待验证线索/可能原因”，不能把 memory 改写成已验证结论，也不能显著提高 confidence。
+- 如果目标 memory 已包含历史“已验证”结论，而本轮只是未验证新现象，必须明确区分：原有已验证结论仍来自旧证据；本轮只新增“类似现象/待验证线索”。不要写成“本轮已验证”。
+- 只有出现用户确认、编译/烧录/运行验证、明确工具结果时，才可以把“解决有效/已验证”写入 content，并适度提高 confidence。
 例：另一个项目也出现采样桩固定值导致状态不变化。
+
+merge_existing_memories：合并多条已有记忆
+- 多条 active memory 语义重复、同方向，继续分开会增加召回噪声或维护成本。
+- 指定一个 target memory 作为合并后的当前有效记忆；source_memory_ids 中的记忆会标记为 merged。
+- 必须给出合并后的完整 memory summary/content/confidence。
+- 会记录 source → target 的 merges relation。
+- 如果 source memory 上有 active conflict，必须提供 conflict_disposition，说明是 resolved_by_merge、discarded_as_stale 还是 carried_forward。
+- 不能修改 topic；如果合并后 topic 语义需要变化，必须另行 update_topic。
 
 update_memory：更新已有记忆
 - 已有 memory 方向正确。
 - 本轮提供了更准确、更通用、更完整的表述。
 - 需要改写 summary/content。
+- 只负责更新 memory 当前内容和 revision，不能修改 topic。
+- 不能修改 stable_key；如果只是 stable_key 旧但 summary/content 已准确，通常 noop，不要为了 key 发起 update_memory。
 例：原记忆只写 ADC 桩导致风扇不转，本轮抽象为“硬件输入桩函数导致下游控制逻辑处理假数据”。
+
+retire_memory：退役不再适用的记忆
+- 已有 active memory 已经失效、重复到不再需要单独保留，或被后续整理明确废弃。
+- 只负责把 memory 标记为 retired 并写 revision；不能修改 topic，不能合并其他 memory，不能删除数据。
+- 如果目标 memory 上有 active conflict，必须提供 conflict_disposition，说明这些冲突是 discarded_as_stale 还是 carried_forward。
+- 适合“这条旧记忆不应再作为当前有效记忆参与后续判断”的场景。
+
+move_memory_topic：移动记忆所属主题
+- memory 内容正确，但归属主题错误或后续整理发现更适合放到另一个 active topic。
+- 只负责把 memory 从 from_topic_id 移到 to_topic_id，并写 revision；不能修改 memory summary/content/confidence，也不能修改 topic title/summary。
+- 必须提供 from_topic_id 和 to_topic_id；from_topic_id 必须匹配当前 memory 所属主题。
+- 如果移动后 source/target topic 标题或概要不准确，必须另行输出 update_topic。
 
 mark_conflict：标记冲突
 - 同 scope、同条件、同对象下结论相反。
 - 无法用项目、工具链、芯片、版本、环境差异解释。
+- 只负责把 memory 标记为 conflict 并写 revision，不负责记录冲突决策。
+- 如果需要说明旧说法、新说法和处理判断，必须另行输出 record_conflict_decision。
 工程经验不要简单按时间覆盖；能拆条件就拆，不能解释才冲突。
 
 update_topic：维护主题元信息
 - 当已有 memory 的 summary/content 已被更新，但 topic 标题或概要仍停留在旧语义时使用。
 - 只用于改主题 title/summary，不用于改记忆正文。
+- update_topic 是唯一允许修改 topic.title/topic.summary 的动作。
+- 不能修改 topic_key；如果只是 topic_key 旧但 title/summary 已准确，通常 noop，不要为了 key 发起 update_topic。
 例：memory 已更新为“用户偏好英文回复”，但 topic 标题仍是“默认使用中文回复”，应把 topic 改为中性的“回复语言偏好”。
+
+merge_topics：合并重复主题
+- 多个 active topic 表达同一类记忆，继续分开会导致召回重复或维护成本上升。
+- 只负责把 source topic 下的 active memories 迁移到 target topic，并把 source topic 标记为 merged。
+- 不能修改任何 memory 的 summary/content/confidence；不能自动合并 memory；不能自动改 target topic 的 title/summary。
+- 如果合并后 target topic 标题或概要不准确，必须另行输出 update_topic。
+- 合并前应先 read_topic_detail 或 list_topic_memories 理解 target/source 内容；不要只凭标题相似就合并。
 
 record_conflict_decision：记录冲突判断过程
 - 当同一用户、同一作用域、同一语义槽位出现前后相反说法时使用。
 - 如果根据用户最新明确纠正决定覆盖旧偏好，应记录 old_claim、new_claim、decision、reason。
 - 它记录“为什么这样处理冲突”，不直接修改 memory 内容；通常与 update_memory 或 update_topic 搭配使用。
+- 它可以记录 active 或 conflict memory 的冲突决策，但不能修改 memory 正文、状态或 topic。
 
 组合动作规则：
 - 用户偏好/工程规则被明确纠正时，通常需要三件套：
@@ -198,6 +254,16 @@ record_conflict_decision：记录冲突判断过程
 - 如果只是补充同方向证据，用 merge_memory，不要记录冲突。
 - 如果只是 topic 展示语义落后但 memory 内容已经正确，只用 update_topic + 必要的 record_conflict_decision。
 - 如果冲突来自不同项目/芯片/工具链/版本条件，优先拆条件或拆记忆，不要直接覆盖。
+- 执行 update_memory / merge_memory / merge_existing_memories / retire_memory / move_memory_topic / mark_conflict 后，必须自检 topic 标题/概要是否仍准确；如果只是补证据、合并重复 memory、移动归类或退役单条 memory，不要自动 update_topic；如果主题语义扩大、缩小或漂移，先读 topic 详情，再显式输出 update_topic。
+- 执行 merge_topics 后，必须自检 target topic 标题/概要是否能覆盖合并后的范围；如果不能覆盖，另行 update_topic；merge_topics 本身不能改标题/概要。
+- 不要让一个动作承担多个职责：新建只新建，更新只更新，主题只由 update_topic 修改，冲突原因只由 record_conflict_decision 记录。
+
+状态权限矩阵：
+- active memory：允许 update_memory、merge_memory、merge_existing_memories、retire_memory、move_memory_topic、mark_conflict、record_conflict_decision。
+- conflict memory：只允许 record_conflict_decision；不能继续 update_memory、merge_memory 或 mark_conflict。
+- merged / superseded / inactive memory：默认只读；本阶段不能写入。
+- retired / merged / superseded / inactive memory：默认只读；本阶段不能写入。
+- topic 只能通过 update_topic 修改 title/summary；create_memory、update_memory、merge_memory、merge_existing_memories、retire_memory、move_memory_topic、merge_topics、mark_conflict、record_conflict_decision、record_memory_relation 都不能隐式修改 topic。
 
 noop：不沉淀
 - 只是当前项目一次性参数或需求选择。
@@ -222,9 +288,18 @@ request_more_evidence：证据不足
 3. 工具结果摘要 > 普通自然语言判断。
 4. pointer 可补充原始证据，但不要把完整原文塞进 memory。
 
+验证状态写法：
+- “用户反馈现象”只能证明现象存在。
+- “助手定位/推理”只能证明候选根因，除非有工具结果或用户确认支撑。
+- “用户确认修复后正常 / 编译通过 / 烧录后验证正常 / 工具结果 verified=true”才算可写为已验证。
+- 未验证证据合并到已有工程经验时，应保持或小幅调整 confidence；不要因为描述详细就自动提高置信度。
+- 同一条 memory 可以同时包含“已验证结论”和“待验证新增线索”，但必须标清每个结论对应的证据来源，避免把旧验证状态投射到新现象上。
+- 编译失败类 memory 应沉淀“症状 → 原因 → 有效修复 → 验证方式”，不要沉淀完整编译日志、完整 diff、临时尝试或一次性路径。
+
 如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
+如果你认为“理想动作”是 merge_memory / update_memory / mark_conflict / record_conflict_decision，但当前还没有修改权限，不能因此输出 noop；必须先请求只读工具补足权限和详情。
 如果主题下 memory 较多或不确定是否重复，应请求 list_topic_memories 先看轻量摘要，再决定是否 read_memory_detail。
 如果需要判断新证据是补充、修正还是已处理过，应请求 read_memory_history 查看版本时间线。
 如果要处理用户偏好变化或冲突，应请求 list_memory_conflicts 查看是否已有相同冲突记录。
@@ -275,7 +350,11 @@ request_more_evidence：证据不足
 memory-changes-v1 changes 可用 action：
 - create_memory
 - merge_memory
+- merge_existing_memories
 - update_memory
+- retire_memory
+- move_memory_topic
+- merge_topics
 - mark_conflict
 - update_topic
 - record_conflict_decision
@@ -324,14 +403,71 @@ merge_memory 示例：
   "reason": "同一模式，本轮只补充新证据或验证，不改变原结论",
   "target_memory_id": "mem_xxx",
   "memory": {
-    "summary": "合并后的中文摘要，必须保留原核心结论并吸收新增证据价值",
-    "content": "合并后的完整内容，必须包含原有症状/根因/解决方法，并补充本轮新增证据或验证方式。不能只写新增片段。",
+    "summary": "合并后的中文摘要，保持原核心结论，必要时加入新增适用条件",
+    "content": "保留原有症状/根因/解决方法的简洁版本。新增证据：本轮补充了某项目中同类现象，或补充了用户确认/工具验证结果。不要粘贴完整日志、执行流或大段对话。",
     "confidence": 0.92
   },
   "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "新增证据或验证"}]
 }
 
-注意：merge_memory / update_memory / mark_conflict 都必须包含 memory 对象，不能只给 target_memory_id 和 evidence_refs。
+merge_existing_memories 示例：
+{
+  "action": "merge_existing_memories",
+  "reason": "多条已有 memory 语义重复，合并后减少召回噪声。",
+  "target_memory_id": "mem_target",
+  "source_memory_ids": ["mem_source_a", "mem_source_b"],
+  "memory": {
+    "summary": "合并后的中文摘要",
+    "content": "合并后的完整内容，必须保留 target 和 sources 的有效结论，并去掉重复表述。",
+    "confidence": 0.9
+  },
+  "conflict_disposition": {
+    "conflict_ids": ["conflict_xxx"],
+    "status": "resolved_by_merge",
+    "reason": "source 被合并后，相关冲突由合并后的 target 结论解决。"
+  },
+  "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "证明这些 memory 重复或同方向"}]
+}
+
+注意：merge_memory / merge_existing_memories / update_memory / mark_conflict 都必须包含 memory 对象，不能只给 target_memory_id 和 evidence_refs。
+
+retire_memory 示例：
+{
+  "action": "retire_memory",
+  "reason": "这条旧记忆已经不再作为当前有效结论使用，需要退役但保留历史。",
+  "target_memory_id": "mem_xxx",
+  "conflict_disposition": {
+    "conflict_ids": ["conflict_xxx"],
+    "status": "discarded_as_stale",
+    "reason": "目标 memory 退役后，该冲突只保留历史意义。"
+  },
+  "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "证明旧记忆已失效或不应继续作为当前有效记忆"}]
+}
+
+注意：retire_memory 不能包含 memory 对象，不能修改 topic；如果目标 memory 没有 active conflict，可以省略 conflict_disposition。
+
+move_memory_topic 示例：
+{
+  "action": "move_memory_topic",
+  "reason": "memory 内容正确，但原主题归类错误，移动到更准确的主题。",
+  "target_memory_id": "mem_xxx",
+  "from_topic_id": "topic_old",
+  "to_topic_id": "topic_new",
+  "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "证明该 memory 更适合目标主题"}]
+}
+
+注意：move_memory_topic 不能包含 memory 或 topic 对象，不能修改 memory 内容，也不能修改 topic 标题/概要。
+
+merge_topics 示例：
+{
+  "action": "merge_topics",
+  "reason": "两个主题语义重复，继续分开会造成召回重复，合并到更准确的目标主题。",
+  "target_topic_id": "topic_target",
+  "source_topic_ids": ["topic_source_a", "topic_source_b"],
+  "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "证明这些主题表达同一类记忆"}]
+}
+
+注意：merge_topics 不能包含 memory 或 topic 对象，不能修改 memory 内容，不能自动改 target topic 标题/概要；如需改摘要，另行 update_topic。
 
 update_topic 示例：
 {
@@ -389,10 +525,13 @@ noop 示例：
 - 每轮最多请求 3 个工具。
 - 只能请求输入中真实存在的 topic_id / memory_id / raw_pointer_id。
 - 不能发明 evidence_id、memory_id、topic_id、raw_pointer_id。
+- stable_key/topic_key 不可修改，不要在 reason 中把“修正 key”作为 update_memory/update_topic 的理由；只能修改工具 schema 允许的字段。
 - search_related_memories 的 query 必须来自当前 turn 证据或已有 memory/topic 摘要中的真实词语，不能发明不存在的问题。
-- update_memory / merge_memory / mark_conflict 的 target_memory_id 必须在 modifiable_memory_ids 中；否则先请求只读工具。
+- update_memory / merge_memory / merge_existing_memories / retire_memory / move_memory_topic / mark_conflict 的 target_memory_id 必须在 modifiable_memory_ids 中；否则先请求只读工具。
 - record_conflict_decision 的 target_memory_id 也必须在 modifiable_memory_ids 中；否则先请求只读工具。
+- 不能把“目标 memory 未读取、暂时没有修改权限”当成 noop 理由；应先请求 read_memory_detail / read_topic_detail / list_topic_memories。
 - update_topic 的 target_topic_id 必须来自已知 topic_id；如果要判断主题是否应改名，优先先 read_topic_detail。
+- merge_topics 的 target_topic_id/source_topic_ids 必须来自已知 active topic_id；source 不能包含 target；如需确认主题下记忆，先 list_topic_memories。
 - 对用户明确纠正导致的同一偏好反转，优先输出 update_memory + update_topic + record_conflict_decision 的组合；如果 memory 已经是最新结论，则至少输出 update_topic + record_conflict_decision。
 - 如果已有 memory 覆盖本轮信息，应 merge/update/noop，不要重复 create。
 - 模型不能写数据库，不能输出 SQL，不能请求未列出的工具。
@@ -406,8 +545,14 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 特别注意：
 - noop 只允许 action、reason、evidence_refs，不能带 memory_id、target_memory_id、topic_id、memory。
 - create_memory 只能二选一 topic 或 topic_id。
-- merge_memory/update_memory/mark_conflict 必须使用 target_memory_id，不能使用 memory_id。
-- merge_memory/update_memory/mark_conflict 必须包含 memory 对象，memory 里必须包含 summary、content、confidence。
+- create_memory 不能修改已有 topic；已有主题必须使用 topic_id，改主题只能使用 update_topic。
+- merge_memory/merge_existing_memories/update_memory/retire_memory/move_memory_topic/mark_conflict 必须使用 target_memory_id，不能使用 memory_id。
+- merge_memory/merge_existing_memories/update_memory/retire_memory/move_memory_topic/mark_conflict 不能修改 topic；如需修改主题标题/概要，另行输出 update_topic。
+- merge_memory/merge_existing_memories/update_memory/mark_conflict 必须包含 memory 对象，memory 里必须包含 summary、content、confidence。
+- merge_existing_memories 必须包含 source_memory_ids；source 不能包含 target。
+- retire_memory 不能包含 memory 对象；如目标 memory 有 active conflict，必须包含 conflict_disposition。
+- move_memory_topic 不能包含 memory 或 topic 对象，必须包含 from_topic_id 和 to_topic_id。
+- merge_topics 不能包含 memory 或 topic 对象，必须包含 target_topic_id 和 source_topic_ids。
 - update_topic 必须使用 target_topic_id 和 topic 对象，topic 只能包含 title、summary。
 - record_conflict_decision 必须使用 target_memory_id 和 conflict 对象。
 - 如果 merge_memory 缺少 memory 对象，必须基于已读取的目标 memory 正文和新增证据补出合并后的完整 memory 对象；不要删除该 action。
@@ -580,7 +725,15 @@ def validate_react_decision(
             "list_topic_memories": {"tool", "topic_id", "reason", "limit"},
             "read_memory_detail": {"tool", "memory_id", "reason"},
             "read_memory_history": {"tool", "memory_id", "reason", "limit"},
-            "list_memory_conflicts": {"tool", "memory_id", "topic_id", "reason", "limit"},
+            "list_memory_conflicts": {
+                "tool",
+                "memory_id",
+                "topic_id",
+                "reason",
+                "limit",
+                "status",
+                "include_resolved",
+            },
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {
                 "tool",
@@ -701,6 +854,12 @@ def validate_react_decision(
                         errors.append(f"{prefix}.limit must be between 1 and 50")
                 except (TypeError, ValueError):
                     errors.append(f"{prefix}.limit must be an integer")
+            if "status" in request and request.get("status") not in CONFLICT_RECORD_STATUSES:
+                errors.append(
+                    f"{prefix}.status must be one of {', '.join(sorted(CONFLICT_RECORD_STATUSES))}"
+                )
+            if "include_resolved" in request and not isinstance(request.get("include_resolved"), bool):
+                errors.append(f"{prefix}.include_resolved must be a boolean")
         if tool == "expand_pointer" and request.get("raw_pointer_id") not in pointer_ids:
             errors.append(f"{prefix}.raw_pointer_id does not belong to this turn")
         key = _tool_key(request)
@@ -719,7 +878,10 @@ def validate_react_decision(
                     continue
                 if change.get("action") in {
                     "merge_memory",
+                    "merge_existing_memories",
                     "update_memory",
+                    "retire_memory",
+                    "move_memory_topic",
                     "mark_conflict",
                     "record_conflict_decision",
                 }:
@@ -728,6 +890,13 @@ def validate_react_decision(
                         errors.append(
                             f"changes.changes[{change_index}].target_memory_id must be read by read_memory_detail or read_topic_detail before modifying or recording conflict for existing memory"
                         )
+                    if change.get("action") == "merge_existing_memories":
+                        for source_memory_id in change.get("source_memory_ids") or []:
+                            source_memory_id = str(source_memory_id)
+                            if source_memory_id and source_memory_id not in observed:
+                                errors.append(
+                                    f"changes.changes[{change_index}].source_memory_ids must be read by read_memory_detail or read_topic_detail before merging existing memories"
+                                )
         except MemoryChangesValidationError as error:
             errors.extend([f"changes.{item}" for item in error.errors])
 
@@ -782,6 +951,8 @@ def _execute_tool_request(
             pg_config_path=pg_config_path,
             memory_id=str(request["memory_id"]) if request.get("memory_id") else None,
             topic_id=str(request["topic_id"]) if request.get("topic_id") else None,
+            status_filter=str(request["status"]) if request.get("status") else None,
+            include_resolved=bool(request.get("include_resolved") or False),
             limit=int(request.get("limit") or 20),
         )
     if tool == "expand_pointer":
@@ -915,22 +1086,37 @@ def _auto_required_memory_reads(
             continue
         if change.get("action") not in {
             "merge_memory",
+            "merge_existing_memories",
             "update_memory",
+            "retire_memory",
+            "move_memory_topic",
             "mark_conflict",
             "record_conflict_decision",
         }:
             continue
         target = str(change.get("target_memory_id") or "")
-        if not target or target not in memory_ids or target in observed_memory_ids or target in seen:
-            continue
-        seen.add(target)
-        result.append(
-            {
-                "tool": "read_memory_detail",
-                "memory_id": target,
-                "reason": "程序强制补证据：修改、合并或冲突处理已有 memory 前必须先读取正文。",
-            }
-        )
+        if target and target in memory_ids and target not in observed_memory_ids and target not in seen:
+            seen.add(target)
+            result.append(
+                {
+                    "tool": "read_memory_detail",
+                    "memory_id": target,
+                    "reason": "程序强制补证据：修改、合并或冲突处理已有 memory 前必须先读取正文。",
+                }
+            )
+        if change.get("action") == "merge_existing_memories":
+            for source in change.get("source_memory_ids") or []:
+                source = str(source)
+                if not source or source not in memory_ids or source in observed_memory_ids or source in seen:
+                    continue
+                seen.add(source)
+                result.append(
+                    {
+                        "tool": "read_memory_detail",
+                        "memory_id": source,
+                        "reason": "程序强制补证据：合并已有 source memory 前必须先读取正文。",
+                    }
+                )
     return result
 
 
@@ -970,12 +1156,16 @@ def _react_payload(
             "summary_only_memory_ids": sorted(summary_only_memory_ids),
             "observed_memory_ids": sorted(observed_memory_ids),
             "modifiable_memory_ids": sorted(observed_memory_ids),
-            "rule": "memory_index 只是摘要索引；只有 modifiable_memory_ids 中的 memory 才允许 update/merge/mark_conflict/record_conflict_decision。",
+            "rule": "memory_index 只是摘要索引；只有 modifiable_memory_ids 中的 memory 才允许 update/merge/merge_existing/retire/move_memory_topic/mark_conflict/record_conflict_decision。",
         },
         "action_decision_guide": {
             "create_memory": "有长期价值，已有 memory 不能覆盖，能形成清晰 stable_key，证据足够。",
             "merge_memory": "同一模式，只增加证据或例子，不改变原结论；必须先读过目标 memory 详情。",
+            "merge_existing_memories": "多条 active memory 语义重复或同方向，继续分开会增加召回噪声；必须先读过 target 和 sources 的详情。",
             "update_memory": "已有 memory 方向正确，本轮提供更准确、更通用或更完整表述；必须先读过目标 memory 详情。",
+            "retire_memory": "已有 active memory 已失效、重复到不应继续作为当前有效记忆或被明确废弃；必须先读过目标 memory 详情，不能修改 topic。",
+            "move_memory_topic": "memory 内容正确但归属主题错误时移动到更准确的 active topic；必须先读过目标 memory 详情，不能修改 memory 内容或 topic 摘要。",
+            "merge_topics": "多个 active topic 语义重复时合并主题目录；只迁移 source topic 下 active memories 并标记 source topic merged，不修改 memory 内容或 target topic 摘要。",
             "mark_conflict": "同 scope、同条件、同对象下结论相反且无法用环境差异解释；必须先读过目标 memory 详情。",
             "update_topic": "memory 内容和 topic 标题/概要出现语义漂移时维护主题元信息；若要判断主题是否应改名，优先先读过 topic 详情。",
             "record_conflict_decision": "记录同一作用域前后矛盾的旧说法、新说法、处理决定和原因；必须先读过目标 memory 详情。",
@@ -1109,7 +1299,19 @@ def _validate_or_repair_react(
                     "noop": ["action", "reason", "evidence_refs"],
                     "request_more_evidence": ["action", "reason", "requests", "evidence_refs"],
                     "merge_memory": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],
+                    "merge_existing_memories": [
+                        "action",
+                        "reason",
+                        "target_memory_id",
+                        "source_memory_ids",
+                        "memory",
+                        "evidence_refs",
+                        "conflict_disposition",
+                    ],
                     "update_memory": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],
+                    "retire_memory": ["action", "reason", "target_memory_id", "evidence_refs", "conflict_disposition"],
+                    "move_memory_topic": ["action", "reason", "target_memory_id", "from_topic_id", "to_topic_id", "evidence_refs"],
+                    "merge_topics": ["action", "reason", "target_topic_id", "source_topic_ids", "evidence_refs"],
                     "mark_conflict": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],
                     "update_topic": ["action", "reason", "target_topic_id", "topic", "evidence_refs"],
                     "record_conflict_decision": ["action", "reason", "target_memory_id", "conflict", "evidence_refs"],

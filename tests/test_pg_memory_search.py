@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from memory_lab.pg_store import (
     _search_terms,
+    build_writer_context,
     get_current_turn_evidence_summary,
     search_related_memories,
 )
@@ -70,7 +71,28 @@ class PgMemorySearchTests(unittest.TestCase):
         self.assertIn("source_rank", sql)
         self.assertIn("verification_status", sql)
         self.assertIn("next_steps", sql)
+        self.assertIn("stable_key LIKE 'acceptance.%'", sql)
+        self.assertIn("topic_key LIKE 'acceptance.%'", sql)
         self.assertIn("LIMIT 20", sql)
+
+    def test_search_can_explicitly_include_test_data(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_array", return_value=[]
+        ) as query_json:
+            result = search_related_memories(
+                pg_config_path=Path("unused.json"),
+                query="acceptance 测试",
+                include_test_data=True,
+            )
+
+        self.assertTrue(result["filters"]["include_test_data"])
+        sql = query_json.call_args.args[1]
+        self.assertNotIn("stable_key LIKE 'acceptance.%'", sql)
+        self.assertNotIn("topic_key LIKE 'acceptance.%'", sql)
 
     def test_no_matches_returns_search_guidance(self) -> None:
         config = {
@@ -151,6 +173,32 @@ class PgMemorySearchTests(unittest.TestCase):
         self.assertIn("ev_core_1", result["evidence_ids"])
         self.assertIn("ptr_1", result["pointer_ids"])
         self.assertIn("只能引用 evidence_ids", result["guidance"])
+
+    def test_writer_context_hides_test_topics_and_memories_from_memory_index(self) -> None:
+        config = {
+            "user": {"user_id": "local-default-user"},
+            "postgres": {"password": "unused"},
+        }
+        fake_context = {
+            "schema_version": "memory-lab-writer-context-v1",
+            "turn_evidence": {"turn_id": "turn_1"},
+            "memory_index": {"topics": [], "memories": []},
+            "available_tools": ["expand_pointer", "read_memory_detail"],
+        }
+        with patch("memory_lab.pg_store.load_pg_config", return_value=config), patch(
+            "memory_lab.pg_store._json_from_psql_object", return_value=fake_context
+        ) as query_json:
+            result = build_writer_context(
+                pg_config_path=Path("unused.json"),
+                turn_id="turn_1",
+            )
+
+        self.assertEqual(result["status"], "complete")
+        sql = query_json.call_args.args[1]
+        self.assertIn("mt.metadata ? 'test_namespace'", sql)
+        self.assertIn("m.metadata ? 'test_namespace'", sql)
+        self.assertIn("topic_key LIKE 'acceptance.%'", sql)
+        self.assertIn("stable_key LIKE 'acceptance.%'", sql)
 
 
 if __name__ == "__main__":
