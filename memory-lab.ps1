@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'historical-backfill', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-list-topic-memories', 'pg-read-memory-history', 'pg-list-memory-conflicts', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'historical-backfill', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-list-topic-memories', 'pg-read-memory-history', 'pg-list-memory-conflicts', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'process-new-turns', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -115,6 +115,8 @@ param(
     [switch]$IncludeResolved,
 
     [switch]$Refresh,
+
+    [switch]$Reprocess,
 
     [switch]$DryRun
 )
@@ -455,6 +457,27 @@ try {
         }
         if ($DryRun) {
             $Arguments += '--dry-run'
+        }
+        if ($AgentLogDirectory) {
+            $Arguments += @('--log-dir', $AgentLogDirectory)
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'process-new-turns') {
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            $Command, '--pg-config', $PgConfigPath, '--config', $ConfigPath,
+            '--limit', $Limit, '--settle-ms', $SettleMilliseconds,
+            '--memory-limit', $MemoryLimit, '--max-iterations', $MaxIterations
+        )
+        if ($PSBoundParameters.ContainsKey('TopicLimit')) {
+            $Arguments += @('--topic-limit', $TopicLimit)
+        }
+        if ($DryRun) {
+            $Arguments += '--dry-run'
+        }
+        if ($Reprocess) {
+            $Arguments += '--reprocess'
         }
         if ($AgentLogDirectory) {
             $Arguments += @('--log-dir', $AgentLogDirectory)

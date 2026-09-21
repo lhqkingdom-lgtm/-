@@ -52,6 +52,7 @@ from .pg_store import (
     trace_memory_relations,
 )
 from .pg_markdown_export import export_pg_markdown
+from .process_new_turns import process_new_turns
 from .prepare import prepare_dataset
 from .report import DEFAULT_GOLD, DEFAULT_REPORT_DIRECTORY, generate_shadow_report
 from .shadow import run_deepseek_shadow
@@ -564,6 +565,20 @@ def build_parser() -> argparse.ArgumentParser:
     pg_memory_agent_batch.add_argument("--topic-limit", type=int, default=200)
     pg_memory_agent_batch.add_argument("--dry-run", action="store_true")
     pg_memory_agent_batch.add_argument("--log-dir", type=Path)
+    process_new = subparsers.add_parser(
+        "process-new-turns",
+        help="Scan local CP SQLite and process recent unprocessed terminal turns",
+    )
+    process_new.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    process_new.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    process_new.add_argument("--limit", type=int, default=5)
+    process_new.add_argument("--settle-ms", type=int, default=1000)
+    process_new.add_argument("--memory-limit", type=int, default=80)
+    process_new.add_argument("--topic-limit", type=int, default=5)
+    process_new.add_argument("--max-iterations", type=int, default=3)
+    process_new.add_argument("--dry-run", action="store_true")
+    process_new.add_argument("--reprocess", action="store_true")
+    process_new.add_argument("--log-dir", type=Path)
     return parser
 
 
@@ -956,6 +971,21 @@ def main(argv: list[str] | None = None) -> int:
                 memory_limit=args.memory_limit,
                 topic_limit=args.topic_limit,
                 dry_run=args.dry_run,
+                log_dir=args.log_dir if args.log_dir else None,
+            )
+        elif args.command == "process-new-turns":
+            report = process_new_turns(
+                source_database=args.source_db,
+                lab_database=args.lab_db,
+                pg_config_path=args.pg_config,
+                config_path=args.config,
+                limit=args.limit,
+                settle_ms=args.settle_ms,
+                memory_limit=args.memory_limit,
+                topic_limit=args.topic_limit,
+                max_iterations=args.max_iterations,
+                dry_run=args.dry_run,
+                reprocess=args.reprocess,
                 log_dir=args.log_dir if args.log_dir else None,
             )
         elif args.command in {"baseline", "ingest"}:

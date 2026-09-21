@@ -195,6 +195,34 @@ PostgreSQL ReAct dry-run 示例：
   -AgentLogDirectory .\reports\react-dry-run
 ```
 
+自动扫描本机 CP SQLite 最近未处理 turn 的最小轮询入口：
+
+```powershell
+.\memory-lab.ps1 process-new-turns `
+  -SourceDatabase "D:\opencode-dev\opencode-dev.db" `
+  -PgConfigPath .\pg-memory-lab.local.json `
+  -Limit 5 `
+  -DryRun `
+  -AgentLogDirectory .\reports\process-new-turns
+```
+
+当前 `process-new-turns` 只承诺本机单设备、多 CP 窗口场景：
+
+```text
+自动扫描 terminal turns；
+按 turn_id + input_hash + dry_run 去重；
+逐条 ingest 到 PostgreSQL；
+逐条运行 ReAct 记忆维护；
+失败 turn 记录 failed，不影响后续 turn；
+DryRun 只记录处理状态和日志，不提交正式 memory 改动。
+```
+
+需要重跑同一批 turn 做调试时，可显式加：
+
+```powershell
+-Reprocess
+```
+
 在开始新的 CP 会话之前建立基线。基线只表示“当前已有历史不参加这次实验”，不会修改 CP：
 
 ```powershell
