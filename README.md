@@ -1,14 +1,21 @@
 # CodePulse Memory Lab
 
-> 当前最新路线见 [PostgreSQL 轻量长期记忆 MVP 状态](POSTGRES_LIGHT_MEMORY_STATUS.md)。
+> 当前最新路线：以 PostgreSQL 为长期记忆主库，围绕真实 CP turn 构建“证据池 → ReAct 记忆维护 Agent → 结构化写库 → 审查报告”的轻量长期记忆系统。
 >
-> 项目已从早期“完整版本链 + 证据链 + 独立 Reviewer”实验方案，收敛为更贴近 Claude Code 的轻量方案：
+> 当前主链路已经从早期 SQLite/Markdown 实验，推进到：
 >
 > ```text
-> CP SQLite → turn 三层证据池 → PostgreSQL → 单 Writer → memory_topics / memories → Markdown 投影
+> CP SQLite / 外部回放 DB
+>   → turn 三层证据池 core / candidate / pointer
+>   → PostgreSQL 证据与长期记忆表
+>   → ReAct 记忆维护 Agent
+>   → read tools 补证据 / 查旧记忆
+>   → memory-changes-v1 结构化计划
+>   → 本地校验、幂等、写库或 dry-run
+>   → 报告 / Markdown 审查
 > ```
 >
-> 目前已完成三层证据池、candidate 中文摘要清洗、pointer 回查、轻量 memory 表和 Writer 读取工具；尚未接入 LLM Writer、正式 memory 写入和 Markdown 投影。
+> 目前已经完成：三层证据池、PostgreSQL memory/topic/conflict/revision 基础表、ReAct 读工具、结构化写入动作、主题维护工具、冲突记录、真实 turn dry-run 回归和 P0 记忆质量优化。
 
 CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只把 CodePulse 的 SQLite 会话记录
 作为输入，不修改 CP 源码、不扫描项目文件，也不向 CP 主 Agent 注入记忆。
@@ -18,12 +25,13 @@ CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只�
 
 ## 当前状态
 
-- 通用沉淀主链已经打通，主入口为 `session-memory`；
-- DeepSeek Writer 与独立 Reviewer 已完成真实接口冒烟验证；
-- 两项目合成数据已完成正式 SQLite、不可变 Markdown 和中文报告发布；
-- 无新增消息的第二次扫描为 `noop`，不会重复写入；
-- 当前自动化回归为 **264 项全部通过**；
-- 查询召回和向 CP 主 Agent 注入仍不属于本阶段。
+- PostgreSQL 长期记忆主链已经打通，核心入口为 `pg-memory-react-run`；
+- 已支持从真实 CP turn 生成三层证据池，并交给 ReAct Agent 判断 `create / merge / update / noop / conflict / topic` 等动作；
+- 已支持只读补证据工具：搜索相关记忆、读取 memory/topic 详情、读取主题下记忆列表、读取历史、查看冲突、回查 pointer；
+- 已支持结构化写入动作：新增、更新、合并证据、合并已有记忆、退役、标记冲突、记录冲突决策、更新主题、移动记忆主题、合并主题、记录关系；
+- 已完成 19 条真实 CP turn dry-run 回归，验证 P0 合并粒度优化；
+- 当前核心定向回归为 **100 项全部通过**；
+- 自动轮询、召回注入 CP 主流程、多设备并发隔离仍属于下一阶段。
 
 完整的两个真实项目测试步骤见 [REAL_PROJECT_TEST_PLAN.md](REAL_PROJECT_TEST_PLAN.md)。
 
@@ -34,24 +42,25 @@ CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只�
 
 ```text
 CP SQLite（只读）
-  → 找出已结束且尚未处理的会话回合
-  → 生成脱敏的完整可观察证据包
-     （用户消息、Assistant 最终回复、工具名称/状态/输入/输出）
-  → DeepSeek Writer 拆分通用原子记忆
-  → 独立 DeepSeek Reviewer 审核或修订
-  → 确定性程序重新校验证据、范围、顺序和 CAS
-  → 新建 / 同义证据合并 / 范围变体 / 修订 / 冲突
-  → 正式 Memory Lab SQLite
-  → 不可变 Markdown generation + CURRENT
-  → 中文 Markdown / HTML / JSON 变更报告
+  → turn 切分
+  → 三层证据池 core / candidate / pointer
+  → PostgreSQL 证据表
+  → ReAct 记忆维护 Agent
+  → 只读工具补充旧记忆、主题、冲突、原始证据
+  → 输出 memory-changes-v1
+  → 本地程序校验 ID、字段、权限、幂等和事务
+  → PostgreSQL memory_topics / memories / revisions / conflict records
+  → dry-run 日志、Markdown/报告审查
 ```
 
-新链路不经过旧的 `prepare / coverage / admission / episode` 白名单支线，也不会因为内容已经写在
-`AGENTS.md` 中就拒绝沉淀。模型可以提出用户信息、偏好、工作流、工程经验、项目事实、参考信息、
-知识或其他可复用记忆；是否值得保存由 Writer 和 Reviewer 根据会话证据判断。
+新链路不要求模型直接写数据库。模型只负责判断本轮 turn 是否需要沉淀、该修改哪条记忆、是否需要先补证据；正式动作始终由本地程序执行和校验。
 
-DeepSeek 只输出严格 JSON，不直接编辑数据库或 Markdown。正式动作始终由本地程序执行。Writer
-和 Reviewer 遇到结构不合规时各允许一次无状态重试；连续失败仍然整批零写入。
+当前 P0 质量策略：
+
+- 只有新证据能用目标 memory 的同一句核心结论解释时，才允许 `merge_memory`；
+- 新信息形成独立规则时，应 `create_memory`，不要强塞进宽泛旧 memory；
+- 用户协作习惯、工程流程、编译失败经验、运行现象经验尽量保持原子化；
+- 如果理想动作是修改旧 memory，但目标 memory 未读取、没有修改权限，必须先请求读工具，不能用 `noop` 掩盖。
 
 ## 输入边界
 
@@ -164,7 +173,26 @@ Set-Location '<Codepulse-Memory-Lab 仓库目录>'
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\src).Path
-python -m unittest discover -s tests
+python -m unittest tests.test_memory_react_prompt tests.test_memory_changes_validation tests.test_real_flow_memory_plans tests.test_pg_memory_search tests.test_pg_memory_versioning
+```
+
+当前核心定向回归期望：
+
+```text
+100 tests OK
+```
+
+PostgreSQL ReAct dry-run 示例：
+
+```powershell
+.\memory-lab.ps1 pg-memory-react-run `
+  -PgConfigPath .\pg-memory-lab.local.json `
+  -TurnId '<turn_id>' `
+  -MemoryLimit 30 `
+  -TopicLimit 5 `
+  -MaxIterations 3 `
+  -DryRun `
+  -AgentLogDirectory .\reports\react-dry-run
 ```
 
 在开始新的 CP 会话之前建立基线。基线只表示“当前已有历史不参加这次实验”，不会修改 CP：
