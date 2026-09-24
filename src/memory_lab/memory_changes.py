@@ -41,6 +41,11 @@ ALLOWED_ACTIONS = {
     "request_more_evidence",
 }
 ALLOWED_REQUEST_TOOLS = {"expand_pointer", "read_memory_detail", "read_topic_detail"}
+ALLOWED_MEMORY_TYPES = {
+    "user_preference",
+    "compile_failure_experience",
+    "runtime_failure_experience",
+}
 CONFLICT_RECORD_STATUSES = (
     "needs_review",
     "resolved_by_update",
@@ -79,6 +84,7 @@ def _error_codes_for_messages(errors: list[str]) -> list[str]:
         ("evidence_id does not belong to this turn", "EVIDENCE_NOT_IN_TURN"),
         ("raw_pointer_id does not belong to this turn", "POINTER_NOT_IN_TURN"),
         ("unsupported fields", "UNSUPPORTED_FIELD"),
+        ("memory.memory_type must be one of", "UNSUPPORTED_MEMORY_TYPE"),
         ("is required", "MISSING_REQUIRED_FIELD"),
         ("must be a non-empty string", "MISSING_REQUIRED_FIELD"),
         ("stable_key already exists", "DUPLICATE_STABLE_KEY"),
@@ -99,6 +105,7 @@ def _suggestions_for_error_codes(codes: list[str]) -> list[str]:
         "EVIDENCE_NOT_IN_TURN": "Use only evidence_id values from the current turn evidence pool, or expand the relevant pointer first.",
         "POINTER_NOT_IN_TURN": "Use only raw_pointer_id values from the current turn pointer layer.",
         "UNSUPPORTED_FIELD": "Remove unsupported fields and keep only the schema fields allowed for this action.",
+        "UNSUPPORTED_MEMORY_TYPE": "Use one of the allowed memory_type values: user_preference, compile_failure_experience, runtime_failure_experience. Use noop when nothing should be stored.",
         "MISSING_REQUIRED_FIELD": "Add the missing required field using the action schema.",
         "DUPLICATE_STABLE_KEY": "Update or merge the existing memory instead of creating a new memory with the same stable_key.",
         "TOPIC_KEY_EXISTS": "Use topic_id to create a memory under the existing topic, or emit a separate update_topic action if the topic title/summary should change.",
@@ -261,6 +268,10 @@ def _check_memory(memory: Any, errors: list[str], prefix: str, *, create: bool) 
         errors.append(f"{prefix}.memory.stable_key must use lowercase key format")
     if create and not _non_empty_string(memory.get("memory_type")):
         errors.append(f"{prefix}.memory.memory_type must be a non-empty string")
+    elif create and str(memory.get("memory_type")) not in ALLOWED_MEMORY_TYPES:
+        errors.append(
+            f"{prefix}.memory.memory_type must be one of {', '.join(sorted(ALLOWED_MEMORY_TYPES))}"
+        )
     if create and not _valid_scope(memory.get("scope")):
         errors.append(f"{prefix}.memory.scope is invalid")
     for field, limit in (("summary", MAX_SUMMARY_CHARS), ("content", MAX_CONTENT_CHARS)):
@@ -2464,6 +2475,7 @@ def commit_memory_changes_file(
 
 
 __all__ = [
+    "ALLOWED_MEMORY_TYPES",
     "MEMORY_CHANGES_SCHEMA_VERSION",
     "MemoryChangesValidationError",
     "MemoryChangesCommitError",

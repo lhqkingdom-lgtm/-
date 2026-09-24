@@ -1,0 +1,118 @@
+{
+  "evalset_id": "memory_eval_v1",
+  "description": "多 turn 连续场景，用于验证长期记忆的 update/merge/noop/topic 更新能力。",
+  "scenarios": [
+    {
+      "scenario_id": "scenario_el48_sensor_interrupt_flow",
+      "title": "EL48 感应功能无法被开关键打断到修复验证",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790",
+        "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4",
+        "turn_9f5e270a1fc7ea15bb870a7272c3e3d1d54b8ea8c0b5b0fbbd376e12336626ca",
+        "turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516"
+      ],
+      "expected": {
+        "should_create_or_update": ["自动/感应模式应能被用户主动操作打断", "修复限定在指定模块，避免影响无关功能", "用户确认修复后补充验证状态"],
+        "should_not_create_duplicates": true,
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_adc_channel_offset_flow",
+      "title": "ADCHS 通道偏移原因确认与修复",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_5c7481ae5e3189158f65a01726da20cb65227571964d6792ef237623c4da09e3",
+        "turn_bf68abfbcacc2ab5b4b6aefafe5c9373b8cc4ed02c663ee0f0457347f48959c2",
+        "turn_361576805c44a76ec235dfb6413946d77fb431c216ddff121a2b986a88849caa"
+      ],
+      "expected": {
+        "should_create_or_update": ["ADC/ADCHS 通道号映射错误需要区分物理通道、寄存器编码和 IO 配置来源"],
+        "should_not_extract": ["当前项目具体 ADCHS 数值作为孤立长期记忆"],
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_fl20pro_iterative_runtime_feedback",
+      "title": "FL20Pro 多轮烧录反馈与功能缺失收敛",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226",
+        "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f",
+        "turn_a08aaa350d725a4483a5ea594fc05980c4a39ec19bfcc9b4a5b5d94e63ac76f1",
+        "turn_edaf2278924bd8e7011a0fa0f62462d8fa495ef6a615e10c9069909c36be74b6"
+      ],
+      "expected": {
+        "should_create_or_update": ["多轮真实烧录反馈应更新同一类功能缺失/定位经验", "标准源码对比用于定位但路径不入长期记忆"],
+        "should_not_create_all_new": true,
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_key_led_mapping_and_polarity",
+      "title": "触摸按键与 LED 映射/极性问题多轮收敛",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d",
+        "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041",
+        "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55",
+        "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd",
+        "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328"
+      ],
+      "expected": {
+        "should_create_or_update": ["共阴极低电平点亮导致 LED 状态反向/错位时，需要同时核对极性、引脚映射和逻辑状态", "具体 IO 映射表应保留为证据，不直接变成长期记忆"],
+        "should_merge_related": true,
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_tg035_flash_size_failure",
+      "title": "代码过大超出芯片 FLASH 容量",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_9cc7e98011f2cfcc0bdc24fdc95cbe897927569925e1906fd2a2bc095c974bc3",
+        "turn_3b9971096f27a895aebe6b7562a43a1a482d540a80c19ea90d94f8b1de8e444c",
+        "turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d",
+        "turn_80f1eb1951705133f313a2b205d39e7e44b5f105ccbd61632e03c4680c83a4ac"
+      ],
+      "expected": {
+        "should_create_or_update": ["芯片 FLASH 容量不足/程序文件太大属于烧录失败模式，需要定位体积来源和有效裁剪策略"],
+        "should_not_extract": ["当前项目完整需求参数"],
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_user_collaboration_preferences",
+      "title": "用户协作偏好跨项目重复出现",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_ce74671f245ef1c8bcad11ca7b866dbd639084917ea50d2978b001ebbf3c7ef3",
+        "turn_24e1d0cddff5e509862938fd43c144c945e8e64b97519c285bab3a85c6446626",
+        "turn_4eaa9f6c277e07ce5f9eacac615a2115e5b5b86258965f33a1667e66c3bde275",
+        "turn_fba4a5189f3c2affea2ef963ecf93df245c5b12e1b6d75b6e3e21506636e08b1"
+      ],
+      "expected": {
+        "should_create_or_update": ["不明白先问不要瞎猜", "关键版本先 git 保存方便回滚", "优先依据需求书/IO/SDK"],
+        "should_merge_related": true,
+        "quality_target": "A"
+      }
+    },
+    {
+      "scenario_id": "scenario_noop_low_value_filter",
+      "title": "无价值/当前状态类输入过滤",
+      "mode": "sequential",
+      "turn_ids": [
+        "turn_38dadb00a1fea17d1a860cd5676814e4599f3cfa6955f407e6f3fab2ad4a5937",
+        "turn_5bac64c1dba63fe209e923027ed0a2776d813567b6569fb90ed1c134db83b5e7",
+        "turn_6de92bc87542233247f7085bd911e9d26ae522c7590523caf802ff0949c42eb5",
+        "turn_1b834671a9be2efae922c321600037e6ddd631ebf39443f8ea113d7bd2ca4d96",
+        "turn_5d83de860d4704395134b82544a5d8f30d94aa0e4bd13dfadeae8af941ee360e"
+      ],
+      "expected": {
+        "should_actions_mostly": ["noop"],
+        "quality_target": "A"
+      }
+    }
+  ]
+}

@@ -29,9 +29,13 @@ CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只�
 - 已支持从真实 CP turn 生成三层证据池，并交给 ReAct Agent 判断 `create / merge / update / noop / conflict / topic` 等动作；
 - 已支持只读补证据工具：搜索相关记忆、读取 memory/topic 详情、读取主题下记忆列表、读取历史、查看冲突、回查 pointer；
 - 已支持结构化写入动作：新增、更新、合并证据、合并已有记忆、退役、标记冲突、记录冲突决策、更新主题、移动记忆主题、合并主题、记录关系；
-- 已完成 19 条真实 CP turn dry-run 回归，验证 P0 合并粒度优化；
-- 当前核心定向回归为 **100 项全部通过**；
-- 自动轮询、召回注入 CP 主流程、多设备并发隔离仍属于下一阶段。
+- 已完成 40 条真实单 turn + 7 组连续场景评测集，支持隔离回放、连续回放和旧报告重判；
+- 已实现本机 CP SQLite 轮询入口：自动发现新 turn、生成证据池、运行 ReAct 并提交/演练记忆动作；
+- 已实现中文终端摘要、逐 turn ReAct JSON 日志和 Markdown/HTML/JSON trace 报告；
+- 最新冻结基线执行成功率 100%（40/40），动作命中率 95%（38/40），明确低价值用例 noop 命中 100%（11/11）；
+- 当前仍需优化长 turn 证据覆盖、记忆颗粒度、一次性内容过滤和语义去重；召回注入 CP 主流程、多设备并发隔离仍属于下一阶段。
+
+回家继续开发时，优先阅读 [当前能力与续作说明](docs/当前能力与续作说明.md)。该文档集中说明评测集、评测链路、轮询入口、日志系统、本地数据依赖和下一步顺序。
 
 完整的两个真实项目测试步骤见 [REAL_PROJECT_TEST_PLAN.md](REAL_PROJECT_TEST_PLAN.md)。
 
@@ -216,6 +220,47 @@ PostgreSQL ReAct dry-run 示例：
 失败 turn 记录 failed，不影响后续 turn；
 DryRun 只记录处理状态和日志，不提交正式 memory 改动。
 ```
+
+持续轮询本机 CP 默认库时可用：
+
+```powershell
+.\memory-lab.ps1 poll-new-turns `
+  -SourceDatabase "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db" `
+  -PgConfigPath .\pg-memory-lab.local.json `
+  -Limit 3 `
+  -DryRun `
+  -AgentLogDirectory .\reports\poll-new-turns-live `
+  -IntervalSeconds 20
+```
+
+查看“CP 原始交互 → turn → 三层证据池 → ReAct 工具调用 → 最终记忆动作”的可视化审计报告：
+
+```powershell
+.\memory-lab.ps1 trace-report `
+  -SourceDatabase "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db" `
+  -PgConfigPath .\pg-memory-lab.local.json `
+  -AgentLogDirectory .\reports\poll-new-turns-live `
+  -Limit 10
+```
+
+报告输出：
+
+```text
+reports\cp-memory-trace\latest-trace.md
+reports\cp-memory-trace\latest-trace.html
+reports\cp-memory-trace\latest-trace.json
+reports\cp-memory-trace\latest-annotations.template.json
+reports\cp-memory-trace\history\*.md/html/json
+reports\cp-memory-trace\history\*.annotations.template.json
+```
+
+其中 `latest-trace.html` 是面向人工查看的可视化页面，包含总览卡片、Turn 总览、每轮 CP
+交互摘要、ReAct 调用流转、最终沉淀计划和 Memory before/after。真实测试时可以保持轮询运行，
+每处理一批 turn 后刷新这个 HTML 查看效果。
+
+其中 `latest-annotations.template.json` 是人工评测标注模板。它会按 turn 列出本轮实际动作、
+质量标签、用户/助手摘要，并预留 `expected_action / human_label / reviewer / note` 字段，方便人工判断
+是否漏沉淀、误沉淀、重复沉淀或证据不足。
 
 需要重跑同一批 turn 做调试时，可显式加：
 

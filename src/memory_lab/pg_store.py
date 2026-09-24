@@ -99,16 +99,19 @@ def _run_psql(config: Mapping[str, Any], sql: str) -> str:
         input=sql,
         text=True,
         encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
         check=False,
     )
     if process.returncode != 0:
+        stderr = process.stderr or ""
+        stdout = process.stdout or ""
         raise RuntimeError(
-            "psql failed: " + (process.stderr.strip() or process.stdout.strip())
+            "psql failed: " + (stderr.strip() or stdout.strip())
         )
-    return process.stdout
+    return process.stdout or ""
 
 
 def _sql_literal(value: str) -> str:

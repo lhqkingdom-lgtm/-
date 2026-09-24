@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .ingest import run_ingestion
 from .memory_react_agent import run_memory_react_agent
 from .pg_store import (
     DEFAULT_PG_CONFIG,
@@ -220,6 +221,7 @@ def process_new_turns(
     """Scan local CP turns and process the newest unprocessed terminal turns."""
 
     ensure_turn_processing_state(pg_config_path=pg_config_path)
+    local_ingest_report = run_ingestion(source_database, lab_database, "ingest")
     scan_report = run_turn_scan(source_database, lab_database, settle_ms=settle_ms)
     source_identifier = source_id(source_database)
     candidates = load_terminal_turn_candidates(
@@ -240,8 +242,13 @@ def process_new_turns(
             skipped.append({**item, "reason": "already_completed"})
             continue
         pending.append(item)
-        if len(pending) >= int(limit):
-            break
+    pending.sort(
+        key=lambda item: (
+            item.get("user_timestamp") if isinstance(item.get("user_timestamp"), (int, float)) else -1,
+            str(item.get("turn_id") or ""),
+        )
+    )
+    pending = pending[: int(limit)]
 
     results: list[dict[str, Any]] = []
     for item in pending:
@@ -338,6 +345,13 @@ def process_new_turns(
         "limit": int(limit),
         "reprocess": bool(reprocess),
         "scan": {
+            "ingest": {
+                "run_id": local_ingest_report.get("run_id"),
+                "new_parts": local_ingest_report.get("new_parts"),
+                "user_events": local_ingest_report.get("user_events"),
+                "isolated_user_events": local_ingest_report.get("isolated_user_events"),
+                "duplicate_parts": local_ingest_report.get("duplicate_parts"),
+            },
             "run_id": scan_report.get("run_id"),
             "counts": scan_report.get("counts"),
             "turn_count": scan_report.get("turn_count"),

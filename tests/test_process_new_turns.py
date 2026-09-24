@@ -4,10 +4,13 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
+import memory_lab.process_new_turns as process_module
 from memory_lab.process_new_turns import (
     PROCESSING_STATE_TABLE_SQL,
     load_terminal_turn_candidates,
+    process_new_turns,
 )
 from memory_lab.store import open_store
 
@@ -80,6 +83,85 @@ class ProcessNewTurnsTests(unittest.TestCase):
 
         self.assertEqual([item["turn_id"] for item in candidates], ["turn_new", "turn_old"])
         self.assertEqual(candidates[0]["input_hash"], "hash_new")
+
+    def test_process_new_turns_executes_selected_pending_turns_oldest_first(self) -> None:
+        calls: list[str] = []
+        candidates = [
+            {
+                "turn_id": "turn_new",
+                "session_id": "session",
+                "user_message_id": "msg_new",
+                "user_timestamp": 3000,
+                "state": "completed",
+                "input_hash": "hash_new",
+                "assistant_count": 1,
+                "part_count": 2,
+                "active_tool_count": 0,
+            },
+            {
+                "turn_id": "turn_mid",
+                "session_id": "session",
+                "user_message_id": "msg_mid",
+                "user_timestamp": 2000,
+                "state": "completed",
+                "input_hash": "hash_mid",
+                "assistant_count": 1,
+                "part_count": 2,
+                "active_tool_count": 0,
+            },
+            {
+                "turn_id": "turn_old",
+                "session_id": "session",
+                "user_message_id": "msg_old",
+                "user_timestamp": 1000,
+                "state": "completed",
+                "input_hash": "hash_old",
+                "assistant_count": 1,
+                "part_count": 2,
+                "active_tool_count": 0,
+            },
+        ]
+
+        def fake_react(**kwargs):
+            turn_id = kwargs["turn_id"]
+            calls.append(turn_id)
+            return {
+                "run_id": f"react_{turn_id}",
+                "status": "complete",
+                "plan": {
+                    "changes": [
+                        {
+                            "action": "noop",
+                            "reason": "test",
+                        }
+                    ]
+                },
+            }
+
+        with (
+            patch.object(process_module, "ensure_turn_processing_state"),
+            patch.object(process_module, "run_ingestion", return_value={"run_id": "ingest"}),
+            patch.object(process_module, "run_turn_scan", return_value={"run_id": "scan"}),
+            patch.object(process_module, "source_id", return_value="src"),
+            patch.object(process_module, "load_terminal_turn_candidates", return_value=candidates),
+            patch.object(process_module, "_pg_processed_keys", return_value=set()),
+            patch.object(process_module, "mark_turn_processing_state"),
+            patch.object(process_module, "ingest_turn_to_postgres", return_value={"ok": True}),
+            patch.object(process_module, "run_memory_react_agent", side_effect=fake_react),
+        ):
+            report = process_new_turns(
+                source_database=Path("source.db"),
+                lab_database=Path("lab.db"),
+                pg_config_path=Path("pg.json"),
+                config_path=Path("config.json"),
+                limit=3,
+            )
+
+        self.assertEqual(calls, ["turn_old", "turn_mid", "turn_new"])
+        self.assertEqual(
+            [item["turn_id"] for item in report["turns"]],
+            ["turn_old", "turn_mid", "turn_new"],
+        )
 
 
 if __name__ == "__main__":

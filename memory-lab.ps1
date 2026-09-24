@@ -1,6 +1,6 @@
-param(
+﻿param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('baseline', 'ingest', 'historical-backfill', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-list-topic-memories', 'pg-read-memory-history', 'pg-list-memory-conflicts', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'process-new-turns', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
+    [ValidateSet('baseline', 'ingest', 'historical-backfill', 'prepare', 'coverage', 'admit', 'turns', 'episodes', 'turn-phases', 'evidence-pools', 'conflict-scenarios-report', 'pg-ingest-turn', 'pg-show-turn', 'pg-quality-report', 'pg-writer-context', 'pg-get-turn-evidence', 'pg-migrate-memory-versioning', 'pg-current-turn-evidence-summary', 'pg-list-memory-topics', 'pg-list-topic-memories', 'pg-read-memory-history', 'pg-list-memory-conflicts', 'pg-expand-pointer', 'pg-read-memory-detail', 'pg-trace-memory-relations', 'pg-read-topic-detail', 'pg-search-related-memories', 'pg-export-markdown', 'pg-writer-dry-run', 'pg-commit-plan', 'pg-writer-commit', 'pg-validate-memory-changes', 'pg-commit-memory-changes', 'pg-memory-agent-run', 'pg-memory-react-run', 'pg-memory-agent-batch', 'process-new-turns', 'poll-new-turns', 'trace-report', 'eval-memory', 'llm-smoke-test', 'review', 'consolidate', 'shadow', 'report', 'catalog', 'recall', 'markdown-preview', 'markdown-recall', 'auto-memory', 'formal-publish', 'change-report', 'formal-recall', 'cycle', 'session-memory', 'watch', 'engineering-candidates', 'topics', 'rollback-memory', 'soak-start', 'soak-status')]
     [string]$Command,
 
     [string]$SourceDatabase = "$env:USERPROFILE\.local\share\codepulse\opencode-dev.db",
@@ -100,6 +100,15 @@ param(
 
     [string]$PlanPath,
 
+    [string]$EvalSetPath = "$PSScriptRoot\evalsets\memory_eval_v1",
+
+    [string]$RunName = 'single-batch',
+
+    [ValidateSet('plan', 'single-batch', 'single-isolated', 'scenario-sequential', 'review-existing')]
+    [string]$EvalMode = 'single-batch',
+
+    [string]$ExistingReportDirectory,
+
     [switch]$ModelRouter,
 
     [ValidateSet('all', 'core', 'candidate', 'pointer', 'router')]
@@ -118,7 +127,11 @@ param(
 
     [switch]$Reprocess,
 
-    [switch]$DryRun
+    [switch]$AutoTraceReport,
+
+    [switch]$DryRun,
+
+    [switch]$DryRunPlan
 )
 
 $BundledPythonExecutable = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
@@ -135,9 +148,230 @@ if (-not $PythonExecutable) {
     }
 }
 $SourceDirectory = "$PSScriptRoot\src"
+$MemoryLabScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $MemoryLabScriptRoot) {
+    $MemoryLabScriptRoot = (Get-Location).Path
+}
+
+foreach ($PathVariableName in @('SourceDatabase', 'LabDatabase', 'ConfigPath', 'PgConfigPath', 'GoldPath', 'ReportDirectory', 'AgentLogDirectory', 'MemoryDirectory', 'FormalMemoryRoot')) {
+    $PathValue = Get-Variable -Name $PathVariableName -ValueOnly -ErrorAction SilentlyContinue
+    if ($PathValue -is [string] -and $PathValue.Length -ge 2 -and $PathValue.StartsWith('"') -and $PathValue.EndsWith('"')) {
+        Set-Variable -Name $PathVariableName -Value $PathValue.Trim('"')
+    }
+}
+
+if ($LabDatabase -eq '\data\memory_lab.db' -or $LabDatabase -eq '\data\\memory_lab.db' -or [string]::IsNullOrWhiteSpace($LabDatabase)) {
+    $LabDatabase = Join-Path $MemoryLabScriptRoot 'data\memory_lab.db'
+}
+if ($ConfigPath -eq '\memory-lab.config.json' -or [string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Join-Path $MemoryLabScriptRoot 'memory-lab.config.json'
+}
+if ($PgConfigPath -eq '\pg-memory-lab.local.json' -or [string]::IsNullOrWhiteSpace($PgConfigPath)) {
+    $PgConfigPath = Join-Path $MemoryLabScriptRoot 'pg-memory-lab.local.json'
+}
+if ($ReportDirectory -eq '\reports' -or [string]::IsNullOrWhiteSpace($ReportDirectory)) {
+    $ReportDirectory = Join-Path $MemoryLabScriptRoot 'reports'
+}
+if ($MemoryDirectory -eq '\preview-memory' -or [string]::IsNullOrWhiteSpace($MemoryDirectory)) {
+    $MemoryDirectory = Join-Path $MemoryLabScriptRoot 'preview-memory'
+}
+if ($FormalMemoryRoot -eq '\memory' -or [string]::IsNullOrWhiteSpace($FormalMemoryRoot)) {
+    $FormalMemoryRoot = Join-Path $MemoryLabScriptRoot 'memory'
+}
+$SourceDirectory = Join-Path $MemoryLabScriptRoot 'src'
 
 if (-not $PythonExecutable -or -not (Test-Path -LiteralPath $PythonExecutable -PathType Leaf)) {
     throw 'Python 3.11+ was not found. Set MEMORY_LAB_PYTHON to an absolute python.exe path.'
+}
+
+function Get-MemoryLabProperty {
+    param(
+        [object]$Object,
+        [string]$Name
+    )
+    if ($null -eq $Object) {
+        return $null
+    }
+    $Property = $Object.PSObject.Properties[$Name]
+    if ($Property) {
+        return $Property.Value
+    }
+    return $null
+}
+
+function Get-MemoryLabShortText {
+    param(
+        [object]$Value,
+        [int]$Limit = 180
+    )
+    if ($null -eq $Value) {
+        return ''
+    }
+    $Text = ([string]$Value) -replace '\s+', ' '
+    $Text = $Text.Trim()
+    if ($Text.Length -le $Limit) {
+        return $Text
+    }
+    if ($Limit -le 1) {
+        return '.'
+    }
+    if ($Limit -le 3) {
+        return '.' * $Limit
+    }
+    return $Text.Substring(0, $Limit - 3) + '...'
+}
+
+function ConvertTo-MemoryLabCompactJson {
+    param(
+        [object]$Value,
+        [int]$Limit = 180
+    )
+    if ($null -eq $Value) {
+        return ''
+    }
+    try {
+        $Json = $Value | ConvertTo-Json -Compress -Depth 12
+        return Get-MemoryLabShortText $Json $Limit
+    }
+    catch {
+        return Get-MemoryLabShortText $Value $Limit
+    }
+}
+
+function Get-MemoryLabToolResultSummary {
+    param([object]$Result)
+    if ($null -eq $Result) {
+        return ''
+    }
+    $Status = Get-MemoryLabProperty $Result 'status'
+    $Memory = Get-MemoryLabProperty $Result 'memory'
+    if ($Memory) {
+        $Topic = Get-MemoryLabProperty $Memory 'topic'
+        $TopicTitle = if ($Topic) { Get-MemoryLabProperty $Topic 'title' } else { $null }
+        $Summary = Get-MemoryLabProperty $Memory 'summary'
+        return Get-MemoryLabShortText ("status={0}; memory={1}; topic={2}; summary={3}" -f `
+            $Status, (Get-MemoryLabProperty $Memory 'memory_id'), $TopicTitle, $Summary) 260
+    }
+    $TopicObject = Get-MemoryLabProperty $Result 'topic'
+    if (-not $TopicObject) {
+        $Detail = Get-MemoryLabProperty $Result 'detail'
+        if ($Detail) {
+            $TopicObject = Get-MemoryLabProperty $Detail 'topic'
+        }
+    }
+    if ($TopicObject) {
+        return Get-MemoryLabShortText ("status={0}; topic={1}; title={2}; summary={3}" -f `
+            $Status, (Get-MemoryLabProperty $TopicObject 'topic_id'), (Get-MemoryLabProperty $TopicObject 'title'), (Get-MemoryLabProperty $TopicObject 'summary')) 260
+    }
+    foreach ($ListName in @('memories', 'conflicts', 'revisions', 'evidence', 'items', 'rows')) {
+        $ListValue = Get-MemoryLabProperty $Result $ListName
+        if ($ListValue -is [array]) {
+            $Samples = @($ListValue | Select-Object -First 3)
+            return Get-MemoryLabShortText ("status={0}; {1}_count={2}; sample={3}" -f `
+                $Status, $ListName, @($ListValue).Count, (ConvertTo-MemoryLabCompactJson $Samples 220)) 360
+        }
+    }
+    return ConvertTo-MemoryLabCompactJson $Result 360
+}
+
+function Write-MemoryLabReactSummary {
+    param(
+        [object]$Turn,
+        [string]$LogDirectory
+    )
+    $TurnId = Get-MemoryLabProperty $Turn 'turn_id'
+    $RunId = Get-MemoryLabProperty $Turn 'agent_run_id'
+    $ActionCounts = Get-MemoryLabProperty $Turn 'action_counts'
+    $ActionSummary = 'none'
+    if ($ActionCounts) {
+        $Pairs = @()
+        foreach ($Property in $ActionCounts.PSObject.Properties) {
+            $Pairs += "$($Property.Name)=$($Property.Value)"
+        }
+        if ($Pairs.Count -gt 0) {
+            $ActionSummary = ($Pairs | Sort-Object) -join ', '
+        }
+    }
+    Write-Host ("  [本轮] {0} 状态={1} 记忆Agent={2} 动作={3}" -f `
+        (Get-MemoryLabShortText $TurnId 22), (Get-MemoryLabProperty $Turn 'status'), (Get-MemoryLabProperty $Turn 'react_status'), $ActionSummary)
+    if (-not $RunId) {
+        Write-Host "  [记忆Agent] 没有 agent_run_id，无法读取详细日志。"
+        return
+    }
+    if (-not $LogDirectory) {
+        Write-Host ("  [记忆Agent] run_id={0}；未设置 -AgentLogDirectory，无法读取详细日志。" -f $RunId)
+        return
+    }
+    $LogPath = Join-Path $LogDirectory "$RunId.json"
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        Write-Host ("  [记忆Agent] run_id={0}；详细日志不存在：{1}" -f $RunId, $LogPath)
+        return
+    }
+    try {
+        $Log = Get-Content -LiteralPath $LogPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    catch {
+        Write-Host ("  [记忆Agent] run_id={0}；详细日志解析失败：{1}" -f $RunId, $_.Exception.Message)
+        return
+    }
+    Write-Host ("  [记忆Agent] run_id={0} 模式={1} 状态={2}" -f $RunId, (Get-MemoryLabProperty $Log 'mode'), (Get-MemoryLabProperty $Log 'status'))
+    foreach ($Step in @((Get-MemoryLabProperty $Log 'steps'))) {
+        Write-Host ("  [步骤] {0}: {1}" -f (Get-MemoryLabProperty $Step 'step'), (Get-MemoryLabShortText (Get-MemoryLabProperty $Step 'summary') 160))
+    }
+    foreach ($Iteration in @((Get-MemoryLabProperty $Log 'iterations'))) {
+        $Raw = Get-MemoryLabProperty $Iteration 'raw'
+        $ToolRequests = @()
+        if ($Raw) {
+            $ToolRequests = @((Get-MemoryLabProperty $Raw 'tool_requests'))
+        }
+        $ToolNames = @()
+        foreach ($Request in $ToolRequests) {
+            $ToolNames += (Get-MemoryLabProperty $Request 'tool')
+        }
+        $ToolText = if ($ToolNames.Count -gt 0) { ($ToolNames -join ', ') } else { 'none' }
+        $Reason = if ($Raw) { Get-MemoryLabProperty $Raw 'reason' } else { $null }
+        Write-Host ("  [判断第 {0} 轮] 决策={1} 请求工具={2}；原因={3}" -f `
+            (Get-MemoryLabProperty $Iteration 'iteration'), (Get-MemoryLabProperty $Iteration 'decision'), $ToolText, (Get-MemoryLabShortText $Reason 220))
+    }
+    foreach ($Observation in @((Get-MemoryLabProperty $Log 'observations'))) {
+        $Request = Get-MemoryLabProperty $Observation 'request'
+        $Result = Get-MemoryLabProperty $Observation 'result'
+        $Tool = Get-MemoryLabProperty $Request 'tool'
+        $Reason = Get-MemoryLabProperty $Request 'reason'
+        $Parameters = @{}
+        foreach ($Name in @('memory_id', 'topic_id', 'raw_pointer_id', 'query', 'limit')) {
+            $Value = Get-MemoryLabProperty $Request $Name
+            if ($null -ne $Value -and "$Value" -ne '') {
+                $Parameters[$Name] = $Value
+            }
+        }
+        Write-Host ("  [工具] {0} 参数={1} -> 状态={2}；原因={3}；返回={4}" -f `
+            $Tool, (ConvertTo-MemoryLabCompactJson $Parameters 120), (Get-MemoryLabProperty $Result 'status'), `
+            (Get-MemoryLabShortText $Reason 180), (Get-MemoryLabToolResultSummary $Result))
+    }
+    $ResultObject = Get-MemoryLabProperty $Log 'result'
+    $Plan = if ($ResultObject) { Get-MemoryLabProperty $ResultObject 'plan' } else { $null }
+    if ($Plan) {
+        Write-Host ("  [最终判断] {0}" -f (Get-MemoryLabShortText (Get-MemoryLabProperty $Plan 'reason') 260))
+        foreach ($Change in @((Get-MemoryLabProperty $Plan 'changes'))) {
+            $Memory = Get-MemoryLabProperty $Change 'memory'
+            $Topic = Get-MemoryLabProperty $Change 'topic'
+            $Target = Get-MemoryLabProperty $Change 'target_memory_id'
+            if (-not $Target) {
+                $Target = Get-MemoryLabProperty $Change 'target_topic_id'
+            }
+            if (-not $Target -and $Memory) {
+                $Target = Get-MemoryLabProperty $Memory 'stable_key'
+            }
+            if (-not $Target -and $Topic) {
+                $Target = Get-MemoryLabProperty $Topic 'title'
+            }
+            $Summary = if ($Memory) { Get-MemoryLabProperty $Memory 'summary' } elseif ($Topic) { Get-MemoryLabProperty $Topic 'summary' } else { Get-MemoryLabProperty $Change 'reason' }
+            Write-Host ("  [记忆变化] 动作={0} 目标={1}；{2}" -f `
+                (Get-MemoryLabProperty $Change 'action'), (Get-MemoryLabShortText $Target 80), (Get-MemoryLabShortText $Summary 260))
+        }
+    }
+    Write-Host ("  [详细文件] {0}" -f $LogPath)
 }
 
 $PreviousPythonPath = $env:PYTHONPATH
@@ -483,6 +717,148 @@ try {
             $Arguments += @('--log-dir', $AgentLogDirectory)
         }
         & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'poll-new-turns') {
+        $Cycle = 0
+        Write-Host "轮询服务已启动。CP数据库=$SourceDatabase 间隔=${IntervalSeconds}秒 每轮最多处理=$Limit DryRun=$DryRun MaxCycles=$MaxCycles"
+        while ($true) {
+            $Cycle += 1
+            $StartedAt = Get-Date -Format o
+            Write-Host "第 $Cycle 轮扫描开始：$StartedAt"
+            $Arguments = @(
+                '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+                'process-new-turns', '--pg-config', $PgConfigPath, '--config', $ConfigPath,
+                '--limit', $Limit, '--settle-ms', $SettleMilliseconds,
+                '--memory-limit', $MemoryLimit, '--max-iterations', $MaxIterations
+            )
+            if ($PSBoundParameters.ContainsKey('TopicLimit')) {
+                $Arguments += @('--topic-limit', $TopicLimit)
+            }
+            if ($DryRun) {
+                $Arguments += '--dry-run'
+            }
+            if ($Reprocess) {
+                $Arguments += '--reprocess'
+            }
+            if ($AgentLogDirectory) {
+                $Arguments += @('--log-dir', $AgentLogDirectory)
+            }
+            $ProcessOutput = & $PythonExecutable @Arguments 2>&1
+            $ProcessExitCode = $LASTEXITCODE
+            if ($ProcessExitCode -ne 0) {
+                Write-Warning "第 $Cycle 轮处理失败，退出码 $ProcessExitCode；服务会继续下一轮。"
+                $ProcessOutput | ForEach-Object { Write-Warning $_ }
+            }
+            else {
+                try {
+                    $ProcessReport = ($ProcessOutput -join "`n") | ConvertFrom-Json
+                    if ($AgentLogDirectory) {
+                        New-Item -ItemType Directory -Force -Path $AgentLogDirectory | Out-Null
+                        $CycleStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+                        $CycleReportPath = Join-Path $AgentLogDirectory ("poll-cycle-{0}-{1}.json" -f $CycleStamp, $Cycle)
+                        $LatestReportPath = Join-Path $AgentLogDirectory 'latest-process-new-turns.json'
+                        ($ProcessOutput -join "`n") | Set-Content -LiteralPath $CycleReportPath -Encoding UTF8
+                        ($ProcessOutput -join "`n") | Set-Content -LiteralPath $LatestReportPath -Encoding UTF8
+                    }
+                    $ActionCounts = @{}
+                    foreach ($Turn in @($ProcessReport.turns)) {
+                        if ($Turn.action_counts) {
+                            foreach ($Property in $Turn.action_counts.PSObject.Properties) {
+                                if (-not $ActionCounts.ContainsKey($Property.Name)) {
+                                    $ActionCounts[$Property.Name] = 0
+                                }
+                                $ActionCounts[$Property.Name] += [int]$Property.Value
+                            }
+                        }
+                    }
+                    $ActionSummary = if ($ActionCounts.Count -gt 0) {
+                        ($ActionCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+                    }
+                    else {
+                        'none'
+                    }
+                    Write-Host ("第 {0} 轮结果：新turn={1} 已完成={2} 失败={3} 已跳过={4} 记忆动作={5}" -f `
+                        $Cycle, $ProcessReport.pending_count, $ProcessReport.completed_count, $ProcessReport.failed_count, $ProcessReport.skipped_count, $ActionSummary)
+                    if ([int]$ProcessReport.pending_count -gt 0) {
+                        Write-Host ("第 {0} 轮详细流转：" -f $Cycle)
+                        foreach ($Turn in @($ProcessReport.turns)) {
+                            Write-MemoryLabReactSummary -Turn $Turn -LogDirectory $AgentLogDirectory
+                        }
+                        if ($AgentLogDirectory) {
+                            Write-Host ("本轮详细日志目录：{0}" -f (Resolve-Path -LiteralPath $AgentLogDirectory).Path)
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "第 $Cycle 轮已完成，但输出解析失败；下面打印原始输出。"
+                    $ProcessOutput | ForEach-Object { Write-Host $_ }
+                }
+            }
+            if ($AutoTraceReport) {
+                $TraceOutputDirectory = Join-Path $ReportDirectory 'cp-memory-trace'
+                $TraceArguments = @(
+                    '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+                    'trace-report', '--pg-config', $PgConfigPath,
+                    '--output-dir', $TraceOutputDirectory,
+                    '--limit', $Limit, '--max-chars', $MaxChars
+                )
+                if ($AgentLogDirectory) {
+                    $TraceArguments += @('--log-dir', $AgentLogDirectory)
+                }
+                $TraceOutput = & $PythonExecutable @TraceArguments 2>&1
+                $TraceExitCode = $LASTEXITCODE
+                if ($TraceExitCode -ne 0) {
+                    Write-Warning "trace-report failed with exit code $TraceExitCode; continuing next cycle."
+                    $TraceOutput | ForEach-Object { Write-Warning $_ }
+                }
+                else {
+                    try {
+                        $TraceReport = ($TraceOutput -join "`n") | ConvertFrom-Json
+                        $TraceHtml = if ($TraceReport.files.html) { $TraceReport.files.html } else { Join-Path $TraceOutputDirectory 'latest-trace.html' }
+                        Write-Host "可视化报告已刷新：$TraceHtml"
+                    }
+                    catch {
+                        Write-Host "可视化报告已刷新：$(Join-Path $TraceOutputDirectory 'latest-trace.html')"
+                    }
+                }
+            }
+            if ($MaxCycles -gt 0 -and $Cycle -ge $MaxCycles) {
+                Write-Host "已达到 MaxCycles=$MaxCycles，轮询停止。"
+                break
+            }
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    }
+    elseif ($Command -eq 'trace-report') {
+        $Arguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            'trace-report', '--pg-config', $PgConfigPath,
+            '--output-dir', (Join-Path $ReportDirectory 'cp-memory-trace'),
+            '--limit', $Limit, '--max-chars', $MaxChars
+        )
+        if ($AgentLogDirectory) {
+            $Arguments += @('--log-dir', $AgentLogDirectory)
+        }
+        & $PythonExecutable @Arguments
+    }
+    elseif ($Command -eq 'eval-memory') {
+        $EvalArguments = @(
+            '-m', 'memory_lab', '--source-db', $SourceDatabase, '--lab-db', $LabDatabase,
+            'eval-memory', '--eval-set', $EvalSetPath, '--pg-config', $PgConfigPath,
+            '--config', $ConfigPath, '--report-dir', (Join-Path $ReportDirectory 'eval'),
+            '--run-name', $RunName, '--mode', $EvalMode, '--limit', $Limit, '--max-iterations', $MaxIterations,
+            '--memory-limit', $MemoryLimit, '--topic-limit', $TopicLimit
+        )
+        if ($DryRunPlan) {
+            $EvalArguments += '--dry-run-plan'
+        }
+        if ($DryRun) {
+            $EvalArguments += '--dry-run'
+        }
+        if ($ExistingReportDirectory) {
+            $EvalArguments += @('--existing-report-dir', $ExistingReportDirectory)
+        }
+        & $PythonExecutable @EvalArguments
     }
     elseif ($Command -eq 'review') {
         if (-not $ProposalId -or -not $ReviewOutcome -or -not $Reviewer) {

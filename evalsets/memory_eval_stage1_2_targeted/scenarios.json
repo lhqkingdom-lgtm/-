@@ -1,0 +1,5 @@
+{
+  "evalset_id": "memory_eval_stage1_2_targeted",
+  "description": "阶段1.2 编译候选准入规则的正反例定向回归；不包含多 turn 闭环。",
+  "scenarios": []
+}

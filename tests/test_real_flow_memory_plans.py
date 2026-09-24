@@ -139,7 +139,7 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                     "topic_id": "topic_c51_build",
                     "memory": {
                         "stable_key": "engineering.c51.compile.function_prototype_before_call",
-                        "memory_type": "build_failure_pattern",
+                        "memory_type": "compile_failure_experience",
                         "summary": "Keil C51 中函数原型缺失可能导致编译或链接异常，修复后需重新编译验证。",
                         "content": "症状：Keil C51 编译失败并指向函数调用/声明不一致。原因：C51 对函数原型、存储类型和调用约定更敏感。解决：在调用前补齐头文件声明或函数原型，保持定义与声明一致。验证：重新编译通过后再沉淀。",
                         "scope": {"level": "domain", "domain": "embedded"},
@@ -172,7 +172,7 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                     "topic_id": "topic_embedded_runtime",
                     "memory": {
                         "stable_key": "embedded.runtime.stub_constant_input_state_machine_stuck",
-                        "memory_type": "runtime_diagnosis_pattern",
+                        "memory_type": "runtime_failure_experience",
                         "summary": "硬件抽象桩函数返回固定值会让主流程跑通但输入恒定，导致下游状态机停在固定状态。",
                         "content": "现象：风扇不转或调节无变化。触发条件：adc_sample 等硬件抽象函数直接返回固定常量。原因：主流程、滤波、阈值判断都在运行，但输入永远不变。解决：替换为真实寄存器/外设读取，并结合数据手册确认 ADC 通道、引脚和转换流程。验证：用户确认替换后现象正常再沉淀。",
                         "scope": {"level": "domain", "domain": "embedded"},
@@ -230,7 +230,7 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                     "topic_id": "topic_embedded_runtime",
                     "memory": {
                         "stable_key": stable_key,
-                        "memory_type": "runtime_diagnosis_pattern",
+                        "memory_type": "runtime_failure_experience",
                         "summary": "风扇不转也可能由 PWM 通道或引脚映射错误导致，不能只套用 ADC 桩函数根因。",
                         "content": "现象：风扇不转。原因：PWM 通道或引脚配置与实际接线不一致，导致占空比逻辑正常但物理引脚无有效输出。解决：核对原理图、芯片复用功能和工程 IO 配置，修正 PWM 通道/引脚映射。验证：烧录后用户确认风扇可按占空比变化。",
                         "scope": {"level": "domain", "domain": "embedded"},

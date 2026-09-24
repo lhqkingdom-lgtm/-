@@ -15,6 +15,7 @@ data/
 pgdata/
 exports/
 pg-memory-lab.local.json
+pg-memory-lab.test-*.json
 *.db
 *.db-shm
 *.db-wal

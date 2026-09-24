@@ -29,6 +29,7 @@ from .memory_agent import (
     build_memory_agent_input,
 )
 from .memory_changes import (
+    ALLOWED_MEMORY_TYPES,
     MEMORY_CHANGES_SCHEMA_VERSION,
     MemoryChangesValidationError,
     commit_memory_changes,
@@ -113,51 +114,52 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 二、长期记忆沉淀标准
 ====================
 
-长期记忆只保存“以后能减少重复问答、减少错误、减少返工”的信息。
+长期记忆只保存以后能减少重复问答、错误或返工的信息，memory_type 只能是：
+- user_preference：用户明确表达的协作习惯、长期规则或关键纠正。
+- compile_failure_experience：编译、链接、构建或烧录前失败的症状、机制、修复与验证。
+- runtime_failure_experience：烧录/运行现象、代码或硬件配置根因、解决方法与验证。
+没有这三类价值时输出 noop；禁止发明近义类型。
 
-优先沉淀三类：
+不要按整轮主题或是否出现具体参数直接决定存不存。先逐项完成：
+1. 事实提取：分别检查 user、assistant、tool 中的独立结论；不能用用户问题或整轮主题的价值覆盖其他证据，不把推测写成事实。
+2. 机制抽象：去掉项目名、路径、具体数值后，写出仍成立的因果机制或协作规则。
+3. 复用判断：抽象结果必须能指导未来相似任务；否则只是当前项目事实。
+4. 证据准入：检查对应 memory_type 所需的证据和验证状态。
 
-1. 用户交互习惯 / 协作偏好
-- 用户希望怎样推进、怎样测试、怎样展示。
-- 用户明确纠正过的长期规则。
-- 用户反复表达的不喜欢的工作方式。
-例：用户不喜欢一组一组慢慢测，希望多窗口连续交互。
+沉淀前必须先过三道门槛：
 
-2. 编译成功/失败经验
-- 错误症状、触发条件、根因、有效修复、验证方式。
-- 工具链限制、芯片/SDK/编译器适配经验。
-例：Keil C51 对现代 C 写法支持有限，修复必须符合 C51 语法和存储模型。
+1. 长期价值门槛
+- 只能回答“当前项目这次怎么做”的信息默认 noop。
+- 具体寄存器、通道、工具版本或配置值本身不是记忆；但由工具授权等级、能力上限、工程识别或实际编译范围造成的可重复失败、结果失真及排查方法，属于可复用的工具链机制，不能仅因发生在当前环境而按项目参数过滤。
 
-3. 用户反馈运行现象 → 定位原因 → 解决方法
-- 用户反馈的板上现象。
-- 排查路径。
-- 代码层根因。
-- 修复方法。
-- 用户/编译/运行验证。
-例：编译烧录通过但风扇不随温度变化，最终定位为 adc_sample 固定返回常量。
+2. 类型必备证据门槛
+- user_preference：必须来自用户明确表达。未来取向、跨 turn 重复，或明确建立会持续影响后续迭代的协作机制是强证据；一次表达若包含可复用的“触发条件—做法—目的”，可低置信度沉淀。单次对象明确的临时命令仍然 noop。
+- compile_failure_experience：有明确失败/限制，且有证据支持的原因或可执行修复方向，即达到候选准入门槛；尚未完成修复验证时，降低 confidence 并明确“待验证”，不能仅因未验证而 noop。“编译通过”本身不是长期经验，除非它验证了某个失败修复。
+- runtime_failure_experience：必须有用户反馈或工具确认的运行现象，以及定位原因和解决方向；只有现象时 request_more_evidence 或 noop。
+- 已有“用户现象 + 代码层根因 + 修复方向/已修改 + 编译验证”但未板上复测时，可以沉淀为候选运行经验，content 必须写“需板上确认/待用户运行验证”。
 
-不要沉淀：
-- 当前项目一次性需求参数，例如具体阈值、PWM 频率、功能选择。
-- 本次生成了哪些函数、变量名、文件改动清单。
-- 可从代码/Git/需求文档稳定恢复的信息。
-- 未验证猜测。
-- 完整日志、完整工具输出。
-- 敏感信息。
+3. 当前项目参数过滤门槛
+- 阈值、IO、PWM、定时、路径、产品名、功能开关、文件清单和一次性交付要求默认只作证据背景。
+- 若去掉这些细节后不能留下独立、可执行的机制或协作规则，输出 noop。
+- 具体细节只能限定适用范围，不能成为 summary 或 stable_key 的主体。
 
-判断口诀：
-需求文档存“当前项目要做什么”；
-长期记忆存“以后类似任务怎么少错、少问、少返工”。
+需求文档存当前项目规格；长期记忆存跨相似任务仍有用的规则。没有证据支持的猜测应 noop；有证据支持但尚未完成验证的原因或修复方向可作为低置信度候选，并明确“待验证”。不要沉淀完整日志、完整工具输出或敏感信息。
 
-用户偏好与项目参数的边界：
-- 项目参数通常回答“这个项目最终做什么”，例如温度阈值、PWM 频率、NTC 规格、是否启用 TACH。
-- 用户偏好/工程流程通常回答“以后类似任务应该怎么做”，例如既有工程二次开发时是否重建工程结构、是否修改启动文件、是否优先保持工具链兼容写法、交付时是否说明人工确认项。
-- 即使流程性偏好出现在某个具体项目中，只要能复用于未来相似任务，就应该沉淀为长期记忆，并用 scope 或 content 中的适用场景限制范围。
-- 不要因为流程性偏好只出现一次就直接 noop；明确命令型流程偏好可以低置信度沉淀。
+单轮多条记忆自检：
+- 一轮 turn 可以产生多条 memory，但每条必须有不同的核心结论、根因或用户偏好。
+- 如果只是同一根因的多个表现，合成一条。
+- 如果只是一个大问题的排查过程，不要把每个中间步骤都拆成 memory。
+- 不要把“症状、原因、修复、验证”拆成多条 memory；它们应组成同一条经验链。
+- 同一轮里多个运行现象如果来自同一个模块、同一状态机、同一硬件配置误解或同一类初始化问题，默认合成一条“故障家族”记忆。
+- 只有当未来检索入口明显不同、根因不同、修复方法不同，且合并后会让记忆难以复用时，才拆成多条 memory。
+- 如果同一轮要新增超过 2 条 memory，必须在总 reason 中逐条说明它们为什么有不同的未来检索入口和不同根因；否则优先合并或 noop 低价值项。
 
-对照案例：
-- “本项目 PWM 使用 25kHz，温度阈值为 35/50/70” → noop，因为这是当前项目需求参数。
-- “在现有 Keil C51 工程上生成代码，不要重建工程结构，不要改 STARTUP.A51，优先保持 C51 兼容写法” → create_memory，类型为 workflow/user_preference，适用场景写明“已有 Keil C51 工程二次开发”。
-- “生成后说明模块划分和需要人工确认的硬件资源” → create_memory 或 merge 到同类用户偏好，因为这是可复用协作流程。
+每条 memory 的质量底线：
+- summary 必须表达可复用规则，而不是当前项目现象标题。
+- content 至少包含：适用范围/触发条件、现象或失败症状、根因、处理原则或修复方向、验证状态。
+- 如果缺少根因或修复方向，只能作为 candidate，并明确“待验证/需补证据”；不能写成已验证经验。
+- 不要只写“某项目出现了某问题”；要写成“什么条件下容易出现什么问题，为什么，之后怎么避免/排查”。
+- 具体引脚、阈值、寄存器值、路径、文件名只能作为例子或证据背景，不能成为 summary 的主体，也不能作为 stable_key 的主要语义。
 
 ====================
 三、动作选择标准
@@ -172,7 +174,8 @@ create_memory：新增记忆
 - 只有确实需要创建全新主题时才携带 topic 对象；create_memory 不能修改已有 topic。
 - stable_key 和 topic_key 是创建时的路由标识，本阶段不可修改；不要为了“修正 key 语义”而 update_memory 或 update_topic。
 - 如果新信息虽然属于同一个大主题，但形成了新的独立规则，应 create_memory，不要为了减少条目数强行 merge 到宽泛旧 memory。
-- 用户协作习惯、工程流程、编译失败经验、运行现象经验应尽量保持原子化；一轮 turn 同时包含多类长期价值时，可以拆成多条 memory。
+- 原子化指“一条 memory 一个可复用核心结论”，不是“一条现象一条 memory”。同一故障链条中的症状、根因、修复、验证必须放在同一条 memory。
+- 一轮 turn 同时包含用户偏好、编译失败、运行现象三类长期价值时，可以拆成多条；但同一类别内默认先合并同根因/同修复策略的内容。
 例：第一次发现“硬件输入桩函数固定返回值会导致主流程跑通但输入恒定，下游状态机无响应”。
 
 merge_memory：合并证据
@@ -292,11 +295,12 @@ request_more_evidence：证据不足
 - “用户反馈现象”只能证明现象存在。
 - “助手定位/推理”只能证明候选根因，除非有工具结果或用户确认支撑。
 - “用户确认修复后正常 / 编译通过 / 烧录后验证正常 / 工具结果 verified=true”才算可写为已验证。
+- 对运行现象来说，编译通过只能证明修复代码语法/链接无误，不能证明板上现象已修好；但“用户现象 + 代码根因 + 修复 + 编译通过”可以作为待板上确认的候选经验沉淀。
 - 未验证证据合并到已有工程经验时，应保持或小幅调整 confidence；不要因为描述详细就自动提高置信度。
 - 同一条 memory 可以同时包含“已验证结论”和“待验证新增线索”，但必须标清每个结论对应的证据来源，避免把旧验证状态投射到新现象上。
-- 编译失败类 memory 应沉淀“症状 → 原因 → 有效修复 → 验证方式”，不要沉淀完整编译日志、完整 diff、临时尝试或一次性路径。
+- 编译失败类 memory 的完整目标结构是“症状 → 原因 → 有效修复 → 验证方式”；候选阶段可以缺少验证结果，但必须明确“待验证”。不要沉淀完整编译日志、完整 diff、临时尝试或一次性路径。
 
-如果 core/candidate 摘要不足以证明症状、根因、修复、验证，应请求 expand_pointer。
+如果 core/candidate 摘要不足以判断是否达到上述准入门槛，或无法确定验证状态，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
 如果可能要修改已有 memory，但目标 memory_id 不在 modifiable_memory_ids，必须先请求 read_memory_detail 或 read_topic_detail。
 如果你认为“理想动作”是 merge_memory / update_memory / mark_conflict / record_conflict_decision，但当前还没有修改权限，不能因此输出 noop；必须先请求只读工具补足权限和详情。
@@ -370,12 +374,12 @@ create_memory 示例：
     "topic_key": "embedded_stub_input_failure",
     "title": "嵌入式硬件输入桩导致假数据",
     "summary": "硬件输入函数返回固定值会让主流程跑通但输入恒定，导致下游状态机无响应。",
-    "topic_type": "engineering_failure_pattern",
+    "topic_type": "runtime_failure_experience",
     "scope": {"level": "domain", "domain": "embedded"}
   },
   "memory": {
     "stable_key": "embedded.stub_input.constant_value_downstream_stuck",
-    "memory_type": "runtime_failure_pattern",
+    "memory_type": "runtime_failure_experience",
     "summary": "硬件输入桩函数固定返回常量会导致下游控制逻辑一直处理假数据。",
     "content": "症状：编译烧录通过，但外设不随真实输入变化。触发条件：采样/驱动函数未读取真实硬件，而是返回固定常量。根因：主流程虽然执行，但输入数据恒定。解决：替换桩实现，按数据手册或现有驱动读取真实寄存器/外设。验证：改变真实输入后，下游状态、占空比或报警应随之变化。",
     "scope": {"level": "domain", "domain": "embedded"},
@@ -549,6 +553,7 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 - merge_memory/merge_existing_memories/update_memory/retire_memory/move_memory_topic/mark_conflict 必须使用 target_memory_id，不能使用 memory_id。
 - merge_memory/merge_existing_memories/update_memory/retire_memory/move_memory_topic/mark_conflict 不能修改 topic；如需修改主题标题/概要，另行输出 update_topic。
 - merge_memory/merge_existing_memories/update_memory/mark_conflict 必须包含 memory 对象，memory 里必须包含 summary、content、confidence。
+- create_memory.memory.memory_type 只能是 user_preference、compile_failure_experience、runtime_failure_experience；旧类型或近义类型必须改成这三类之一，不能发明新类型。
 - merge_existing_memories 必须包含 source_memory_ids；source 不能包含 target。
 - retire_memory 不能包含 memory 对象；如目标 memory 有 active conflict，必须包含 conflict_disposition。
 - move_memory_topic 不能包含 memory 或 topic 对象，必须包含 from_topic_id 和 to_topic_id。
@@ -780,6 +785,10 @@ def validate_react_decision(
         if tool == "search_related_memories":
             if not _non_empty_string(request.get("query")):
                 errors.append(f"{prefix}.query must be a non-empty string")
+            if "memory_type" in request and request.get("memory_type") not in ALLOWED_MEMORY_TYPES:
+                errors.append(
+                    f"{prefix}.memory_type must be one of {', '.join(sorted(ALLOWED_MEMORY_TYPES))}"
+                )
             if "limit" in request:
                 try:
                     limit_value = int(request.get("limit"))
@@ -1139,18 +1148,18 @@ def _react_payload(
         "memory_policy": {
             "role": "长期记忆整理 Agent，不是普通总结器",
             "long_term_value_rule": "只保存以后能减少重复问答、减少错误、减少返工的信息",
+            "admission_order": [
+                "提取有证据支持的事实，不按整轮主题一刀切。",
+                "去掉项目名、路径和具体数值，抽象因果机制或协作规则。",
+                "抽象后仍能指导相似任务才有长期价值。",
+                "按 memory_type 检查必备证据和验证状态。",
+            ],
             "primary_targets": [
                 "用户交互习惯和协作偏好",
                 "编译成功/失败经验",
                 "用户反馈运行现象后定位出的原因和解决方法",
             ],
-            "do_not_store": [
-                "当前项目一次性参数",
-                "代码/Git/需求文档可稳定恢复的信息",
-                "未验证猜测",
-                "完整日志和完整工具输出",
-                "敏感信息",
-            ],
+            "reject_if": "去掉当前项目细节后不能留下独立、可执行的机制或协作规则。",
         },
         "memory_access_state": {
             "summary_only_memory_ids": sorted(summary_only_memory_ids),
@@ -1182,7 +1191,7 @@ def _react_payload(
                 "tool": "search_related_memories",
                 "args": {
                     "query": "必填；来自当前 turn 证据或已有索引的真实关键词",
-                    "memory_type": "可选；限制 memory_type",
+                    "memory_type": "可选；只能是 user_preference / compile_failure_experience / runtime_failure_experience",
                     "domain": "可选；限制领域 scope",
                     "project_key": "可选；限制项目 scope",
                     "limit": "可选；1-20，默认 8",
@@ -1296,6 +1305,7 @@ def _validate_or_repair_react(
                 "required_schema": payload["required_output_schema"],
                 "current_turn_id": turn_id,
                 "strict_field_rules": {
+                    "allowed_create_memory_types": sorted(ALLOWED_MEMORY_TYPES),
                     "noop": ["action", "reason", "evidence_refs"],
                     "request_more_evidence": ["action", "reason", "requests", "evidence_refs"],
                     "merge_memory": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],

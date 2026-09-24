@@ -16,6 +16,13 @@ from .cycle import run_memory_cycle, watch_memory_cycles
 from .config import DEFAULT_CONFIG
 from .consolidation import record_proposal_review, rollback_memory, run_consolidation
 from .engineering_memory import summarize_engineering_candidates
+from .eval_memory import (
+    DEFAULT_EVALSET,
+    DEFAULT_EVAL_REPORT_DIR,
+    run_eval_memory_plan,
+    run_eval_memory_review_existing,
+    run_eval_memory_replay,
+)
 from .episodes import run_episode_extraction
 from .evidence_pool import DeepSeekPhaseRouter, run_evidence_pool_report
 from .formal_markdown import publish_formal_memory, recall_formal_memory
@@ -64,6 +71,7 @@ from .topics import (
     formal_semantic_hash,
     topic_catalog,
 )
+from .trace_report import DEFAULT_TRACE_REPORT_DIR, generate_cp_memory_trace_report
 from .turns import run_turn_scan
 from .unified_cycle import run_unified_cycle
 from .unified_model import (
@@ -579,6 +587,42 @@ def build_parser() -> argparse.ArgumentParser:
     process_new.add_argument("--dry-run", action="store_true")
     process_new.add_argument("--reprocess", action="store_true")
     process_new.add_argument("--log-dir", type=Path)
+    trace_report = subparsers.add_parser(
+        "trace-report",
+        help="Generate human-readable CP turn -> evidence -> ReAct -> memory trace report",
+    )
+    trace_report.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    trace_report.add_argument("--log-dir", type=Path)
+    trace_report.add_argument("--output-dir", type=Path, default=DEFAULT_TRACE_REPORT_DIR)
+    trace_report.add_argument("--limit", type=int, default=20)
+    trace_report.add_argument("--max-chars", type=int, default=900)
+    eval_memory = subparsers.add_parser(
+        "eval-memory",
+        help="Validate and run offline memory-quality evaluation sets",
+    )
+    eval_memory.add_argument("--eval-set", type=Path, default=DEFAULT_EVALSET)
+    eval_memory.add_argument(
+        "--mode",
+        choices=[
+            "plan",
+            "single-batch",
+            "single-isolated",
+            "scenario-sequential",
+            "review-existing",
+        ],
+        default="single-batch",
+    )
+    eval_memory.add_argument("--dry-run-plan", action="store_true")
+    eval_memory.add_argument("--pg-config", type=Path, default=DEFAULT_PG_CONFIG)
+    eval_memory.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    eval_memory.add_argument("--report-dir", type=Path, default=DEFAULT_EVAL_REPORT_DIR)
+    eval_memory.add_argument("--run-name", default="single-batch")
+    eval_memory.add_argument("--limit", type=int, default=3)
+    eval_memory.add_argument("--max-iterations", type=int, default=3)
+    eval_memory.add_argument("--memory-limit", type=int, default=80)
+    eval_memory.add_argument("--topic-limit", type=int, default=200)
+    eval_memory.add_argument("--dry-run", action="store_true")
+    eval_memory.add_argument("--existing-report-dir", type=Path)
     return parser
 
 
@@ -988,6 +1032,48 @@ def main(argv: list[str] | None = None) -> int:
                 reprocess=args.reprocess,
                 log_dir=args.log_dir if args.log_dir else None,
             )
+        elif args.command == "trace-report":
+            report = generate_cp_memory_trace_report(
+                source_database=args.source_db,
+                lab_database=args.lab_db,
+                pg_config_path=args.pg_config,
+                log_dir=args.log_dir if args.log_dir else None,
+                output_dir=args.output_dir,
+                limit=args.limit,
+                max_chars=args.max_chars,
+            )
+        elif args.command == "eval-memory":
+            eval_mode = "plan" if args.dry_run_plan else args.mode
+            if eval_mode == "plan":
+                report = run_eval_memory_plan(
+                    evalset_path=args.eval_set,
+                    lab_database=args.lab_db,
+                    dry_run_plan=True,
+                )
+            elif eval_mode == "review-existing":
+                if args.existing_report_dir is None:
+                    raise ValueError(
+                        "eval-memory review-existing requires --existing-report-dir"
+                    )
+                report = run_eval_memory_review_existing(
+                    evalset_path=args.eval_set,
+                    existing_report_directory=args.existing_report_dir,
+                )
+            else:
+                report = run_eval_memory_replay(
+                    evalset_path=args.eval_set,
+                    lab_database=args.lab_db,
+                    pg_config_path=args.pg_config,
+                    config_path=args.config,
+                    report_directory=args.report_dir,
+                    run_name=args.run_name,
+                    mode=eval_mode,
+                    limit=args.limit,
+                    dry_run=args.dry_run,
+                    max_iterations=args.max_iterations,
+                    memory_limit=args.memory_limit,
+                    topic_limit=args.topic_limit,
+                )
         elif args.command in {"baseline", "ingest"}:
             report = run_ingestion(args.source_db, args.lab_db, args.command)
         elif args.command == "historical-backfill":

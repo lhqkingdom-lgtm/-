@@ -260,7 +260,7 @@ class MemoryChangesValidationTests(unittest.TestCase):
                         },
                         "memory": {
                             "stable_key": "general.user_preference.reply_language.new",
-                            "memory_type": "collaboration_preference",
+                            "memory_type": "user_preference",
                             "summary": "用户希望默认英文回复。",
                             "content": "用户希望默认英文回复。",
                             "scope": {"level": "global"},
@@ -271,6 +271,49 @@ class MemoryChangesValidationTests(unittest.TestCase):
                 ],
             },
             "topic.topic_key already exists",
+        )
+
+    def test_create_memory_accepts_allowed_memory_type(self) -> None:
+        assert_valid(
+            self,
+            base_proposal(
+                {
+                    "action": "create_memory",
+                    "reason": "新增用户长期偏好。",
+                    "topic_id": "topic_language",
+                    "memory": {
+                        "stable_key": "general.user_preference.reply_language.english",
+                        "memory_type": "user_preference",
+                        "summary": "用户希望默认英文回复。",
+                        "content": "用户希望默认英文回复。",
+                        "scope": {"level": "global"},
+                        "confidence": 0.9,
+                    },
+                    "evidence_refs": evidence_refs(),
+                }
+            ),
+        )
+
+    def test_create_memory_rejects_legacy_memory_type(self) -> None:
+        assert_validation_errors(
+            self,
+            base_proposal(
+                {
+                    "action": "create_memory",
+                    "reason": "旧类型不应继续写入。",
+                    "topic_id": "topic_language",
+                    "memory": {
+                        "stable_key": "general.user_preference.reply_language.legacy_type",
+                        "memory_type": "workflow_rule",
+                        "summary": "用户希望默认英文回复。",
+                        "content": "用户希望默认英文回复。",
+                        "scope": {"level": "global"},
+                        "confidence": 0.9,
+                    },
+                    "evidence_refs": evidence_refs(),
+                }
+            ),
+            "memory.memory_type must be one of",
         )
 
     def test_record_conflict_decision_accepts_complete_payload(self) -> None:
@@ -664,7 +707,7 @@ class MemoryChangesValidationTests(unittest.TestCase):
                     "topic_id": "topic_language",
                     "memory": {
                         "stable_key": "general.user_preference.reply_language.english",
-                        "memory_type": "collaboration_preference",
+                        "memory_type": "user_preference",
                         "summary": "用户希望默认英文回复。",
                         "content": "用户希望默认英文回复。",
                         "scope": {"level": "global"},
@@ -711,7 +754,7 @@ class MemoryChangesValidationTests(unittest.TestCase):
                     "topic_id": "topic_language",
                     "memory": {
                         "stable_key": "general.user_preference.reply_language.english",
-                        "memory_type": "collaboration_preference",
+                        "memory_type": "user_preference",
                         "summary": "用户希望默认英文回复。",
                         "content": "用户希望默认英文回复。",
                         "scope": {"level": "global"},
@@ -824,7 +867,7 @@ class MemoryChangesCommitIdempotencyTests(unittest.TestCase):
                 },
                 "memory": {
                     "stable_key": "user.preference.answer_style.concise",
-                    "memory_type": "collaboration_preference",
+                    "memory_type": "user_preference",
                     "summary": "用户希望回答更简洁。",
                     "content": "用户希望回答更简洁，优先给结论。",
                     "scope": {"level": "global"},
@@ -1628,7 +1671,7 @@ class MemoryChangesCommitIdempotencyTests(unittest.TestCase):
                     },
                     "memory": {
                         "stable_key": "general.user_preference.reply_language.new",
-                        "memory_type": "collaboration_preference",
+                        "memory_type": "user_preference",
                         "summary": "用户希望默认英文回复。",
                         "content": "用户希望默认英文回复。",
                         "scope": {"level": "global"},
@@ -1668,7 +1711,5 @@ class MemoryChangesCommitIdempotencyTests(unittest.TestCase):
             result = commit_memory_changes(proposal, pg_config_path=Path("unused.json"))
         self.assertFalse(result["ok"])
         self.assertIn("EVIDENCE_NOT_IN_TURN", result["rejected"][0]["error_codes"])
-
-
 if __name__ == "__main__":
     unittest.main()

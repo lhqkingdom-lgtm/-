@@ -61,7 +61,8 @@ class MemoryReactPromptTests(unittest.TestCase):
     def test_prompt_documents_atomic_create_memory_policy(self) -> None:
         self.assertIn("新的独立规则", REACT_SYSTEM_PROMPT)
         self.assertIn("不要为了减少条目数强行 merge 到宽泛旧 memory", REACT_SYSTEM_PROMPT)
-        self.assertIn("用户协作习惯、工程流程、编译失败经验、运行现象经验应尽量保持原子化", REACT_SYSTEM_PROMPT)
+        self.assertIn("原子化指“一条 memory 一个可复用核心结论”", REACT_SYSTEM_PROMPT)
+        self.assertIn("同一故障链条中的症状、根因、修复、验证必须放在同一条 memory", REACT_SYSTEM_PROMPT)
 
     def test_prompt_documents_verification_status_policy(self) -> None:
         self.assertIn("验证状态写法", REACT_SYSTEM_PROMPT)
@@ -71,6 +72,40 @@ class MemoryReactPromptTests(unittest.TestCase):
         self.assertIn("不要因为描述详细就自动提高置信度", REACT_SYSTEM_PROMPT)
         self.assertIn("不要写成“本轮已验证”", REACT_SYSTEM_PROMPT)
         self.assertIn("避免把旧验证状态投射到新现象上", REACT_SYSTEM_PROMPT)
+
+    def test_prompt_documents_allowed_memory_types(self) -> None:
+        self.assertIn("memory_type 只能是", REACT_SYSTEM_PROMPT)
+        self.assertIn("user_preference", REACT_SYSTEM_PROMPT)
+        self.assertIn("compile_failure_experience", REACT_SYSTEM_PROMPT)
+        self.assertIn("runtime_failure_experience", REACT_SYSTEM_PROMPT)
+        self.assertIn("禁止发明近义类型", REACT_SYSTEM_PROMPT)
+
+    def test_prompt_documents_quality_admission_gates(self) -> None:
+        self.assertIn("沉淀前必须先过三道门槛", REACT_SYSTEM_PROMPT)
+        self.assertIn("长期价值门槛", REACT_SYSTEM_PROMPT)
+        self.assertIn("实际编译范围造成的可重复失败、结果失真", REACT_SYSTEM_PROMPT)
+        self.assertIn("不能仅因发生在当前环境而按项目参数过滤", REACT_SYSTEM_PROMPT)
+        self.assertIn("类型必备证据门槛", REACT_SYSTEM_PROMPT)
+        self.assertIn("当前项目参数过滤门槛", REACT_SYSTEM_PROMPT)
+        self.assertIn("事实提取", REACT_SYSTEM_PROMPT)
+        self.assertIn("机制抽象", REACT_SYSTEM_PROMPT)
+        self.assertIn("复用判断", REACT_SYSTEM_PROMPT)
+        self.assertIn("单次对象明确的临时命令仍然 noop", REACT_SYSTEM_PROMPT)
+        self.assertIn("不能仅因未验证而 noop", REACT_SYSTEM_PROMPT)
+        self.assertIn("编译通过”本身不是长期经验", REACT_SYSTEM_PROMPT)
+        self.assertIn("候选阶段可以缺少验证结果", REACT_SYSTEM_PROMPT)
+        self.assertIn("有证据支持但尚未完成验证", REACT_SYSTEM_PROMPT)
+        self.assertIn("可以沉淀为候选运行经验", REACT_SYSTEM_PROMPT)
+        self.assertIn("需板上确认/待用户运行验证", REACT_SYSTEM_PROMPT)
+        self.assertIn("阈值、IO、PWM、定时", REACT_SYSTEM_PROMPT)
+
+    def test_prompt_documents_multi_memory_granularity_gate(self) -> None:
+        self.assertIn("单轮多条记忆自检", REACT_SYSTEM_PROMPT)
+        self.assertIn("每条必须有不同的核心结论", REACT_SYSTEM_PROMPT)
+        self.assertIn("同一根因的多个表现，合成一条", REACT_SYSTEM_PROMPT)
+        self.assertIn("不要把“症状、原因、修复、验证”拆成多条 memory", REACT_SYSTEM_PROMPT)
+        self.assertIn("如果同一轮要新增超过 2 条 memory", REACT_SYSTEM_PROMPT)
+        self.assertIn("不同的未来检索入口和不同根因", REACT_SYSTEM_PROMPT)
 
     def test_validate_accepts_search_related_memories_request(self) -> None:
         decision = {
@@ -82,7 +117,7 @@ class MemoryReactPromptTests(unittest.TestCase):
                     "tool": "search_related_memories",
                     "query": "Keil C51 编译错误",
                     "reason": "查找是否已有同类编译失败经验。",
-                    "memory_type": "compile_failure_pattern",
+                    "memory_type": "compile_failure_experience",
                     "domain": "embedded",
                     "limit": 5,
                 }
@@ -102,6 +137,35 @@ class MemoryReactPromptTests(unittest.TestCase):
         )
 
         self.assertEqual(validated["tool_requests"][0]["tool"], "search_related_memories")
+
+    def test_validate_rejects_search_with_legacy_memory_type(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "tool_requests",
+            "reason": "需要搜索旧记忆。",
+            "tool_requests": [
+                {
+                    "tool": "search_related_memories",
+                    "query": "Keil C51 编译错误",
+                    "reason": "旧类型过滤不应继续使用。",
+                    "memory_type": "compile_failure_pattern",
+                }
+            ],
+            "changes": [],
+        }
+
+        with self.assertRaises(Exception) as raised:
+            validate_react_decision(
+                decision,
+                turn_id="turn_1",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": set(),
+                    "pointer_ids": set(),
+                },
+                pg_config_path=Path("unused.json"),
+            )
+        self.assertIn("memory_type must be one of", str(raised.exception))
 
     def test_validate_rejects_search_with_bad_limit(self) -> None:
         decision = {
