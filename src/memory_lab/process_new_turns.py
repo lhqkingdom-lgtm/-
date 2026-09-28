@@ -292,6 +292,51 @@ def process_new_turns(
                     action = str(change.get("action") or "unknown")
                     action_counts[action] = action_counts.get(action, 0) + 1
             agent_run_id = str(react_report.get("run_id") or "")
+            react_status = str(react_report.get("status") or "unknown")
+            chain_state = react_report.get("chain_state")
+            chain_persistence = react_report.get("chain_persistence")
+            if react_status != "complete":
+                chain_error = (
+                    chain_persistence.get("error_code")
+                    if isinstance(chain_persistence, Mapping)
+                    else None
+                )
+                failure_message = (
+                    f"memory react status={react_status}"
+                    + (f" chain_error={chain_error}" if chain_error else "")
+                )
+                mark_turn_processing_state(
+                    pg_config_path=pg_config_path,
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    input_hash=input_hash,
+                    dry_run=dry_run,
+                    status="failed",
+                    agent_run_id=agent_run_id or None,
+                    last_error=failure_message,
+                    metadata={
+                        "ingest": ingest_report,
+                        "react_status": react_status,
+                        "action_counts": action_counts,
+                        "chain_state": chain_state,
+                        "chain_persistence": chain_persistence,
+                        "failed_at": _utc_now_iso(),
+                    },
+                )
+                results.append(
+                    {
+                        **item,
+                        "status": "failed",
+                        "error": failure_message,
+                        "agent_run_id": agent_run_id or None,
+                        "action_counts": action_counts,
+                        "react_status": react_status,
+                        "chain_state": chain_state,
+                        "chain_persistence": chain_persistence,
+                        "dry_run": dry_run,
+                    }
+                )
+                continue
             mark_turn_processing_state(
                 pg_config_path=pg_config_path,
                 turn_id=turn_id,
@@ -302,8 +347,10 @@ def process_new_turns(
                 agent_run_id=agent_run_id or None,
                 metadata={
                     "ingest": ingest_report,
-                    "react_status": react_report.get("status"),
+                    "react_status": react_status,
                     "action_counts": action_counts,
+                    "chain_state": chain_state,
+                    "chain_persistence": chain_persistence,
                     "completed_at": _utc_now_iso(),
                 },
             )
@@ -313,7 +360,9 @@ def process_new_turns(
                     "status": "completed",
                     "agent_run_id": agent_run_id or None,
                     "action_counts": action_counts,
-                    "react_status": react_report.get("status"),
+                    "react_status": react_status,
+                    "chain_state": chain_state,
+                    "chain_persistence": chain_persistence,
                     "dry_run": dry_run,
                 }
             )

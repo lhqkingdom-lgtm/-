@@ -339,7 +339,7 @@ function Write-MemoryLabReactSummary {
         $Tool = Get-MemoryLabProperty $Request 'tool'
         $Reason = Get-MemoryLabProperty $Request 'reason'
         $Parameters = @{}
-        foreach ($Name in @('memory_id', 'topic_id', 'raw_pointer_id', 'query', 'limit')) {
+        foreach ($Name in @('memory_id', 'topic_id', 'turn_id', 'raw_pointer_id', 'query', 'limit', 'layers', 'max_chars', 'preview_chars')) {
             $Value = Get-MemoryLabProperty $Request $Name
             if ($null -ne $Value -and "$Value" -ne '') {
                 $Parameters[$Name] = $Value
@@ -350,6 +350,20 @@ function Write-MemoryLabReactSummary {
             (Get-MemoryLabShortText $Reason 180), (Get-MemoryLabToolResultSummary $Result))
     }
     $ResultObject = Get-MemoryLabProperty $Log 'result'
+    $ChainState = if ($ResultObject) { Get-MemoryLabProperty $ResultObject 'chain_state' } else { $null }
+    $ChainPersistence = if ($ResultObject) { Get-MemoryLabProperty $ResultObject 'chain_persistence' } else { $null }
+    if ($ChainState) {
+        $ChainId = Get-MemoryLabProperty $ChainState 'chain_id'
+        if (-not $ChainId) { $ChainId = '新链（提交后生成）' }
+        $RelatedTurnCount = @((Get-MemoryLabProperty $ChainState 'related_turn_ids')).Count
+        $Missing = @((Get-MemoryLabProperty $ChainState 'missing_evidence'))
+        $MissingText = if ($Missing.Count -gt 0) { $Missing -join '；' } else { '无' }
+        $PersistStatus = if ($ChainPersistence) { Get-MemoryLabProperty $ChainPersistence 'status' } else { '未写入（DryRun 或非技术链）' }
+        $PersistResult = if ($ChainPersistence) { Get-MemoryLabProperty $ChainPersistence 'result' } else { '' }
+        Write-Host ("  [故障链] ID={0} 类型={1} 状态={2} 关联turn={3} 缺口={4}；保存状态={5} {6}" -f `
+            $ChainId, (Get-MemoryLabProperty $ChainState 'chain_type'), (Get-MemoryLabProperty $ChainState 'state'), `
+            $RelatedTurnCount, (Get-MemoryLabShortText $MissingText 220), $PersistStatus, $PersistResult)
+    }
     $Plan = if ($ResultObject) { Get-MemoryLabProperty $ResultObject 'plan' } else { $null }
     if ($Plan) {
         Write-Host ("  [最终判断] {0}" -f (Get-MemoryLabShortText (Get-MemoryLabProperty $Plan 'reason') 260))

@@ -46,6 +46,11 @@ ALLOWED_MEMORY_TYPES = {
     "compile_failure_experience",
     "runtime_failure_experience",
 }
+LEGACY_MEMORY_TYPE_ALIASES = {
+    "workflow": "user_preference",
+    "compile_failure_pattern": "compile_failure_experience",
+    "runtime_failure_pattern": "runtime_failure_experience",
+}
 CONFLICT_RECORD_STATUSES = (
     "needs_review",
     "resolved_by_update",
@@ -161,24 +166,82 @@ def _digest_id(prefix: str, *parts: str) -> str:
     return f"{prefix}_{digest}"
 
 
-def _reference_snapshot(config: Mapping[str, Any], user_id: str, turn_id: str) -> dict[str, Any]:
+def _reference_snapshot(
+    config: Mapping[str, Any],
+    user_id: str,
+    turn_id: str,
+    source_turn_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    requested_turn_ids = source_turn_ids or [turn_id]
+    requested_values = ", ".join(
+        f"({_sql_literal(source_turn_id)})" for source_turn_id in requested_turn_ids
+    )
     sql = f"""
 \\pset format unaligned
 \\pset tuples_only on
+WITH anchor AS (
+  SELECT turn_id, user_id, source_id, session_id, project_key, occurred_at, created_at
+  FROM turns
+  WHERE turn_id = {_sql_literal(turn_id)} AND user_id = {_sql_literal(user_id)}
+),
+requested_source_turns(turn_id) AS (
+  VALUES {requested_values}
+),
+authorized_source_turns AS (
+  SELECT source_turn.turn_id
+  FROM requested_source_turns requested
+  JOIN turns source_turn
+    ON source_turn.turn_id = requested.turn_id
+   AND source_turn.user_id = {_sql_literal(user_id)}
+  JOIN anchor a ON true
+  WHERE source_turn.turn_id = a.turn_id
+     OR (
+       source_turn.source_id = a.source_id
+       AND source_turn.session_id = a.session_id
+       AND COALESCE(source_turn.project_key, '') = COALESCE(a.project_key, '')
+       AND (
+         COALESCE(source_turn.occurred_at, source_turn.created_at),
+         source_turn.created_at,
+         source_turn.turn_id
+       ) < (
+         COALESCE(a.occurred_at, a.created_at),
+         a.created_at,
+         a.turn_id
+       )
+     )
+)
 SELECT jsonb_build_object(
-  'turn_exists', EXISTS(
-    SELECT 1 FROM turns
-    WHERE turn_id = {_sql_literal(turn_id)} AND user_id = {_sql_literal(user_id)}
-  ),
+  'turn_exists', EXISTS(SELECT 1 FROM anchor),
+  'authorized_source_turn_ids', COALESCE((
+    SELECT jsonb_agg(turn_id ORDER BY turn_id) FROM authorized_source_turns
+  ), '[]'::jsonb),
+  'unauthorized_source_turn_ids', COALESCE((
+    SELECT jsonb_agg(requested.turn_id ORDER BY requested.turn_id)
+    FROM requested_source_turns requested
+    LEFT JOIN authorized_source_turns authorized ON authorized.turn_id = requested.turn_id
+    WHERE authorized.turn_id IS NULL
+  ), '[]'::jsonb),
   'evidence_ids', COALESCE((
     SELECT jsonb_agg(evidence_id)
     FROM evidence_items
-    WHERE turn_id = {_sql_literal(turn_id)} AND user_id = {_sql_literal(user_id)}
+    WHERE turn_id IN (SELECT turn_id FROM authorized_source_turns)
+      AND user_id = {_sql_literal(user_id)}
   ), '[]'::jsonb),
+  'evidence_details', COALESCE((
+    SELECT jsonb_object_agg(evidence_id, jsonb_build_object(
+      'turn_id', turn_id,
+      'layer', layer,
+      'source_type', source_type,
+      'kind', kind
+    ))
+    FROM evidence_items
+    WHERE turn_id IN (SELECT turn_id FROM authorized_source_turns)
+      AND user_id = {_sql_literal(user_id)}
+  ), '{{}}'::jsonb),
   'pointer_ids', COALESCE((
     SELECT jsonb_agg(evidence_id)
     FROM evidence_items
-    WHERE turn_id = {_sql_literal(turn_id)}
+    WHERE turn_id IN (SELECT turn_id FROM authorized_source_turns)
       AND user_id = {_sql_literal(user_id)}
       AND layer = 'pointer'
   ), '[]'::jsonb),
@@ -189,6 +252,11 @@ SELECT jsonb_build_object(
   ), '[]'::jsonb),
   'memory_topics', COALESCE((
     SELECT jsonb_object_agg(memory_id, topic_id)
+    FROM memories
+    WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
+  ), '{{}}'::jsonb),
+  'memory_types', COALESCE((
+    SELECT jsonb_object_agg(memory_id, memory_type)
     FROM memories
     WHERE user_id = {_sql_literal(user_id)} AND status = 'active'
   ), '{{}}'::jsonb),
@@ -317,6 +385,114 @@ def _check_evidence_refs(
             errors.append(f"{ref_prefix}.raw_pointer_id does not belong to this turn")
         if "reason" in ref and not _non_empty_string(ref.get("reason")):
             errors.append(f"{ref_prefix}.reason must be a non-empty string")
+
+
+def _check_technical_closure(
+    closure: Any,
+    errors: list[str],
+    prefix: str,
+    *,
+    memory_type: str,
+    evidence_ids: set[str],
+    evidence_details: Mapping[str, Any],
+    change_evidence_refs: Any,
+) -> None:
+    memory_type = LEGACY_MEMORY_TYPE_ALIASES.get(memory_type, memory_type)
+    expected = {
+        "compile_failure_experience": ("compilation", "compile_verified"),
+        "runtime_failure_experience": ("runtime", "user_verified"),
+    }.get(memory_type)
+    if expected is None:
+        if closure is not None:
+            errors.append(
+                f"{prefix}.technical_closure is only allowed for compile/runtime experience"
+            )
+        return
+    if not _is_object(closure):
+        errors.append(
+            f"{prefix}.technical_closure is required for {memory_type}"
+        )
+        return
+    allowed = {"chain_type", "state", "verification_evidence_ids"}
+    extra = set(closure) - allowed
+    missing = allowed - set(closure)
+    if extra:
+        errors.append(
+            f"{prefix}.technical_closure has unsupported fields: {sorted(extra)}"
+        )
+    if missing:
+        errors.append(
+            f"{prefix}.technical_closure missing fields: {sorted(missing)}"
+        )
+    expected_chain_type, expected_state = expected
+    if closure.get("chain_type") != expected_chain_type:
+        errors.append(
+            f"{prefix}.technical_closure.chain_type must be {expected_chain_type}"
+        )
+    if closure.get("state") != expected_state:
+        errors.append(
+            f"{prefix}.technical_closure.state must be {expected_state}"
+        )
+    verification_ids = closure.get("verification_evidence_ids")
+    if not isinstance(verification_ids, list) or not verification_ids:
+        errors.append(
+            f"{prefix}.technical_closure.verification_evidence_ids must be a non-empty array"
+        )
+        return
+    if len(verification_ids) > 20:
+        errors.append(
+            f"{prefix}.technical_closure.verification_evidence_ids exceeds 20"
+        )
+    cited_evidence_ids = {
+        str(ref.get("evidence_id"))
+        for ref in (change_evidence_refs or [])
+        if isinstance(ref, Mapping) and ref.get("evidence_id")
+    }
+    seen: set[str] = set()
+    valid_details: list[Mapping[str, Any]] = []
+    for verification_index, evidence_id in enumerate(verification_ids[:20]):
+        evidence_id = str(evidence_id or "")
+        if not evidence_id:
+            errors.append(
+                f"{prefix}.technical_closure.verification_evidence_ids[{verification_index}] must be a non-empty string"
+            )
+            continue
+        if evidence_id in seen:
+            errors.append(
+                f"{prefix}.technical_closure.verification_evidence_ids[{verification_index}] is duplicated"
+            )
+            continue
+        seen.add(evidence_id)
+        if evidence_id not in evidence_ids:
+            errors.append(
+                f"{prefix}.technical_closure.verification_evidence_ids[{verification_index}] is not authorized evidence"
+            )
+            continue
+        if evidence_id not in cited_evidence_ids:
+            errors.append(
+                f"{prefix}.technical_closure.verification_evidence_ids[{verification_index}] must also appear in evidence_refs"
+            )
+        detail = evidence_details.get(evidence_id)
+        if isinstance(detail, Mapping):
+            valid_details.append(detail)
+    if memory_type == "runtime_failure_experience" and valid_details:
+        if not any(
+            detail.get("kind") == "user_confirmation"
+            and detail.get("source_type") in {"user_message", "user_answer"}
+            for detail in valid_details
+        ):
+            errors.append(
+                f"{prefix}.technical_closure runtime verification requires user_confirmation evidence from the user"
+            )
+    if memory_type == "compile_failure_experience" and valid_details:
+        if not any(
+            detail.get("kind")
+            in {"build_or_tool_result", "compile_conclusion", "user_confirmation"}
+            for detail in valid_details
+        ):
+            errors.append(
+                f"{prefix}.technical_closure compilation verification requires build/compile/user confirmation evidence"
+            )
 
 
 def _check_memory_relation(relation: Any, errors: list[str], prefix: str) -> None:
@@ -472,7 +648,8 @@ def validate_memory_changes(
     user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
     errors: list[str] = []
     top_required = {"schema_version", "turn_id", "reason", "changes"}
-    extra_top = set(proposal) - top_required
+    top_allowed = top_required | {"source_turn_ids"}
+    extra_top = set(proposal) - top_allowed
     missing_top = top_required - set(proposal)
     if extra_top:
         errors.append(f"unexpected top-level fields: {sorted(extra_top)}")
@@ -493,15 +670,64 @@ def validate_memory_changes(
     elif len(changes) > MAX_CHANGES:
         errors.append(f"changes exceeds max {MAX_CHANGES}")
 
-    snapshot = _reference_snapshot(config, user_id, str(proposal.get("turn_id") or ""))
+    trigger_turn_id = str(proposal.get("turn_id") or "")
+    raw_source_turn_ids = proposal.get("source_turn_ids")
+    source_turn_ids: list[str] = [trigger_turn_id] if trigger_turn_id else []
+    if raw_source_turn_ids is not None:
+        source_turn_ids = []
+        if not isinstance(raw_source_turn_ids, list) or not raw_source_turn_ids:
+            errors.append("source_turn_ids must be a non-empty array when provided")
+        elif len(raw_source_turn_ids) > 12:
+            errors.append("source_turn_ids exceeds max 12")
+        else:
+            seen_source_turn_ids: set[str] = set()
+            for source_index, source_turn_id in enumerate(raw_source_turn_ids):
+                if not _non_empty_string(source_turn_id):
+                    errors.append(
+                        f"source_turn_ids[{source_index}] must be a non-empty string"
+                    )
+                    continue
+                source_turn_id = str(source_turn_id)
+                if source_turn_id in seen_source_turn_ids:
+                    errors.append(f"source_turn_ids[{source_index}] is duplicated")
+                    continue
+                seen_source_turn_ids.add(source_turn_id)
+                source_turn_ids.append(source_turn_id)
+            if trigger_turn_id and trigger_turn_id not in seen_source_turn_ids:
+                errors.append("source_turn_ids must include current turn_id")
+    safe_source_turn_ids = source_turn_ids or ([trigger_turn_id] if trigger_turn_id else ["invalid-turn"])
+    snapshot = _reference_snapshot(
+        config,
+        user_id,
+        trigger_turn_id,
+        safe_source_turn_ids,
+    )
     if not snapshot.get("turn_exists"):
         errors.append("turn_id does not exist for current user")
+    unauthorized_source_turn_ids = {
+        str(item) for item in snapshot.get("unauthorized_source_turn_ids") or []
+    }
+    if unauthorized_source_turn_ids:
+        errors.append(
+            "source_turn_ids contain turns outside the current earlier conversation: "
+            + ", ".join(sorted(unauthorized_source_turn_ids))
+        )
     evidence_ids = {str(item) for item in snapshot.get("evidence_ids") or []}
     pointer_ids = {str(item) for item in snapshot.get("pointer_ids") or []}
+    evidence_details = {
+        str(key): value
+        for key, value in (snapshot.get("evidence_details") or {}).items()
+        if isinstance(value, Mapping)
+    }
     memory_ids = {str(item) for item in snapshot.get("memory_ids") or []}
     memory_topics = {
         str(key): str(value)
         for key, value in (snapshot.get("memory_topics") or {}).items()
+        if _non_empty_string(key) and _non_empty_string(value)
+    }
+    memory_types = {
+        str(key): str(value)
+        for key, value in (snapshot.get("memory_types") or {}).items()
         if _non_empty_string(key) and _non_empty_string(value)
     }
     conflict_memory_ids = {str(item) for item in snapshot.get("conflict_memory_ids") or []}
@@ -544,6 +770,7 @@ def validate_memory_changes(
                 "topic_id",
                 "memory",
                 "evidence_refs",
+                "technical_closure",
             }
             extra = set(change) - allowed
             if extra:
@@ -590,9 +817,27 @@ def validate_memory_changes(
                 pointer_ids=pointer_ids,
                 required=True,
             )
+            if _is_object(memory):
+                _check_technical_closure(
+                    change.get("technical_closure"),
+                    errors,
+                    prefix,
+                    memory_type=str(memory.get("memory_type") or ""),
+                    evidence_ids=evidence_ids,
+                    evidence_details=evidence_details,
+                    change_evidence_refs=change.get("evidence_refs"),
+                )
 
         elif action in {"merge_memory", "update_memory", "mark_conflict"}:
-            allowed = {"action", "reason", "target_memory_id", "memory", "evidence_refs"}
+            allowed = {
+                "action",
+                "reason",
+                "target_memory_id",
+                "memory",
+                "evidence_refs",
+            }
+            if action in {"merge_memory", "update_memory"}:
+                allowed = {*allowed, "technical_closure"}
             if action == "update_memory":
                 allowed = {*allowed, "conflict_resolution"}
             extra = set(change) - allowed
@@ -636,6 +881,17 @@ def validate_memory_changes(
                 pointer_ids=pointer_ids,
                 required=True,
             )
+            target_memory_type = memory_types.get(str(target or ""), "")
+            if action in {"merge_memory", "update_memory"} and target_memory_type:
+                _check_technical_closure(
+                    change.get("technical_closure"),
+                    errors,
+                    prefix,
+                    memory_type=target_memory_type,
+                    evidence_ids=evidence_ids,
+                    evidence_details=evidence_details,
+                    change_evidence_refs=change.get("evidence_refs"),
+                )
 
         elif action == "retire_memory":
             allowed = {"action", "reason", "target_memory_id", "evidence_refs", "conflict_disposition"}
@@ -703,6 +959,7 @@ def validate_memory_changes(
                 "memory",
                 "evidence_refs",
                 "conflict_disposition",
+                "technical_closure",
             }
             extra = set(change) - allowed
             if extra:
@@ -793,6 +1050,17 @@ def validate_memory_changes(
                 pointer_ids=pointer_ids,
                 required=True,
             )
+            target_memory_type = memory_types.get(str(target or ""), "")
+            if target_memory_type:
+                _check_technical_closure(
+                    change.get("technical_closure"),
+                    errors,
+                    prefix,
+                    memory_type=target_memory_type,
+                    evidence_ids=evidence_ids,
+                    evidence_details=evidence_details,
+                    change_evidence_refs=change.get("evidence_refs"),
+                )
 
         elif action == "update_topic":
             allowed = {"action", "reason", "target_topic_id", "topic", "evidence_refs"}
@@ -1065,12 +1333,15 @@ def _load_proposal_file(plan_path: Path) -> dict[str, Any]:
 
 
 def _single_change_proposal(proposal: Mapping[str, Any], change: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    single = {
         "schema_version": proposal.get("schema_version"),
         "turn_id": proposal.get("turn_id"),
         "reason": proposal.get("reason"),
         "changes": [dict(change)],
     }
+    if "source_turn_ids" in proposal:
+        single["source_turn_ids"] = list(proposal.get("source_turn_ids") or [])
+    return single
 
 
 def _resolve_temp_memory_references(
@@ -1092,13 +1363,20 @@ def _resolve_temp_memory_references(
 
 def _evidence_metadata(proposal: Mapping[str, Any], change: Mapping[str, Any]) -> dict[str, Any]:
     turn_id = proposal.get("turn_id")
-    return {
+    source_turn_ids = proposal.get("source_turn_ids")
+    if not isinstance(source_turn_ids, list) or not source_turn_ids:
+        source_turn_ids = [turn_id] if turn_id else []
+    metadata = {
         "source_turn_id": turn_id,
-        "source_turn_ids": [turn_id] if turn_id else [],
+        "source_turn_ids": source_turn_ids,
         "change_reason": change.get("reason"),
         "evidence_refs": change.get("evidence_refs") or [],
         "last_action": change.get("action"),
     }
+    if isinstance(change.get("technical_closure"), Mapping):
+        metadata["technical_closure"] = dict(change["technical_closure"])
+        metadata["verification_status"] = "verified"
+    return metadata
 
 
 def _create_topic_sql(user_id: str, topic: Mapping[str, Any]) -> tuple[str, str]:

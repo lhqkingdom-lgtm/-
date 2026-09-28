@@ -1,0 +1,31 @@
+{
+  "schema_version": "memory-multiturn-fixtures-v1",
+  "fixtures": [
+    {
+      "fixture_id": "empty_user_state_v1",
+      "description": "隔离用户，无正式记忆、无主题、无未闭环故障链。",
+      "topics": [],
+      "memories": [],
+      "open_chains": []
+    },
+    {
+      "fixture_id": "existing_ask_before_guessing_v1",
+      "description": "已存在一条‘信息不足先询问、不要猜测’用户偏好，用于验证重复证据应合并、更新或保持不变。",
+      "topics": [
+        {
+          "topic_key": "user.collaboration.requirement_clarification",
+          "summary": "用户希望信息不足时先询问并依据需求、IO 和 SDK 工作。"
+        }
+      ],
+      "memories": [
+        {
+          "memory_key": "user.preference.ask_before_guessing",
+          "memory_type": "user_preference",
+          "content": "需求或硬件信息不明确时先向用户确认，不要自行猜测。",
+          "status": "active"
+        }
+      ],
+      "open_chains": []
+    }
+  ]
+}

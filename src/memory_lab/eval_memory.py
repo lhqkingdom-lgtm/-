@@ -12,6 +12,7 @@ from typing import Any, Mapping
 
 from .config import DEFAULT_CONFIG
 from .memory_react_agent import run_memory_react_agent
+from .multiturn_eval_contract import validate_multiturn_evalset
 from .pg_store import DEFAULT_PG_CONFIG, ingest_turn_to_postgres, load_pg_config
 
 
@@ -219,6 +220,13 @@ def run_eval_memory_plan(
     case_parameter_quality = _validate_eval_case_parameters(cases)
     scenarios_doc = _read_scenarios(scenarios_path)
     scenarios = scenarios_doc["scenarios"]
+    multiturn_contract = None
+    if scenarios_doc.get("schema_version") == "memory-multiturn-scenarios-v1":
+        multiturn_contract = validate_multiturn_evalset(
+            evalset_path,
+            lab_database=lab_database,
+            verify_evidence_hashes=True,
+        )
 
     case_turn_ids: list[str] = []
     source_paths: set[str] = set()
@@ -285,7 +293,7 @@ def run_eval_memory_plan(
         )
 
     status = "complete" if not missing_turn_ids and not missing_sources else "failed"
-    return {
+    result = {
         "status": status,
         "tool": "eval_memory_plan",
         "evalset_path": str(evalset_path),
@@ -312,6 +320,9 @@ def run_eval_memory_plan(
             "按 cases.jsonl 调用 pg-memory-react-run 并生成事实报告。"
         ),
     }
+    if multiturn_contract is not None:
+        result["multiturn_contract"] = multiturn_contract
+    return result
 
 
 def _utc_run_stamp() -> str:

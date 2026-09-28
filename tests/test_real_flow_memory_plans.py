@@ -30,6 +30,32 @@ BASE_SNAPSHOT = {
         "user.workflow.stage_confirm",
         "user.workflow.fast_demo",
     ],
+    "evidence_details": {
+        "ev_user": {
+            "turn_id": "turn_current",
+            "layer": "core",
+            "source_type": "user_message",
+            "kind": "user_confirmation",
+        },
+        "ev_assistant": {
+            "turn_id": "turn_current",
+            "layer": "core",
+            "source_type": "assistant_message",
+            "kind": "assistant_conclusion",
+        },
+        "ev_tool": {
+            "turn_id": "turn_current",
+            "layer": "candidate",
+            "source_type": "tool_result",
+            "kind": "build_or_tool_result",
+        },
+        "ev_result": {
+            "turn_id": "turn_current",
+            "layer": "core",
+            "source_type": "tool_result",
+            "kind": "compile_conclusion",
+        },
+    },
 }
 
 
@@ -145,6 +171,11 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                         "scope": {"level": "domain", "domain": "embedded"},
                         "confidence": 0.9,
                     },
+                    "technical_closure": {
+                        "chain_type": "compilation",
+                        "state": "compile_verified",
+                        "verification_evidence_ids": ["ev_result"],
+                    },
                     "evidence_refs": [
                         {"evidence_id": "ev_tool", "reason": "编译日志给出失败症状。"},
                         {"evidence_id": "ev_result", "reason": "修复后编译通过。"},
@@ -177,6 +208,11 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                         "content": "现象：风扇不转或调节无变化。触发条件：adc_sample 等硬件抽象函数直接返回固定常量。原因：主流程、滤波、阈值判断都在运行，但输入永远不变。解决：替换为真实寄存器/外设读取，并结合数据手册确认 ADC 通道、引脚和转换流程。验证：用户确认替换后现象正常再沉淀。",
                         "scope": {"level": "domain", "domain": "embedded"},
                         "confidence": 0.92,
+                    },
+                    "technical_closure": {
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "verification_evidence_ids": ["ev_user"],
                     },
                     "evidence_refs": [
                         {"evidence_id": "ev_assistant", "reason": "模型完成代码级定位。"},
@@ -235,6 +271,11 @@ class RealFlowMemoryPlansTests(unittest.TestCase):
                         "content": "现象：风扇不转。原因：PWM 通道或引脚配置与实际接线不一致，导致占空比逻辑正常但物理引脚无有效输出。解决：核对原理图、芯片复用功能和工程 IO 配置，修正 PWM 通道/引脚映射。验证：烧录后用户确认风扇可按占空比变化。",
                         "scope": {"level": "domain", "domain": "embedded"},
                         "confidence": 0.88,
+                    },
+                    "technical_closure": {
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "verification_evidence_ids": ["ev_user"],
                     },
                     "evidence_refs": [
                         {"evidence_id": "ev_tool", "reason": "定位到 PWM 引脚配置。"},

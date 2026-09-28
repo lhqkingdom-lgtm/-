@@ -8,6 +8,7 @@ its three evidence layers into PostgreSQL so the user can inspect the tables.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -22,6 +23,12 @@ from .source import source_id
 from .store import open_store
 from .turn_evidence import build_turn_evidence
 from .turns import run_turn_scan
+from .memory_chain_state import (
+    MEMORY_CHAIN_SCHEMA_VERSION,
+    MemoryChainStateValidationError,
+    validate_chain_state,
+    validate_chain_transition,
+)
 
 
 DEFAULT_PG_CONFIG = Path(__file__).resolve().parents[2] / "pg-memory-lab.local.json"
@@ -430,7 +437,16 @@ ON CONFLICT (turn_id) DO UPDATE SET
   final_phase = EXCLUDED.final_phase,
   occurred_at = EXCLUDED.occurred_at,
   source_hash = EXCLUDED.source_hash,
-  metadata = EXCLUDED.metadata;
+  metadata = EXCLUDED.metadata ||
+    CASE
+      -- A source turn can be replayed under an isolated evaluation user.
+      -- Preserve chain state only for the same owner; carrying it across an
+      -- ownership change leaks one user's unfinished diagnosis into another.
+      WHEN turns.user_id = EXCLUDED.user_id
+       AND turns.metadata ? 'memory_chains'
+      THEN jsonb_build_object('memory_chains', turns.metadata -> 'memory_chains')
+      ELSE '{{}}'::jsonb
+    END;
 
 WITH rows AS (
   SELECT *
@@ -632,6 +648,7 @@ payload AS (
       'turn_id', t.turn_id,
       'user_id', t.user_id,
       'source_id', t.source_id,
+      'session_id', t.session_id,
       'project_key', t.project_key,
       'state', t.state,
       'rule_phase', t.rule_phase,
@@ -666,6 +683,701 @@ SELECT COALESCE(
         "turn_id": turn_id,
         "found": bool(evidence.get("found")),
         "evidence": evidence,
+    }
+
+
+def list_previous_session_turns(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    current_turn_id: str,
+    limit: int = 10,
+    preview_chars: int = 320,
+) -> dict[str, Any]:
+    """List bounded summaries of turns preceding ``current_turn_id``.
+
+    The current turn is the security anchor.  Only earlier turns owned by the
+    configured user and belonging to the same source, session and project are
+    returned.  This is intentionally a discovery tool: callers must use
+    :func:`read_session_turn_evidence` before citing historical evidence.
+    """
+
+    current_turn_id = str(current_turn_id or "").strip()
+    if not current_turn_id:
+        return {
+            "status": "rejected",
+            "tool": "list_previous_session_turns",
+            "error_code": "empty_current_turn_id",
+            "turns": [],
+            "count": 0,
+            "guidance": "current_turn_id 不能为空。",
+        }
+    try:
+        normalized_limit = max(1, min(int(limit), 20))
+        normalized_preview_chars = max(80, min(int(preview_chars), 800))
+    except (TypeError, ValueError):
+        return {
+            "status": "rejected",
+            "tool": "list_previous_session_turns",
+            "error_code": "invalid_bounds",
+            "turns": [],
+            "count": 0,
+            "guidance": "limit 和 preview_chars 必须是整数。",
+        }
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH anchor AS (
+  SELECT turn_id, user_id, source_id, session_id, project_key, occurred_at, created_at
+  FROM turns
+  WHERE turn_id = {_sql_literal(current_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+),
+previous AS (
+  SELECT t.*
+  FROM turns t
+  JOIN anchor a
+    ON t.user_id = a.user_id
+   AND t.source_id = a.source_id
+   AND t.session_id = a.session_id
+   AND COALESCE(t.project_key, '') = COALESCE(a.project_key, '')
+  WHERE t.turn_id <> a.turn_id
+    AND (
+      COALESCE(t.occurred_at, t.created_at), t.created_at, t.turn_id
+    ) < (
+      COALESCE(a.occurred_at, a.created_at), a.created_at, a.turn_id
+    )
+  ORDER BY COALESCE(t.occurred_at, t.created_at) DESC, t.created_at DESC, t.turn_id DESC
+  LIMIT {normalized_limit}
+),
+summaries AS (
+  SELECT jsonb_build_object(
+    'turn_id', p.turn_id,
+    'occurred_at', p.occurred_at,
+    'state', p.state,
+    'rule_phase', p.rule_phase,
+    'final_phase', p.final_phase,
+    'phase_hint', COALESCE(p.final_phase, p.rule_phase),
+    'evidence_count', (
+      SELECT count(*) FROM evidence_items e WHERE e.turn_id = p.turn_id AND e.user_id = p.user_id
+    ),
+    'layer_counts', COALESCE((
+      SELECT jsonb_object_agg(layer, item_count)
+      FROM (
+        SELECT e.layer, count(*) AS item_count
+        FROM evidence_items e
+        WHERE e.turn_id = p.turn_id AND e.user_id = p.user_id
+        GROUP BY e.layer
+      ) layer_totals
+    ), '{{}}'::jsonb),
+    'evidence_kinds', COALESCE((
+      SELECT jsonb_agg(kind ORDER BY kind)
+      FROM (
+        SELECT DISTINCT e.kind
+        FROM evidence_items e
+        WHERE e.turn_id = p.turn_id AND e.user_id = p.user_id
+      ) kinds
+    ), '[]'::jsonb),
+    'previews', COALESCE((
+      SELECT jsonb_agg(jsonb_build_object(
+        'evidence_id', preview.evidence_id,
+        'layer', preview.layer,
+        'source_type', preview.source_type,
+        'kind', preview.kind,
+        'text', left(preview.text_or_summary, {normalized_preview_chars})
+      ) ORDER BY preview.layer_rank, preview.ordinal NULLS LAST, preview.evidence_id)
+      FROM (
+        SELECT
+          e.*,
+          CASE e.layer WHEN 'core' THEN 1 WHEN 'candidate' THEN 2 ELSE 3 END AS layer_rank
+        FROM evidence_items e
+        WHERE e.turn_id = p.turn_id
+          AND e.user_id = p.user_id
+          AND e.layer IN ('core', 'candidate')
+        ORDER BY
+          CASE e.layer WHEN 'core' THEN 1 WHEN 'candidate' THEN 2 ELSE 3 END,
+          e.ordinal NULLS LAST,
+          e.evidence_id
+        LIMIT 6
+      ) preview
+    ), '[]'::jsonb)
+  ) AS item,
+  COALESCE(p.occurred_at, p.created_at) AS sort_time,
+  p.created_at,
+  p.turn_id
+  FROM previous p
+)
+SELECT jsonb_build_object(
+  'anchor_found', EXISTS(SELECT 1 FROM anchor),
+  'turns', COALESCE((
+    SELECT jsonb_agg(item ORDER BY sort_time DESC, created_at DESC, turn_id DESC)
+    FROM summaries
+  ), '[]'::jsonb)
+)::text;
+"""
+    payload = _json_from_psql_object(config, sql)
+    if not payload.get("anchor_found"):
+        return {
+            "status": "not_found",
+            "tool": "list_previous_session_turns",
+            "error_code": "current_turn_not_found",
+            "current_turn_id": current_turn_id,
+            "turns": [],
+            "count": 0,
+            "guidance": "当前 turn 尚未写入 PostgreSQL，不能查询其会话历史。",
+        }
+    turns = [item for item in payload.get("turns") or [] if isinstance(item, Mapping)]
+    return {
+        "status": "complete",
+        "tool": "list_previous_session_turns",
+        "current_turn_id": current_turn_id,
+        "turns": turns,
+        "count": len(turns),
+        "limits": {"limit": normalized_limit, "preview_chars": normalized_preview_chars},
+        "guidance": (
+            "这里只返回历史 turn 摘要；如需引用其证据，必须继续调用 read_session_turn_evidence。"
+        ),
+    }
+
+
+def read_session_turn_evidence(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    current_turn_id: str,
+    target_turn_id: str,
+    layers: list[str] | None = None,
+    max_chars: int = 1200,
+) -> dict[str, Any]:
+    """Read evidence for an earlier turn in the current turn's conversation.
+
+    Authorization is derived from PostgreSQL ownership and chronology, never
+    from model-provided session/project values.
+    """
+
+    current_turn_id = str(current_turn_id or "").strip()
+    target_turn_id = str(target_turn_id or "").strip()
+    if not current_turn_id or not target_turn_id:
+        return {
+            "status": "rejected",
+            "tool": "read_session_turn_evidence",
+            "error_code": "empty_turn_id",
+            "current_turn_id": current_turn_id,
+            "target_turn_id": target_turn_id,
+            "guidance": "current_turn_id 和 target_turn_id 都不能为空。",
+        }
+    if current_turn_id == target_turn_id:
+        return {
+            "status": "rejected",
+            "tool": "read_session_turn_evidence",
+            "error_code": "target_is_current_turn",
+            "current_turn_id": current_turn_id,
+            "target_turn_id": target_turn_id,
+            "guidance": "当前 turn 应使用 get_current_turn_evidence_summary，不属于历史 turn。",
+        }
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH anchor AS (
+  SELECT turn_id, user_id, source_id, session_id, project_key, occurred_at, created_at
+  FROM turns
+  WHERE turn_id = {_sql_literal(current_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+),
+target AS (
+  SELECT turn_id, user_id, source_id, session_id, project_key, occurred_at, created_at
+  FROM turns
+  WHERE turn_id = {_sql_literal(target_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+)
+SELECT jsonb_build_object(
+  'anchor_found', EXISTS(SELECT 1 FROM anchor),
+  'target_found', EXISTS(SELECT 1 FROM target),
+  'authorized', EXISTS(
+    SELECT 1
+    FROM anchor a
+    JOIN target t
+      ON t.user_id = a.user_id
+     AND t.source_id = a.source_id
+     AND t.session_id = a.session_id
+     AND COALESCE(t.project_key, '') = COALESCE(a.project_key, '')
+    WHERE (
+      COALESCE(t.occurred_at, t.created_at), t.created_at, t.turn_id
+    ) < (
+      COALESCE(a.occurred_at, a.created_at), a.created_at, a.turn_id
+    )
+  )
+)::text;
+"""
+    authorization = _json_from_psql_object(config, sql)
+    if not authorization.get("anchor_found"):
+        return {
+            "status": "not_found",
+            "tool": "read_session_turn_evidence",
+            "error_code": "current_turn_not_found",
+            "current_turn_id": current_turn_id,
+            "target_turn_id": target_turn_id,
+            "guidance": "当前 turn 尚未写入 PostgreSQL。",
+        }
+    if not authorization.get("target_found"):
+        return {
+            "status": "not_found",
+            "tool": "read_session_turn_evidence",
+            "error_code": "target_turn_not_found",
+            "current_turn_id": current_turn_id,
+            "target_turn_id": target_turn_id,
+            "guidance": "目标历史 turn 不存在或不属于当前用户。",
+        }
+    if not authorization.get("authorized"):
+        return {
+            "status": "denied",
+            "tool": "read_session_turn_evidence",
+            "error_code": "target_outside_current_conversation",
+            "current_turn_id": current_turn_id,
+            "target_turn_id": target_turn_id,
+            "guidance": "目标 turn 不是当前会话中更早的 turn，拒绝读取。",
+        }
+
+    detail = get_turn_evidence(
+        pg_config_path=pg_config_path,
+        turn_id=target_turn_id,
+        layers=layers or ["core", "candidate", "pointer"],
+        max_chars=max_chars,
+    )
+    evidence = detail.get("evidence") if isinstance(detail.get("evidence"), Mapping) else {}
+    return {
+        "status": "complete" if detail.get("found") else "not_found",
+        "tool": "read_session_turn_evidence",
+        "current_turn_id": current_turn_id,
+        "target_turn_id": target_turn_id,
+        "found": bool(detail.get("found")),
+        "evidence": evidence,
+        "guidance": (
+            "已读取同会话历史 turn；只有本次返回的 evidence_id 才能进入跨 turn 证据授权集合。"
+        ),
+    }
+
+
+def _memory_chain_id(
+    *,
+    user_id: str,
+    session_id: str,
+    project_key: str,
+    chain_type: str,
+    anchor_turn_id: str,
+) -> str:
+    material = "|".join(
+        (user_id, session_id, project_key, chain_type, anchor_turn_id)
+    )
+    return "chain_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+
+
+def save_memory_chain_state(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    current_turn_id: str,
+    chain_state: Mapping[str, Any],
+    final_memory_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist one validated technical chain in existing ``turns.metadata``."""
+
+    current_turn_id = str(current_turn_id or "").strip()
+    observed_turn_ids = {
+        str(item)
+        for item in (chain_state.get("related_turn_ids") or [])
+        if str(item) and str(item) != current_turn_id
+    }
+    try:
+        normalized = validate_chain_state(
+            chain_state,
+            current_turn_id=current_turn_id,
+            observed_turn_ids=observed_turn_ids,
+        )
+    except MemoryChainStateValidationError as error:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "invalid_chain_state",
+            "errors": error.errors,
+            "guidance": "修正 chain_state 后重试；未通过校验的状态不会写入。",
+        }
+    if normalized["chain_type"] == "none":
+        return {
+            "status": "skipped",
+            "tool": "save_memory_chain_state",
+            "result": "not_applicable",
+            "guidance": "非技术故障 turn 不保存故障链状态。",
+        }
+
+    normalized_final_ids: list[str] = []
+    for memory_id in final_memory_ids or []:
+        memory_id = str(memory_id or "").strip()
+        if memory_id and memory_id not in normalized_final_ids:
+            normalized_final_ids.append(memory_id)
+    if len(normalized_final_ids) > 10:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "too_many_final_memories",
+            "guidance": "一条故障链最多关联 10 条最终记忆。",
+        }
+    if normalized["status"] == "open" and normalized_final_ids:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "open_chain_has_final_memory",
+            "guidance": "未闭环状态不能关联正式记忆。",
+        }
+
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    requested_turn_ids = normalized["related_turn_ids"]
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH anchor AS (
+  SELECT * FROM turns
+  WHERE turn_id = {_sql_literal(current_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+),
+requested AS (
+  SELECT value #>> '{{}}' AS turn_id
+  FROM jsonb_array_elements({_json_literal(requested_turn_ids)})
+),
+authorized AS (
+  SELECT t.turn_id, t.session_id, COALESCE(t.project_key, '') AS project_key,
+         t.occurred_at, t.created_at, t.metadata
+  FROM turns t
+  JOIN anchor a
+    ON t.user_id = a.user_id
+   AND t.source_id = a.source_id
+   AND t.session_id = a.session_id
+   AND COALESCE(t.project_key, '') = COALESCE(a.project_key, '')
+  JOIN requested r ON r.turn_id = t.turn_id
+  WHERE (
+    COALESCE(t.occurred_at, t.created_at), t.created_at, t.turn_id
+  ) <= (
+    COALESCE(a.occurred_at, a.created_at), a.created_at, a.turn_id
+  )
+),
+conversation_chains AS (
+  SELECT t.turn_id AS stored_on_turn_id, chain.value AS chain
+  FROM turns t
+  JOIN anchor a
+    ON t.user_id = a.user_id
+   AND t.source_id = a.source_id
+   AND t.session_id = a.session_id
+   AND COALESCE(t.project_key, '') = COALESCE(a.project_key, '')
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(t.metadata -> 'memory_chains') = 'array'
+      THEN t.metadata -> 'memory_chains'
+      ELSE '[]'::jsonb
+    END
+  ) AS chain(value)
+)
+SELECT jsonb_build_object(
+  'current_found', EXISTS(SELECT 1 FROM anchor),
+  'session_id', COALESCE((SELECT session_id FROM anchor), ''),
+  'project_key', COALESCE((SELECT project_key FROM anchor), ''),
+  'turns', COALESCE((
+    SELECT jsonb_agg(jsonb_build_object(
+      'turn_id', turn_id,
+      'memory_chains', CASE
+        WHEN jsonb_typeof(metadata -> 'memory_chains') = 'array'
+        THEN metadata -> 'memory_chains'
+        ELSE '[]'::jsonb
+      END
+    ) ORDER BY COALESCE(occurred_at, created_at), created_at, turn_id)
+    FROM authorized
+  ), '[]'::jsonb),
+  'conversation_chains', COALESCE((
+    SELECT jsonb_agg(jsonb_build_object(
+      'stored_on_turn_id', stored_on_turn_id,
+      'chain', chain
+    ))
+    FROM conversation_chains
+  ), '[]'::jsonb)
+)::text;
+"""
+    context = _json_from_psql_object(config, sql)
+    if not context.get("current_found"):
+        return {
+            "status": "not_found",
+            "tool": "save_memory_chain_state",
+            "error_code": "current_turn_not_found",
+            "guidance": "当前 turn 尚未入库，不能保存故障链状态。",
+        }
+    authorized_turns = [
+        item for item in context.get("turns") or [] if isinstance(item, Mapping)
+    ]
+    authorized_ids = {str(item.get("turn_id") or "") for item in authorized_turns}
+    unauthorized = [item for item in requested_turn_ids if item not in authorized_ids]
+    if unauthorized:
+        return {
+            "status": "denied",
+            "tool": "save_memory_chain_state",
+            "error_code": "related_turn_outside_conversation",
+            "unauthorized_turn_ids": unauthorized,
+            "guidance": "关联 turn 必须属于同一用户、来源、会话和项目，且不能晚于当前 turn。",
+        }
+
+    related_set = set(requested_turn_ids)
+    requested_chain_id = str(normalized.get("chain_id") or "")
+    candidates: list[dict[str, Any]] = []
+    for item in context.get("conversation_chains") or []:
+        if not isinstance(item, Mapping) or not isinstance(item.get("chain"), Mapping):
+            continue
+        chain = dict(item["chain"])
+        chain_turns = {str(value) for value in chain.get("related_turn_ids") or []}
+        exact_id_match = (
+            bool(requested_chain_id)
+            and str(chain.get("chain_id") or "") == requested_chain_id
+        )
+        overlap_match = (
+            not requested_chain_id
+            and chain.get("chain_type") == normalized["chain_type"]
+            and bool(chain_turns.intersection(related_set))
+        )
+        if exact_id_match or overlap_match:
+            candidates.append(
+                {**chain, "stored_on_turn_id": str(item.get("stored_on_turn_id") or "")}
+            )
+    if requested_chain_id and not candidates:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "unknown_chain_id",
+            "chain_id": requested_chain_id,
+            "guidance": "指定的故障链不存在或不属于当前会话；重新调用 list_open_memory_chains 后再判断。",
+        }
+    if len(candidates) > 1:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "ambiguous_existing_chain",
+            "candidate_chain_ids": [str(item.get("chain_id") or "") for item in candidates],
+            "guidance": "当前证据同时命中多条故障链；需要模型读取更多历史 turn 后明确归属。",
+        }
+
+    existing = candidates[0] if candidates else None
+    if existing and not requested_chain_id:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "chain_id_required_for_existing_chain",
+            "candidate_chain_ids": [str(existing.get("chain_id") or "")],
+            "guidance": "当前证据与已有故障链重叠；必须携带 list_open_memory_chains 返回的 chain_id，不能静默续接。",
+        }
+    if existing:
+        try:
+            validate_chain_transition(existing, normalized)
+        except MemoryChainStateValidationError as error:
+            return {
+                "status": "rejected",
+                "tool": "save_memory_chain_state",
+                "error_code": "invalid_chain_transition",
+                "errors": error.errors,
+                "guidance": "不能静默倒退或丢弃已有故障链证据；必要时创建新链。",
+            }
+        anchor_turn_id = str(existing.get("anchor_turn_id") or existing["stored_on_turn_id"])
+        chain_id = str(existing.get("chain_id") or "")
+    else:
+        anchor_turn_id = str(authorized_turns[0]["turn_id"])
+        chain_id = _memory_chain_id(
+            user_id=user_id,
+            session_id=str(context.get("session_id") or ""),
+            project_key=str(context.get("project_key") or ""),
+            chain_type=normalized["chain_type"],
+            anchor_turn_id=anchor_turn_id,
+        )
+
+    record = {
+        "schema_version": MEMORY_CHAIN_SCHEMA_VERSION,
+        "chain_id": chain_id,
+        "chain_type": normalized["chain_type"],
+        "state": normalized["state"],
+        "anchor_turn_id": anchor_turn_id,
+        "related_turn_ids": normalized["related_turn_ids"],
+        "missing_evidence": normalized["missing_evidence"],
+        "status": normalized["status"],
+        "updated_by_turn_id": current_turn_id,
+        "final_memory_ids": normalized_final_ids,
+    }
+    if existing and all(
+        existing.get(key) == record.get(key)
+        for key in (
+            "chain_id", "chain_type", "state", "anchor_turn_id",
+            "related_turn_ids", "missing_evidence", "status",
+            "updated_by_turn_id", "final_memory_ids",
+        )
+    ):
+        return {
+            "status": "complete",
+            "tool": "save_memory_chain_state",
+            "result": "skipped_existing",
+            "chain": record,
+            "guidance": "相同故障链状态已经保存，无需重复写入。",
+        }
+
+    anchor_row = next(
+        item for item in authorized_turns if str(item.get("turn_id") or "") == anchor_turn_id
+    )
+    old_chains = [
+        dict(item)
+        for item in anchor_row.get("memory_chains") or []
+        if isinstance(item, Mapping)
+    ]
+    new_chains = [item for item in old_chains if str(item.get("chain_id") or "") != chain_id]
+    new_chains.append(record)
+    update_sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH updated AS (
+  UPDATE turns
+  SET metadata = jsonb_set(
+    COALESCE(metadata, '{{}}'::jsonb),
+    '{{memory_chains}}',
+    {_json_literal(new_chains)},
+    true
+  )
+  WHERE turn_id = {_sql_literal(anchor_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+    AND COALESCE(metadata -> 'memory_chains', '[]'::jsonb) = {_json_literal(old_chains)}
+  RETURNING turn_id
+)
+SELECT jsonb_build_object('updated', EXISTS(SELECT 1 FROM updated))::text;
+"""
+    update_result = _json_from_psql_object(config, update_sql)
+    if not update_result.get("updated"):
+        return {
+            "status": "retry",
+            "tool": "save_memory_chain_state",
+            "error_code": "concurrent_chain_update",
+            "chain_id": chain_id,
+            "guidance": "故障链状态在写入前已被其他进程修改；重新读取后再判断。",
+        }
+    return {
+        "status": "complete",
+        "tool": "save_memory_chain_state",
+        "result": "updated" if existing else "created",
+        "chain": record,
+        "guidance": "故障链状态已保存到 anchor turn 的 metadata，不会进入正式记忆召回。",
+    }
+
+
+def list_open_memory_chains(
+    *,
+    pg_config_path: Path = DEFAULT_PG_CONFIG,
+    current_turn_id: str,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """List open technical chains in the current turn's conversation.
+
+    Only chain summaries and turn previews are returned. Evidence IDs remain
+    unavailable until ``read_session_turn_evidence`` is called.
+    """
+
+    current_turn_id = str(current_turn_id or "").strip()
+    normalized_limit = max(1, min(int(limit), 20))
+    config = load_pg_config(pg_config_path)
+    user_id = str(config["user"].get("user_id") or DEFAULT_USER_ID)
+    sql = f"""
+\\pset format unaligned
+\\pset tuples_only on
+WITH anchor AS (
+  SELECT * FROM turns
+  WHERE turn_id = {_sql_literal(current_turn_id)}
+    AND user_id = {_sql_literal(user_id)}
+),
+chain_rows AS (
+  SELECT t.turn_id AS stored_on_turn_id, chain.value AS chain
+  FROM turns t
+  JOIN anchor a
+    ON t.user_id = a.user_id
+   AND t.source_id = a.source_id
+   AND t.session_id = a.session_id
+   AND COALESCE(t.project_key, '') = COALESCE(a.project_key, '')
+  CROSS JOIN LATERAL jsonb_array_elements(
+    CASE
+      WHEN jsonb_typeof(t.metadata -> 'memory_chains') = 'array'
+      THEN t.metadata -> 'memory_chains'
+      ELSE '[]'::jsonb
+    END
+  ) AS chain(value)
+  WHERE (chain.value ->> 'status') = 'open'
+    AND (
+      COALESCE(t.occurred_at, t.created_at), t.created_at, t.turn_id
+    ) <= (
+      COALESCE(a.occurred_at, a.created_at), a.created_at, a.turn_id
+    )
+  ORDER BY COALESCE(t.occurred_at, t.created_at) DESC, t.turn_id DESC
+  LIMIT {normalized_limit}
+)
+SELECT jsonb_build_object(
+  'current_found', EXISTS(SELECT 1 FROM anchor),
+  'chains', COALESCE((
+    SELECT jsonb_agg(jsonb_build_object(
+      'chain_id', chain ->> 'chain_id',
+      'chain_type', chain ->> 'chain_type',
+      'state', chain ->> 'state',
+      'status', chain ->> 'status',
+      'anchor_turn_id', chain ->> 'anchor_turn_id',
+      'related_turn_ids', COALESCE(chain -> 'related_turn_ids', '[]'::jsonb),
+      'missing_evidence', COALESCE(chain -> 'missing_evidence', '[]'::jsonb),
+      'updated_by_turn_id', chain ->> 'updated_by_turn_id',
+      'related_turns', COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+          'turn_id', rt.turn_id,
+          'rule_phase', rt.rule_phase,
+          'occurred_at', rt.occurred_at,
+          'preview', COALESCE((
+            SELECT left(e.text_or_summary, 320)
+            FROM evidence_items e
+            WHERE e.user_id = rt.user_id
+              AND e.turn_id = rt.turn_id
+              AND e.layer = 'core'
+            ORDER BY e.ordinal NULLS LAST, e.evidence_id
+            LIMIT 1
+          ), '')
+        ) ORDER BY COALESCE(rt.occurred_at, rt.created_at), rt.created_at, rt.turn_id)
+        FROM turns rt
+        WHERE rt.user_id = {_sql_literal(user_id)}
+          AND rt.turn_id IN (
+            SELECT jsonb_array_elements_text(COALESCE(chain -> 'related_turn_ids', '[]'::jsonb))
+          )
+      ), '[]'::jsonb)
+    ))
+    FROM chain_rows
+  ), '[]'::jsonb)
+)::text;
+"""
+    payload = _json_from_psql_object(config, sql)
+    if not payload.get("current_found"):
+        return {
+            "status": "not_found",
+            "tool": "list_open_memory_chains",
+            "error_code": "current_turn_not_found",
+            "current_turn_id": current_turn_id,
+            "chains": [],
+            "count": 0,
+            "guidance": "当前 turn 尚未入库，不能查询未闭环故障链。",
+        }
+    chains = [item for item in payload.get("chains") or [] if isinstance(item, Mapping)]
+    return {
+        "status": "complete",
+        "tool": "list_open_memory_chains",
+        "current_turn_id": current_turn_id,
+        "chains": chains,
+        "count": len(chains),
+        "limit": normalized_limit,
+        "guidance": (
+            "这里只返回未闭环链和 turn 摘要；引用历史证据前仍须调用 read_session_turn_evidence。"
+        ),
     }
 
 
@@ -2227,10 +2939,15 @@ def postgres_quality_report(
 
 __all__ = [
     "DEFAULT_PG_CONFIG",
+    "get_turn_evidence",
     "ingest_turn_to_postgres",
+    "list_previous_session_turns",
+    "list_open_memory_chains",
     "list_memory_conflicts",
     "load_pg_config",
     "list_topic_memories",
+    "read_session_turn_evidence",
+    "save_memory_chain_state",
     "read_memory_history",
     "postgres_quality_report",
     "show_postgres_turn",

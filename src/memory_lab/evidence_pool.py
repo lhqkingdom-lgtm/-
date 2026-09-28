@@ -447,7 +447,24 @@ def _tool_items(bundle: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _kind_for_text(source_type: str, text: str, rule_phase: str) -> str:
     lower = text.casefold()
     if source_type in {"user_message", "user_answer"}:
-        if any(word in lower for word in ("修好了", "正常了", "验证通过", "已解决", "重新烧录")):
+        explicit_confirmation = any(
+            word in lower
+            for word in (
+                "修好了", "正常了", "验证通过", "已解决", "重新烧录",
+                "问题消失", "功能恢复", "恢复正常", "功能正常",
+            )
+        )
+        tested_positive_result = (
+            any(word in lower for word in ("测试", "验证", "试了", "运行"))
+            and any(
+                word in lower
+                for word in (
+                    "实现了", "已实现", "正常", "恢复", "通过了",
+                    "问题消失", "没问题", "可以了",
+                )
+            )
+        )
+        if explicit_confirmation or tested_positive_result:
             return "user_confirmation"
         if any(word in lower for word in ("烧录", "不转", "没反应", "现象", "无变化")):
             return "runtime_symptom"

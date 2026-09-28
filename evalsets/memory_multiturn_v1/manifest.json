@@ -1,0 +1,25 @@
+{
+  "schema_version": "memory-multiturn-manifest-v1",
+  "evalset_id": "memory_multiturn_v1",
+  "version": "1.0.0-candidate.2",
+  "status": "candidate",
+  "created_at": "2026-09-28",
+  "spec_file": "SPEC.md",
+  "scenario_file": "scenarios.json",
+  "case_file": "cases.jsonl",
+  "rubric_file": "rubric.json",
+  "fixture_file": "fixtures/initial_states.json",
+  "scenario_count": 10,
+  "release_gate_scenario_count": 8,
+  "known_gap_scenario_count": 2,
+  "provenance": {
+    "real_scenario_count": 10,
+    "synthetic_scenario_count": 0,
+    "source_databases": [
+      "D:/opencode-dev/opencode-dev.db",
+      "C:/Users/19873/.local/share/codepulse/opencode-dev.db"
+    ],
+    "isolated_turn_index": "D:/codepulse/Codepulse-Memory-Lab/data/eval/memory_eval_index.db"
+  },
+  "freeze_policy": "candidate 通过静态契约、证据哈希和人工审核后冻结；冻结后新增场景进入新版本。"
+}

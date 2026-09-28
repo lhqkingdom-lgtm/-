@@ -16,6 +16,66 @@ from memory_lab.store import open_store
 
 
 class ProcessNewTurnsTests(unittest.TestCase):
+    def test_partial_chain_persistence_failure_marks_turn_failed_for_retry(self) -> None:
+        candidate = {
+            "turn_id": "turn_chain",
+            "session_id": "session",
+            "user_message_id": "msg_chain",
+            "user_timestamp": 1000,
+            "state": "completed",
+            "input_hash": "hash_chain",
+            "assistant_count": 1,
+            "part_count": 2,
+            "active_tool_count": 0,
+        }
+        state_calls: list[dict] = []
+
+        def capture_state(**kwargs):
+            state_calls.append(kwargs)
+            return {"status": kwargs["status"]}
+
+        with (
+            patch.object(process_module, "ensure_turn_processing_state"),
+            patch.object(process_module, "run_ingestion", return_value={"run_id": "ingest"}),
+            patch.object(process_module, "run_turn_scan", return_value={"run_id": "scan"}),
+            patch.object(process_module, "source_id", return_value="src"),
+            patch.object(process_module, "load_terminal_turn_candidates", return_value=[candidate]),
+            patch.object(process_module, "_pg_processed_keys", return_value=set()),
+            patch.object(process_module, "mark_turn_processing_state", side_effect=capture_state),
+            patch.object(process_module, "ingest_turn_to_postgres", return_value={"ok": True}),
+            patch.object(
+                process_module,
+                "run_memory_react_agent",
+                return_value={
+                    "run_id": "react_chain",
+                    "status": "partial_failure",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "waiting_user_validation",
+                    },
+                    "chain_persistence": {
+                        "status": "retry",
+                        "error_code": "concurrent_chain_update",
+                    },
+                    "plan": {"changes": [{"action": "noop"}]},
+                },
+            ),
+        ):
+            report = process_new_turns(
+                source_database=Path("source.db"),
+                lab_database=Path("lab.db"),
+                pg_config_path=Path("pg.json"),
+                config_path=Path("config.json"),
+                limit=1,
+                dry_run=False,
+            )
+
+        self.assertEqual(report["completed_count"], 0)
+        self.assertEqual(report["failed_count"], 1)
+        self.assertEqual(report["turns"][0]["react_status"], "partial_failure")
+        self.assertEqual(state_calls[-1]["status"], "failed")
+        self.assertIn("concurrent_chain_update", state_calls[-1]["last_error"])
+
     def test_processing_state_table_keeps_dry_run_separate(self) -> None:
         self.assertIn("turn_processing_state", PROCESSING_STATE_TABLE_SQL)
         self.assertIn("dry_run boolean NOT NULL", PROCESSING_STATE_TABLE_SQL)

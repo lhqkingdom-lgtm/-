@@ -62,6 +62,58 @@ class FakeClient:
 
 
 class EvidencePoolTests(unittest.TestCase):
+    def test_user_test_with_positive_result_is_confirmation(self) -> None:
+        payload = bundle()
+        payload["user"]["text_parts"] = [
+            {
+                "source_part_id": "user_part",
+                "text": "现在我做了测试发现光感功能都实现了。",
+            }
+        ]
+        phase = {
+            "primary_phase": "requirement_alignment",
+            "primary_label": "需求对齐",
+            "phases": [],
+            "recommended_memory_targets": [],
+            "recommended_evidence_policy": "",
+        }
+
+        pool = build_evidence_pool(payload, phase_result=phase)
+
+        user_items = [
+            item
+            for item in pool["core_evidence"]
+            if item.get("source_type") == "user_message"
+        ]
+        self.assertEqual(len(user_items), 1)
+        self.assertEqual(user_items[0]["kind"], "user_confirmation")
+
+    def test_user_request_to_implement_is_not_confirmation(self) -> None:
+        payload = bundle()
+        payload["user"]["text_parts"] = [
+            {
+                "source_part_id": "user_part",
+                "text": "请帮我实现光感功能，完成后我再测试。",
+            }
+        ]
+        phase = {
+            "primary_phase": "requirement_alignment",
+            "primary_label": "需求对齐",
+            "phases": [],
+            "recommended_memory_targets": [],
+            "recommended_evidence_policy": "",
+        }
+
+        pool = build_evidence_pool(payload, phase_result=phase)
+
+        user_items = [
+            item
+            for item in pool["core_evidence"]
+            if item.get("source_type") == "user_message"
+        ]
+        self.assertEqual(len(user_items), 1)
+        self.assertNotEqual(user_items[0]["kind"], "user_confirmation")
+
     def test_core_candidate_and_pointer_are_separate(self) -> None:
         pool = build_evidence_pool(bundle())
 

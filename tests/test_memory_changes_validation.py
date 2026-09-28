@@ -9,6 +9,7 @@ from memory_lab.memory_changes import (
     MemoryChangesValidationError,
     commit_memory_changes,
     _digest_id,
+    _evidence_metadata,
     validate_memory_changes,
 )
 
@@ -146,6 +147,266 @@ def assert_valid(testcase: unittest.TestCase, proposal: dict) -> None:
 
 
 class MemoryChangesValidationTests(unittest.TestCase):
+    def _validate_with_snapshot(self, proposal: dict, snapshot: dict):
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot",
+            return_value=snapshot,
+        ):
+            return validate_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+    def _technical_create(self, memory_type: str, *, closure=None, evidence_id="ev_user") -> dict:
+        change = {
+            "action": "create_memory",
+            "reason": "测试技术闭环准入。",
+            "topic_id": "topic_language",
+            "memory": {
+                "stable_key": f"test.{memory_type}.closed_chain",
+                "memory_type": memory_type,
+                "summary": "经过验证的可复用技术经验。",
+                "content": "症状、原因、修复和验证已经闭环。",
+                "scope": {"level": "domain", "domain": "embedded"},
+                "confidence": 0.9,
+            },
+            "evidence_refs": [{"evidence_id": evidence_id, "reason": "闭环证据。"}],
+        }
+        if closure is not None:
+            change["technical_closure"] = closure
+        return base_proposal(change)
+
+    def test_compile_memory_requires_verified_closure(self) -> None:
+        with self.assertRaisesRegex(MemoryChangesValidationError, "technical_closure is required"):
+            self._validate_with_snapshot(
+                self._technical_create("compile_failure_experience", closure=None),
+                SNAPSHOT,
+            )
+
+    def test_compile_memory_accepts_build_verification(self) -> None:
+        snapshot = {
+            **SNAPSHOT,
+            "evidence_ids": ["ev_build"],
+            "evidence_details": {
+                "ev_build": {
+                    "source_type": "tool_result",
+                    "kind": "build_or_tool_result",
+                }
+            },
+        }
+        proposal = self._technical_create(
+            "compile_failure_experience",
+            evidence_id="ev_build",
+            closure={
+                "chain_type": "compilation",
+                "state": "compile_verified",
+                "verification_evidence_ids": ["ev_build"],
+            },
+        )
+        normalized = self._validate_with_snapshot(proposal, snapshot)
+        self.assertEqual(normalized["changes"][0]["technical_closure"]["state"], "compile_verified")
+
+    def test_runtime_memory_requires_user_confirmation_evidence(self) -> None:
+        snapshot = {
+            **SNAPSHOT,
+            "evidence_ids": ["ev_assistant"],
+            "evidence_details": {
+                "ev_assistant": {
+                    "source_type": "assistant_final",
+                    "kind": "diagnosis_or_solution",
+                }
+            },
+        }
+        proposal = self._technical_create(
+            "runtime_failure_experience",
+            evidence_id="ev_assistant",
+            closure={
+                "chain_type": "runtime",
+                "state": "user_verified",
+                "verification_evidence_ids": ["ev_assistant"],
+            },
+        )
+        with self.assertRaisesRegex(MemoryChangesValidationError, "requires user_confirmation"):
+            self._validate_with_snapshot(proposal, snapshot)
+
+    def test_runtime_memory_accepts_user_confirmation_evidence(self) -> None:
+        snapshot = {
+            **SNAPSHOT,
+            "evidence_ids": ["ev_user_confirmed"],
+            "evidence_details": {
+                "ev_user_confirmed": {
+                    "source_type": "user_message",
+                    "kind": "user_confirmation",
+                }
+            },
+        }
+        proposal = self._technical_create(
+            "runtime_failure_experience",
+            evidence_id="ev_user_confirmed",
+            closure={
+                "chain_type": "runtime",
+                "state": "user_verified",
+                "verification_evidence_ids": ["ev_user_confirmed"],
+            },
+        )
+        normalized = self._validate_with_snapshot(proposal, snapshot)
+        self.assertEqual(normalized["changes"][0]["technical_closure"]["state"], "user_verified")
+
+    def test_user_preference_rejects_technical_closure(self) -> None:
+        proposal = self._technical_create(
+            "user_preference",
+            closure={
+                "chain_type": "runtime",
+                "state": "user_verified",
+                "verification_evidence_ids": ["ev_user"],
+            },
+        )
+        with self.assertRaisesRegex(MemoryChangesValidationError, "only allowed"):
+            self._validate_with_snapshot(proposal, SNAPSHOT)
+
+    def test_existing_legacy_runtime_type_accepts_new_closure_rules(self) -> None:
+        snapshot = {
+            **SNAPSHOT,
+            "memory_types": {"mem_language": "runtime_failure_pattern"},
+            "evidence_ids": ["ev_user_confirmed"],
+            "evidence_details": {
+                "ev_user_confirmed": {
+                    "source_type": "user_message",
+                    "kind": "user_confirmation",
+                }
+            },
+        }
+        proposal = base_proposal(
+            {
+                "action": "update_memory",
+                "reason": "把新的用户验证补充到旧类型运行记忆。",
+                "target_memory_id": "mem_language",
+                "memory": {
+                    "summary": "运行问题经过用户重新烧录验证。",
+                    "content": "现象、根因、修复和用户验证已经闭环。",
+                    "confidence": 0.93,
+                },
+                "technical_closure": {
+                    "chain_type": "runtime",
+                    "state": "user_verified",
+                    "verification_evidence_ids": ["ev_user_confirmed"],
+                },
+                "evidence_refs": [
+                    {"evidence_id": "ev_user_confirmed", "reason": "用户确认。"}
+                ],
+            }
+        )
+        normalized = self._validate_with_snapshot(proposal, snapshot)
+        self.assertEqual(normalized["changes"][0]["action"], "update_memory")
+
+    def test_multi_turn_plan_accepts_authorized_historical_evidence(self) -> None:
+        proposal = {
+            "schema_version": MEMORY_CHANGES_SCHEMA_VERSION,
+            "turn_id": "turn_current",
+            "source_turn_ids": ["turn_current", "turn_previous"],
+            "reason": "跨 turn 闭环证据。",
+            "changes": [
+                {
+                    "action": "noop",
+                    "reason": "P3 只验证跨 turn 引用。",
+                    "evidence_refs": [
+                        {"evidence_id": "ev_previous", "reason": "历史验证证据。"}
+                    ],
+                }
+            ],
+        }
+        snapshot = {
+            **SNAPSHOT,
+            "turn_exists": True,
+            "evidence_ids": ["ev_user", "ev_previous"],
+            "authorized_source_turn_ids": ["turn_current", "turn_previous"],
+            "unauthorized_source_turn_ids": [],
+        }
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch(
+            "memory_lab.memory_changes._reference_snapshot", return_value=snapshot
+        ) as reference_snapshot:
+            normalized = validate_memory_changes(
+                proposal,
+                pg_config_path=Path("unused.json"),
+            )
+
+        self.assertEqual(normalized["source_turn_ids"], ["turn_current", "turn_previous"])
+        self.assertEqual(
+            reference_snapshot.call_args.args[3],
+            ["turn_current", "turn_previous"],
+        )
+
+    def test_multi_turn_plan_rejects_outside_conversation_source(self) -> None:
+        proposal = {
+            "schema_version": MEMORY_CHANGES_SCHEMA_VERSION,
+            "turn_id": "turn_current",
+            "source_turn_ids": ["turn_current", "turn_other_session"],
+            "reason": "错误跨会话引用。",
+            "changes": [
+                {
+                    "action": "noop",
+                    "reason": "不应通过。",
+                    "evidence_refs": [],
+                }
+            ],
+        }
+        snapshot = {
+            **SNAPSHOT,
+            "turn_exists": True,
+            "authorized_source_turn_ids": ["turn_current"],
+            "unauthorized_source_turn_ids": ["turn_other_session"],
+        }
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch("memory_lab.memory_changes._reference_snapshot", return_value=snapshot):
+            with self.assertRaisesRegex(
+                MemoryChangesValidationError,
+                "outside the current earlier conversation",
+            ):
+                validate_memory_changes(proposal, pg_config_path=Path("unused.json"))
+
+    def test_multi_turn_plan_requires_trigger_turn_and_unique_ids(self) -> None:
+        proposal = {
+            "schema_version": MEMORY_CHANGES_SCHEMA_VERSION,
+            "turn_id": "turn_current",
+            "source_turn_ids": ["turn_previous", "turn_previous"],
+            "reason": "错误来源列表。",
+            "changes": [
+                {"action": "noop", "reason": "不应通过。", "evidence_refs": []}
+            ],
+        }
+        with patch(
+            "memory_lab.memory_changes.load_pg_config",
+            return_value={"user": {"user_id": "local-default-user"}, "postgres": {}},
+        ), patch("memory_lab.memory_changes._reference_snapshot", return_value=SNAPSHOT):
+            with self.assertRaises(MemoryChangesValidationError) as raised:
+                validate_memory_changes(proposal, pg_config_path=Path("unused.json"))
+        message = str(raised.exception)
+        self.assertIn("is duplicated", message)
+        self.assertIn("must include current turn_id", message)
+
+    def test_evidence_metadata_preserves_all_source_turn_ids(self) -> None:
+        metadata = _evidence_metadata(
+            {
+                "turn_id": "turn_current",
+                "source_turn_ids": ["turn_previous", "turn_current"],
+            },
+            {
+                "action": "create_memory",
+                "reason": "闭环。",
+                "evidence_refs": [{"evidence_id": "ev_previous"}],
+            },
+        )
+
+        self.assertEqual(
+            metadata["source_turn_ids"],
+            ["turn_previous", "turn_current"],
+        )
+
     def test_rejects_unknown_action(self) -> None:
         assert_validation_errors(
             self,

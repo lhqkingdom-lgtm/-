@@ -35,15 +35,24 @@ from .memory_changes import (
     commit_memory_changes,
     validate_memory_changes,
 )
+from .memory_chain_state import (
+    CLOSED_STATES,
+    MemoryChainStateValidationError,
+    validate_chain_state,
+)
 from .pg_store import (
     DEFAULT_PG_CONFIG,
     expand_pointer,
     get_current_turn_evidence_summary,
+    list_open_memory_chains,
+    list_previous_session_turns,
     list_memory_conflicts,
     list_topic_memories,
     read_memory_detail,
     read_memory_history,
+    read_session_turn_evidence,
     read_topic_detail,
+    save_memory_chain_state,
     search_related_memories,
     trace_memory_relations,
 )
@@ -61,6 +70,9 @@ ALLOWED_TOOLS = {
     "list_topic_memories",
     "read_memory_history",
     "list_memory_conflicts",
+    "list_open_memory_chains",
+    "list_previous_session_turns",
+    "read_session_turn_evidence",
 }
 CONFLICT_RECORD_STATUSES = {
     "needs_review",
@@ -96,12 +108,16 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - memory_index：记忆摘要，只能用于发现相似/重复/冲突候选。
 
 3. observations：
-- search_related_memories / read_memory_detail / read_topic_detail / list_topic_memories / read_memory_history / list_memory_conflicts / expand_pointer / get_current_turn_evidence_summary 返回的详情。
+- search_related_memories / read_memory_detail / read_topic_detail / list_topic_memories / read_memory_history / list_memory_conflicts / expand_pointer / get_current_turn_evidence_summary / list_open_memory_chains / list_previous_session_turns / read_session_turn_evidence 返回的详情。
 - search_related_memories 只用于发现候选 memory，不代表已经读取正文，也不授权修改。
 - list_topic_memories 只列出某个主题下的 memory 摘要，用于判断是否需要继续 read_memory_detail。
 - read_memory_history 用于查看某条 memory 的版本历史，不授权修改。
 - list_memory_conflicts 用于查看已有冲突记录，避免重复记录冲突或判断是否需要补充冲突证据；默认只返回 needs_review/carried_forward 这类活跃风险，只有审计历史时才请求 include_resolved=true。
 - get_current_turn_evidence_summary 只用于回看当前 turn 的证据池，帮助确认 evidence_id 和本轮事实，不授权修改任何 memory。
+- list_open_memory_chains 只返回同会话未闭环技术链及关联 turn 摘要；它能发现相关历史 turn，但不授权引用摘要中的 evidence_id。
+- 任何 compilation/runtime 的最终判断（包括 noop + chain_state）前，都必须先调用一次 list_open_memory_chains。只有当前现象/失败、根因或修复与开放链属于同一故障时，才继续既有链并原样复制工具返回的 chain_id；仅仅同属 runtime/compilation、同会话或同一条多问题 turn 不算命中。根因或验证对象不同就省略 chain_id，形成独立链，绝不能用一个问题的用户确认关闭另一个问题的开放链。禁止编造 chain_id。
+- list_previous_session_turns 只发现同会话更早 turn 的摘要，不授权引用摘要里的 evidence_id。
+- 只有继续调用 read_session_turn_evidence 读取历史 turn 详情后，该 turn 和返回的 evidence_id 才进入跨 turn 证据授权集合。
 - trace_memory_relations 用于查看某条 memory 的版本历史和 supersedes/merges/conflicts_with 关系，不授权修改。
 - 只有 observations 中已经读到正文的 memory，才算可安全修改。
 
@@ -119,6 +135,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 - compile_failure_experience：编译、链接、构建或烧录前失败的症状、机制、修复与验证。
 - runtime_failure_experience：烧录/运行现象、代码或硬件配置根因、解决方法与验证。
 没有这三类价值时输出 noop；禁止发明近义类型。
+已有库中可能出现旧类型 workflow、compile_failure_pattern、runtime_failure_pattern；它们只用于兼容读取和更新，分别按 user_preference、compile_failure_experience、runtime_failure_experience 理解。新建 memory 仍只能使用上面三种新类型。
 
 不要按整轮主题或是否出现具体参数直接决定存不存。先逐项完成：
 1. 事实提取：分别检查 user、assistant、tool 中的独立结论；不能用用户问题或整轮主题的价值覆盖其他证据，不把推测写成事实。
@@ -134,16 +151,17 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 
 2. 类型必备证据门槛
 - user_preference：必须来自用户明确表达。未来取向、跨 turn 重复，或明确建立会持续影响后续迭代的协作机制是强证据；一次表达若包含可复用的“触发条件—做法—目的”，可低置信度沉淀。单次对象明确的临时命令仍然 noop。
-- compile_failure_experience：有明确失败/限制，且有证据支持的原因或可执行修复方向，即达到候选准入门槛；尚未完成修复验证时，降低 confidence 并明确“待验证”，不能仅因未验证而 noop。“编译通过”本身不是长期经验，除非它验证了某个失败修复。
+- compile_failure_experience：必须有明确失败/限制、证据支持的原因、已执行的修复，以及修复后编译通过的验证。未达到 compile_verified 时只保留 turn 证据并输出 noop + chain_state；“编译通过”本身不是长期经验，除非它验证了某个失败修复。
+- 编译工具返回的“可能含义”、通用错误说明或错误码释义不是已证实根因。若同一环境随后用另一入口/命令成功构建，不能直接归因于许可证、安装或环境损坏；必须先定位两种调用的关键差异。原因仍不明确时保留 failure_observed 未闭环链并 noop，不得把“换个入口后成功”包装成完整失败经验。
 - runtime_failure_experience：必须有用户反馈或工具确认的运行现象，以及定位原因和解决方向；只有现象时 request_more_evidence 或 noop。
-- 已有“用户现象 + 代码层根因 + 修复方向/已修改 + 编译验证”但未板上复测时，可以沉淀为候选运行经验，content 必须写“需板上确认/待用户运行验证”。
+- runtime_failure_experience 只有在用户测试/重新烧录/运行后明确确认正常，达到 user_verified，才能写入正式 memory。用户明确表示“我测试了，功能已实现/问题消失/现在正常”即属于 user_verified，不要求机械地逐字出现“烧录”；代码修好或编译通过都不能代替用户验证。
 
 3. 当前项目参数过滤门槛
 - 阈值、IO、PWM、定时、路径、产品名、功能开关、文件清单和一次性交付要求默认只作证据背景。
 - 若去掉这些细节后不能留下独立、可执行的机制或协作规则，输出 noop。
 - 具体细节只能限定适用范围，不能成为 summary 或 stable_key 的主体。
 
-需求文档存当前项目规格；长期记忆存跨相似任务仍有用的规则。没有证据支持的猜测应 noop；有证据支持但尚未完成验证的原因或修复方向可作为低置信度候选，并明确“待验证”。不要沉淀完整日志、完整工具输出或敏感信息。
+需求文档存当前项目规格；长期记忆存跨相似任务仍有用的规则。没有证据支持的猜测应 noop；有证据支持但尚未完成技术闭环的原因或修复方向仍只保留在 turn 证据中，通过 chain_state 说明当前状态和缺口，不创建或更新正式技术 memory。不要沉淀完整日志、完整工具输出或敏感信息。
 
 单轮多条记忆自检：
 - 一轮 turn 可以产生多条 memory，但每条必须有不同的核心结论、根因或用户偏好。
@@ -157,7 +175,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 每条 memory 的质量底线：
 - summary 必须表达可复用规则，而不是当前项目现象标题。
 - content 至少包含：适用范围/触发条件、现象或失败症状、根因、处理原则或修复方向、验证状态。
-- 如果缺少根因或修复方向，只能作为 candidate，并明确“待验证/需补证据”；不能写成已验证经验。
+- 如果缺少根因、修复方向或对应的最终验证，不得创建或更新正式技术 memory；输出 noop + chain_state，并明确缺少的证据。
 - 不要只写“某项目出现了某问题”；要写成“什么条件下容易出现什么问题，为什么，之后怎么避免/排查”。
 - 具体引脚、阈值、寄存器值、路径、文件名只能作为例子或证据背景，不能成为 summary 的主体，也不能作为 stable_key 的主要语义。
 
@@ -189,8 +207,8 @@ merge_memory：合并证据
 - 如果本轮只是重复证明同一结论，content 只需补一句“新增证据：……”，不要复制完整日志、完整执行流、完整错误列表或大段会话。
 - 如果目标 memory 已经很宽泛或内容已经较长，默认不要继续扩写；除非本轮证据直接增强同一句核心结论，否则应新建更小的 memory，或 noop。
 - 不要把用户习惯塞进工程流程记忆，也不要把编译失败经验塞进运行现象记忆；这些只是在同一主题下相关，不等于同一条 memory。
-- 如果本轮只提供未验证现象或助手推测，只能标为“待验证线索/可能原因”，不能把 memory 改写成已验证结论，也不能显著提高 confidence。
-- 如果目标 memory 已包含历史“已验证”结论，而本轮只是未验证新现象，必须明确区分：原有已验证结论仍来自旧证据；本轮只新增“类似现象/待验证线索”。不要写成“本轮已验证”。
+- 如果本轮只提供未验证现象或助手推测，不能创建或更新正式技术 memory，也不能提高已有 memory 的 confidence；只记录 chain_state 和缺少的验证证据。
+- 如果目标 memory 已包含历史“已验证”结论，而本轮只是未验证新现象，不要把未验证线索合并进正式 memory；输出 noop + chain_state，原有已验证结论保持不变。
 - 只有出现用户确认、编译/烧录/运行验证、明确工具结果时，才可以把“解决有效/已验证”写入 content，并适度提高 confidence。
 例：另一个项目也出现采样桩固定值导致状态不变化。
 
@@ -295,10 +313,11 @@ request_more_evidence：证据不足
 - “用户反馈现象”只能证明现象存在。
 - “助手定位/推理”只能证明候选根因，除非有工具结果或用户确认支撑。
 - “用户确认修复后正常 / 编译通过 / 烧录后验证正常 / 工具结果 verified=true”才算可写为已验证。
-- 对运行现象来说，编译通过只能证明修复代码语法/链接无误，不能证明板上现象已修好；但“用户现象 + 代码根因 + 修复 + 编译通过”可以作为待板上确认的候选经验沉淀。
-- 未验证证据合并到已有工程经验时，应保持或小幅调整 confidence；不要因为描述详细就自动提高置信度。
-- 同一条 memory 可以同时包含“已验证结论”和“待验证新增线索”，但必须标清每个结论对应的证据来源，避免把旧验证状态投射到新现象上。
-- 编译失败类 memory 的完整目标结构是“症状 → 原因 → 有效修复 → 验证方式”；候选阶段可以缺少验证结果，但必须明确“待验证”。不要沉淀完整编译日志、完整 diff、临时尝试或一次性路径。
+- 对运行现象来说，编译通过只能证明修复代码语法/链接无误，不能证明板上现象已修好。
+- 未闭环的编译/运行信息只保留在 turns/evidence_items；本轮输出 noop，并用 chain_state 记录缺少什么证据，不能创建或更新正式技术 memory。
+- 编译失败经验必须达到 compile_verified；运行失败经验必须有用户重新烧录/运行后的明确确认，达到 user_verified。
+- 不要因为描述详细就自动提高 confidence，也不要把旧验证状态投射到新现象上。
+- 编译失败类 memory 的完整目标结构是“症状 → 原因 → 有效修复 → 验证方式”；不要沉淀完整编译日志、完整 diff、临时尝试或一次性路径。
 
 如果 core/candidate 摘要不足以判断是否达到上述准入门槛，或无法确定验证状态，应请求 expand_pointer。
 如果已有 memory_index 数量有限或摘要看不出相关性，应先请求 search_related_memories，用关键词从主题标题、主题摘要、memory 摘要、memory 正文中召回候选。
@@ -309,6 +328,15 @@ request_more_evidence：证据不足
 如果要处理用户偏好变化或冲突，应请求 list_memory_conflicts 查看是否已有相同冲突记录。
 如果怀疑某条 memory 已被合并、替代或与其他 memory 冲突，应请求 trace_memory_relations 查看关系链。
 如果经过多轮工具调用后不确定当前 turn 的证据、evidence_id 或本轮是否足够支撑写入，可以请求 get_current_turn_evidence_summary 回看当前 turn 证据池。
+如果当前 turn 涉及编译或上板故障链，最终判断前必须先请求 list_open_memory_chains；若现象/根因/修复确实命中同一既有链，原样带回其 chain_id，并读取该链全部关联历史 turn 的证据，不得丢弃旧环节。开放链若描述的是另一个症状、根因或修复对象，即使来自同一会话、同一模块或同一条多问题 turn，也不得复用该 chain_id。若没有明确命中或需要发现尚未标记的历史环节，再请求 list_previous_session_turns。选中相关 turn 后，再请求 read_session_turn_evidence，不要一次读取整个会话。确认为全新链时不要填写 chain_id。
+chain_state 使用严格枚举，禁止发明近义状态：
+- 非技术 turn：chain_type=none，state=not_applicable，missing_evidence=[]；也可以完全省略 chain_state。noop 是记忆动作，不是 chain state。
+- 编译链：chain_type=compilation，state 只能是 failure_observed、cause_identified、fix_applied、compile_verified。
+- 运行链：chain_type=runtime，state 只能是 symptom_observed、cause_identified、fix_applied、waiting_user_validation、user_verified、fix_rejected。
+- needs_verification、needs_user_verification、unverified、compile_unverified、diagnosis_only、no_chain、noop 都不是合法 state；必须根据已有证据选上面的精确枚举。
+- 所有 chain_state 都必须包含 related_turn_ids 和 missing_evidence。未闭环技术链的 missing_evidence 必须非空；compile_verified、user_verified 和 none/not_applicable 的 missing_evidence 必须为空数组。
+- user_verified 只允许用于用户明确说明重新烧录/运行后正常；助手声称已修复、代码已修改或编译通过均不得使用 user_verified。
+- compile_verified 只允许用于失败修复后的编译/链接/构建验证；普通低价值 turn、路径问答和一次性任务不得因为助手文本提到编译而建立 compilation 链。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
 禁止凭 search_related_memories 结果直接 update_memory / merge_memory / mark_conflict / record_conflict_decision；搜索结果只用于决定下一步读哪个 memory/topic 详情。
 禁止凭 get_current_turn_evidence_summary 直接修改已有 memory；它只用于确认当前 turn 证据，修改已有 memory 仍必须先 read_memory_detail 或 read_topic_detail。
@@ -332,6 +360,9 @@ request_more_evidence：证据不足
     {"tool": "list_memory_conflicts", "memory_id": "已有 memory_id", "reason": "为什么查冲突记录"},
     {"tool": "expand_pointer", "raw_pointer_id": "本轮 pointer id", "reason": "为什么查"},
     {"tool": "get_current_turn_evidence_summary", "reason": "为什么需要回看当前 turn 证据"},
+    {"tool": "list_open_memory_chains", "reason": "为什么需要查看同会话未闭环技术链", "limit": 10},
+    {"tool": "list_previous_session_turns", "reason": "为什么需要查看同会话历史摘要", "limit": 10},
+    {"tool": "read_session_turn_evidence", "turn_id": "必须来自历史摘要结果", "reason": "为什么该历史 turn 与当前问题相关"},
     {"tool": "trace_memory_relations", "memory_id": "已有 memory_id", "reason": "为什么需要查版本/关系链"}
   ],
   "changes": []
@@ -342,14 +373,22 @@ request_more_evidence：证据不足
   "schema_version": "memory-react-v1",
   "decision": "final_changes",
   "reason": "中文说明最终判断",
+  "chain_state": {"chain_type":"runtime","state":"user_verified","related_turn_ids":["turn_xxx"],"missing_evidence":[]},
   "tool_requests": [],
   "changes": {
     "schema_version": "memory-changes-v1",
     "turn_id": "当前 turn_id",
+    "source_turn_ids": ["当前 turn_id", "已经 read_session_turn_evidence 读取过的历史 turn_id"],
     "reason": "中文整体判断",
     "changes": []
   }
 }
+
+chain_state 合法示例：
+- 非技术 noop：省略 chain_state，或 {"chain_type":"none","state":"not_applicable","related_turn_ids":["当前 turn_id"],"missing_evidence":[]}
+- 编译未闭环：{"chain_type":"compilation","state":"fix_applied","related_turn_ids":["当前 turn_id"],"missing_evidence":["修复后的编译通过证据"]}
+- 运行待复测：{"chain_type":"runtime","state":"waiting_user_validation","related_turn_ids":["当前 turn_id"],"missing_evidence":["用户重新烧录运行后的确认"]}
+- 运行修复被否定：{"chain_type":"runtime","state":"fix_rejected","related_turn_ids":["历史 turn_id","当前 turn_id"],"missing_evidence":["新的根因定位、有效修复和用户复测确认"]}
 
 memory-changes-v1 changes 可用 action：
 - create_memory
@@ -384,6 +423,11 @@ create_memory 示例：
     "content": "症状：编译烧录通过，但外设不随真实输入变化。触发条件：采样/驱动函数未读取真实硬件，而是返回固定常量。根因：主流程虽然执行，但输入数据恒定。解决：替换桩实现，按数据手册或现有驱动读取真实寄存器/外设。验证：改变真实输入后，下游状态、占空比或报警应随之变化。",
     "scope": {"level": "domain", "domain": "embedded"},
     "confidence": 0.9
+  },
+  "technical_closure": {
+    "chain_type": "runtime",
+    "state": "user_verified",
+    "verification_evidence_ids": ["ev_user_confirmation"]
   },
   "evidence_refs": [{"evidence_id": "ev_xxx", "reason": "证明症状、根因或验证"}]
 }
@@ -526,6 +570,10 @@ noop 示例：
 
 - decision=tool_requests 时，tool_requests 必须非空，changes 必须是空数组。
 - decision=final_changes 时，tool_requests 必须是空数组，changes 必须是完整 memory-changes-v1 对象。
+- changes.source_turn_ids 可省略；单 turn 时默认只有当前 turn。跨 turn 时必须包含当前 turn，且历史 turn 只能来自 turn_access_state.observed_turn_ids。
+- chain_state 可用于记录本轮重建出的故障链状态；技术 memory 写入时必须提供，并与 technical_closure 一致。
+- compile_failure_experience 的 create/merge/update 必须带 technical_closure，state 只能是 compile_verified。
+- runtime_failure_experience 的 create/merge/update 必须带 technical_closure，state 只能是 user_verified，验证证据必须包含用户确认。
 - 每轮最多请求 3 个工具。
 - 只能请求输入中真实存在的 topic_id / memory_id / raw_pointer_id。
 - 不能发明 evidence_id、memory_id、topic_id、raw_pointer_id。
@@ -547,6 +595,16 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 只修复 JSON schema、字段名、字段结构和引用 ID，不要改变原本语义判断。
 如果错误是 unsupported fields，必须删除这些字段，不能换成别的未知字段。
 特别注意：
+- chain_state 是严格协议字段，允许值只有：none/not_applicable；compilation/failure_observed、cause_identified、fix_applied、compile_verified；runtime/symptom_observed、cause_identified、fix_applied、waiting_user_validation、user_verified、fix_rejected。
+- needs_verification、needs_user_verification、unverified、compile_unverified、diagnosis_only、no_chain、noop 都是非法 state。根据 previous_output 的原意改成最接近的合法状态；noop 是 action，不是 state。
+- chain_state 必须含 chain_type、state、related_turn_ids、missing_evidence。未闭环技术链 missing_evidence 必须非空；compile_verified、user_verified、none/not_applicable 时必须为 []。
+- 非技术 turn 应省略 chain_state，或使用 none/not_applicable；不要因为助手文本里出现“编译”就建立技术链。
+- user_verified 必须有用户测试、重新烧录或运行后确认正常；用户明确说“我测试了，功能已实现/问题消失/现在正常”可以作为用户确认证据，不要求原话必须含“烧录”。不能由助手的修复声明或编译通过替代。compile_verified 必须是失败修复后的编译/链接/构建验证。
+- 如果校验错误要求先完成 list_open_memory_chains，不要继续输出技术 final_changes；改为请求 list_open_memory_chains 的 tool_requests。
+- decision=tool_requests 时必须同时输出 `changes: []`，不能省略 changes。
+- read_session_turn_evidence 只能读取 available_ids.discovered_turn_ids 中的历史 turn；current_turn_id 已在当前证据包内，禁止用历史工具读取当前 turn。
+- available_ids.observed_turn_ids 中的历史 turn 已经读取完成，禁止重复请求 read_session_turn_evidence；必须直接使用 observations 中已有证据继续判断。
+- read_session_turn_evidence.layers 如填写，只能是 `['core']`、`['core','candidate']` 或 `['core','candidate','pointer']` 这类由 core/candidate/pointer 组成的非空去重数组；不存在 raw/summary 层。不确定时省略 layers。
 - noop 只允许 action、reason、evidence_refs，不能带 memory_id、target_memory_id、topic_id、memory。
 - create_memory 只能二选一 topic 或 topic_id。
 - create_memory 不能修改已有 topic；已有主题必须使用 topic_id，改主题只能使用 update_topic。
@@ -554,6 +612,9 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 - merge_memory/merge_existing_memories/update_memory/retire_memory/move_memory_topic/mark_conflict 不能修改 topic；如需修改主题标题/概要，另行输出 update_topic。
 - merge_memory/merge_existing_memories/update_memory/mark_conflict 必须包含 memory 对象，memory 里必须包含 summary、content、confidence。
 - create_memory.memory.memory_type 只能是 user_preference、compile_failure_experience、runtime_failure_experience；旧类型或近义类型必须改成这三类之一，不能发明新类型。
+- compile_failure_experience 的 create/merge/update 必须带 technical_closure={"chain_type":"compilation","state":"compile_verified","verification_evidence_ids":[...]}。
+- runtime_failure_experience 的 create/merge/update 必须带 technical_closure={"chain_type":"runtime","state":"user_verified","verification_evidence_ids":[...]}，且验证证据必须是用户确认。
+- 写技术 memory 时顶层 chain_state 必须与 technical_closure 的 chain_type/state 一致。
 - merge_existing_memories 必须包含 source_memory_ids；source 不能包含 target。
 - retire_memory 不能包含 memory 对象；如目标 memory 有 active conflict，必须包含 conflict_disposition。
 - move_memory_topic 不能包含 memory 或 topic 对象，必须包含 from_topic_id 和 to_topic_id。
@@ -562,6 +623,8 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 - record_conflict_decision 必须使用 target_memory_id 和 conflict 对象。
 - 如果 merge_memory 缺少 memory 对象，必须基于已读取的目标 memory 正文和新增证据补出合并后的完整 memory 对象；不要删除该 action。
 - tool_requests 和 final_changes 不能混用。
+tool_requests 的最小合法完整示例：
+{"schema_version":"memory-react-v1","decision":"tool_requests","reason":"补充历史证据","tool_requests":[{"tool":"read_session_turn_evidence","turn_id":"必须来自 discovered_turn_ids 且不能是 current_turn_id","reason":"读取相关历史 turn","layers":["core","candidate","pointer"]}],"changes":[]}
 只能输出完整 JSON 对象，不要输出 Markdown、解释、代码块或额外文本。
 """
 
@@ -632,6 +695,11 @@ def _collect_available_ids(payload: Mapping[str, Any]) -> dict[str, set[str]]:
         "pointer_ids": pointer_ids,
         "topic_ids": topic_ids,
         "memory_ids": memory_ids,
+        "discovered_turn_ids": set(),
+        "observed_turn_ids": set(),
+        "historical_evidence_ids": set(),
+        "open_chain_scan_completed": set(),
+        "open_chain_ids": set(),
     }
 
 
@@ -663,6 +731,12 @@ def _tool_key(request: Mapping[str, Any]) -> tuple[str, str]:
         return tool, "|".join(parts)
     if tool == "get_current_turn_evidence_summary":
         return tool, "current_turn"
+    if tool == "list_open_memory_chains":
+        return tool, "current_session"
+    if tool == "list_previous_session_turns":
+        return tool, "current_session"
+    if tool == "read_session_turn_evidence":
+        return tool, str(request.get("turn_id") or "")
     if tool == "trace_memory_relations":
         return tool, str(request.get("memory_id") or "")
     return tool, ""
@@ -679,7 +753,8 @@ def validate_react_decision(
 ) -> dict[str, Any]:
     errors: list[str] = []
     required = {"schema_version", "decision", "reason", "tool_requests", "changes"}
-    extra = set(decision) - required
+    allowed = required | {"chain_state"}
+    extra = set(decision) - allowed
     missing = required - set(decision)
     if extra:
         errors.append(f"unexpected top-level fields: {sorted(extra)}")
@@ -691,6 +766,47 @@ def validate_react_decision(
         errors.append("decision must be tool_requests or final_changes")
     if not _non_empty_string(decision.get("reason")):
         errors.append("reason must be a non-empty string")
+
+    chain_state = decision.get("chain_state")
+    if chain_state is not None:
+        try:
+            chain_state = validate_chain_state(
+                chain_state,
+                current_turn_id=turn_id,
+                observed_turn_ids=available_ids.get("observed_turn_ids") or set(),
+            )
+        except MemoryChainStateValidationError as error:
+            errors.extend(error.errors)
+
+    if (
+        decision.get("decision") == "final_changes"
+        and isinstance(chain_state, Mapping)
+        and chain_state.get("chain_type") in {"compilation", "runtime"}
+    ):
+        if "current_session" not in (
+            available_ids.get("open_chain_scan_completed") or set()
+        ):
+            errors.append(
+                "technical final decision requires a completed list_open_memory_chains observation"
+            )
+        chain_id = str(chain_state.get("chain_id") or "")
+        if chain_id:
+            if chain_id not in (available_ids.get("open_chain_ids") or set()):
+                errors.append(
+                    "chain_state.chain_id must come from a completed list_open_memory_chains observation"
+                )
+            required_turn_ids = available_ids.get(
+                f"open_chain_required::{chain_id}"
+            ) or set()
+            related_turn_ids = {
+                str(item) for item in chain_state.get("related_turn_ids") or []
+            }
+            missing_turn_ids = set(required_turn_ids) - related_turn_ids
+            if missing_turn_ids:
+                errors.append(
+                    "chain_state.related_turn_ids cannot drop turns from the selected open chain: "
+                    + ", ".join(sorted(missing_turn_ids))
+                )
 
     tool_requests = decision.get("tool_requests")
     if not isinstance(tool_requests, list):
@@ -755,6 +871,20 @@ def validate_react_decision(
                 "max_items_per_layer",
                 "max_chars",
             },
+            "list_open_memory_chains": {"tool", "reason", "limit"},
+            "list_previous_session_turns": {
+                "tool",
+                "reason",
+                "limit",
+                "preview_chars",
+            },
+            "read_session_turn_evidence": {
+                "tool",
+                "turn_id",
+                "reason",
+                "layers",
+                "max_chars",
+            },
             "trace_memory_relations": {
                 "tool",
                 "memory_id",
@@ -772,6 +902,9 @@ def validate_react_decision(
             "expand_pointer": {"tool", "raw_pointer_id", "reason"},
             "search_related_memories": {"tool", "query", "reason"},
             "get_current_turn_evidence_summary": {"tool", "reason"},
+            "list_open_memory_chains": {"tool", "reason"},
+            "list_previous_session_turns": {"tool", "reason"},
+            "read_session_turn_evidence": {"tool", "turn_id", "reason"},
             "trace_memory_relations": {"tool", "memory_id", "reason"},
         }[str(tool)]
         extra_request = set(request) - allowed_by_tool
@@ -809,6 +942,57 @@ def validate_react_decision(
                     max_chars_value = int(request.get("max_chars"))
                     if max_chars_value < 80 or max_chars_value > 4000:
                         errors.append(f"{prefix}.max_chars must be between 80 and 4000")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.max_chars must be an integer")
+        if tool == "list_open_memory_chains":
+            if "limit" in request:
+                try:
+                    open_chain_limit = int(request.get("limit"))
+                    if open_chain_limit < 1 or open_chain_limit > 20:
+                        errors.append(f"{prefix}.limit must be between 1 and 20")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
+        if tool == "list_previous_session_turns":
+            if "limit" in request:
+                try:
+                    history_limit = int(request.get("limit"))
+                    if history_limit < 1 or history_limit > 20:
+                        errors.append(f"{prefix}.limit must be between 1 and 20")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.limit must be an integer")
+            if "preview_chars" in request:
+                try:
+                    preview_chars = int(request.get("preview_chars"))
+                    if preview_chars < 80 or preview_chars > 800:
+                        errors.append(f"{prefix}.preview_chars must be between 80 and 800")
+                except (TypeError, ValueError):
+                    errors.append(f"{prefix}.preview_chars must be an integer")
+        if tool == "read_session_turn_evidence":
+            target_turn_id = str(request.get("turn_id") or "")
+            if target_turn_id not in (available_ids.get("discovered_turn_ids") or set()):
+                errors.append(
+                    f"{prefix}.turn_id must come from a completed list_open_memory_chains or list_previous_session_turns observation"
+                )
+            if target_turn_id in (available_ids.get("observed_turn_ids") or set()):
+                errors.append(
+                    f"{prefix}.turn_id was already read; use the existing observation instead of repeating the tool request"
+                )
+            if "layers" in request:
+                layers = request.get("layers")
+                if (
+                    not isinstance(layers, list)
+                    or not layers
+                    or any(layer not in {"core", "candidate", "pointer"} for layer in layers)
+                    or len(set(layers)) != len(layers)
+                ):
+                    errors.append(
+                        f"{prefix}.layers must be a non-empty unique array of core/candidate/pointer"
+                    )
+            if "max_chars" in request:
+                try:
+                    history_max_chars = int(request.get("max_chars"))
+                    if history_max_chars < 80 or history_max_chars > 8000:
+                        errors.append(f"{prefix}.max_chars must be between 80 and 8000")
                 except (TypeError, ValueError):
                     errors.append(f"{prefix}.max_chars must be an integer")
         if tool == "trace_memory_relations":
@@ -881,6 +1065,43 @@ def validate_react_decision(
             normalized_changes = validate_memory_changes(changes, pg_config_path=pg_config_path)
             if normalized_changes.get("turn_id") != turn_id:
                 errors.append("changes.turn_id must equal current turn_id")
+            source_turn_ids = normalized_changes.get("source_turn_ids")
+            if source_turn_ids is None:
+                source_turn_ids = [turn_id]
+            allowed_source_turn_ids = {
+                turn_id,
+                *(available_ids.get("observed_turn_ids") or set()),
+            }
+            if isinstance(source_turn_ids, list):
+                unauthorized_source_turn_ids = {
+                    str(source_turn_id)
+                    for source_turn_id in source_turn_ids
+                    if str(source_turn_id) not in allowed_source_turn_ids
+                }
+                if unauthorized_source_turn_ids:
+                    errors.append(
+                        "changes.source_turn_ids contain historical turns that were not read by read_session_turn_evidence: "
+                        + ", ".join(sorted(unauthorized_source_turn_ids))
+                    )
+            technical_closures = [
+                change.get("technical_closure")
+                for change in normalized_changes.get("changes") or []
+                if isinstance(change, Mapping)
+                and isinstance(change.get("technical_closure"), Mapping)
+            ]
+            if technical_closures:
+                if not isinstance(chain_state, Mapping):
+                    errors.append("chain_state is required when writing a technical memory")
+                else:
+                    for closure_index, closure in enumerate(technical_closures):
+                        if closure.get("chain_type") != chain_state.get("chain_type"):
+                            errors.append(
+                                f"technical_closure[{closure_index}].chain_type must match chain_state.chain_type"
+                            )
+                        if closure.get("state") != chain_state.get("state"):
+                            errors.append(
+                                f"technical_closure[{closure_index}].state must match chain_state.state"
+                            )
             observed = observed_memory_ids or set()
             for change_index, change in enumerate(normalized_changes.get("changes") or []):
                 if not isinstance(change, Mapping):
@@ -987,6 +1208,31 @@ def _execute_tool_request(
             max_items_per_layer=int(request.get("max_items_per_layer") or 12),
             max_chars=int(request.get("max_chars") or max_chars),
         )
+    if tool == "list_open_memory_chains":
+        return list_open_memory_chains(
+            pg_config_path=pg_config_path,
+            current_turn_id=turn_id,
+            limit=int(request.get("limit") or 10),
+        )
+    if tool == "list_previous_session_turns":
+        return list_previous_session_turns(
+            pg_config_path=pg_config_path,
+            current_turn_id=turn_id,
+            limit=int(request.get("limit") or 10),
+            preview_chars=int(request.get("preview_chars") or 320),
+        )
+    if tool == "read_session_turn_evidence":
+        return read_session_turn_evidence(
+            pg_config_path=pg_config_path,
+            current_turn_id=turn_id,
+            target_turn_id=str(request["turn_id"]),
+            layers=(
+                [str(layer) for layer in request.get("layers") or []]
+                if request.get("layers")
+                else None
+            ),
+            max_chars=int(request.get("max_chars") or max_chars),
+        )
     if tool == "trace_memory_relations":
         return trace_memory_relations(
             pg_config_path=pg_config_path,
@@ -1045,6 +1291,81 @@ def _execute_tool_requests(
                 }
             )
     return observations
+
+
+def _update_turn_access_ids(
+    available_ids: dict[str, set[str]],
+    observations: list[dict[str, Any]],
+) -> None:
+    """Promote only successfully observed history into the authorization state."""
+
+    discovered = available_ids.setdefault("discovered_turn_ids", set())
+    observed = available_ids.setdefault("observed_turn_ids", set())
+    evidence_ids = available_ids.setdefault("evidence_ids", set())
+    pointer_ids = available_ids.setdefault("pointer_ids", set())
+    historical_evidence = available_ids.setdefault("historical_evidence_ids", set())
+    open_chain_scans = available_ids.setdefault("open_chain_scan_completed", set())
+    open_chain_ids = available_ids.setdefault("open_chain_ids", set())
+    for observation in observations:
+        if observation.get("status") != "complete":
+            continue
+        result = observation.get("result")
+        if not isinstance(result, Mapping) or result.get("status") != "complete":
+            continue
+        tool = result.get("tool")
+        if tool == "list_open_memory_chains":
+            open_chain_scans.add("current_session")
+            current_turn_id = str(result.get("current_turn_id") or "")
+            for chain in result.get("chains") or []:
+                if not isinstance(chain, Mapping):
+                    continue
+                chain_id = str(chain.get("chain_id") or "")
+                if chain_id:
+                    open_chain_ids.add(chain_id)
+                required_turn_ids = (
+                    available_ids.setdefault(f"open_chain_required::{chain_id}", set())
+                    if chain_id
+                    else set()
+                )
+                for related_turn_id in chain.get("related_turn_ids") or []:
+                    related_turn_id = str(related_turn_id or "")
+                    if related_turn_id and related_turn_id != current_turn_id:
+                        discovered.add(related_turn_id)
+                        required_turn_ids.add(related_turn_id)
+            continue
+        if tool == "list_previous_session_turns":
+            for item in result.get("turns") or []:
+                if isinstance(item, Mapping) and item.get("turn_id"):
+                    discovered.add(str(item["turn_id"]))
+            continue
+        if tool != "read_session_turn_evidence":
+            continue
+        target_turn_id = str(result.get("target_turn_id") or "")
+        if not target_turn_id or target_turn_id not in discovered:
+            continue
+        detail = result.get("evidence")
+        if not isinstance(detail, Mapping):
+            continue
+        turn = detail.get("turn")
+        if not isinstance(turn, Mapping) or str(turn.get("turn_id") or "") != target_turn_id:
+            continue
+        observed.add(target_turn_id)
+        layers = detail.get("layers")
+        if not isinstance(layers, Mapping):
+            continue
+        for layer_name in ("core", "candidate", "pointer"):
+            for item in layers.get(layer_name) or []:
+                if not isinstance(item, Mapping):
+                    continue
+                evidence_id = str(item.get("evidence_id") or "")
+                raw_pointer_id = str(item.get("raw_pointer_id") or "")
+                if evidence_id:
+                    evidence_ids.add(evidence_id)
+                    historical_evidence.add(evidence_id)
+                    if layer_name == "pointer":
+                        pointer_ids.add(evidence_id)
+                if raw_pointer_id:
+                    pointer_ids.add(raw_pointer_id)
 
 
 def _observed_memory_ids(observations: list[dict[str, Any]]) -> set[str]:
@@ -1129,6 +1450,63 @@ def _auto_required_memory_reads(
     return result
 
 
+def _auto_required_chain_reads(
+    raw_decision: Mapping[str, Any],
+    *,
+    available_ids: Mapping[str, set[str]],
+    max_requests: int = 3,
+) -> list[dict[str, Any]]:
+    """Run mandatory chain discovery and read missing chain evidence.
+
+    A technical final decision is not valid until open chains were listed.
+    When the model skips that protocol step, the orchestrator performs the
+    read-only discovery call and asks the model to decide again.  If the model
+    then selects an existing chain from that result, all unread chain turns are
+    loaded in the same way.  These reads add evidence; they never choose a
+    state or write a memory on the model's behalf.
+    """
+
+    if raw_decision.get("decision") != "final_changes":
+        return []
+    chain_state = raw_decision.get("chain_state")
+    if not isinstance(chain_state, Mapping):
+        return []
+    chain_type = str(chain_state.get("chain_type") or "")
+    if (
+        chain_type in {"compilation", "runtime"}
+        and "current_session"
+        not in (available_ids.get("open_chain_scan_completed") or set())
+        and not (available_ids.get("open_chain_ids") or set())
+    ):
+        return [
+            {
+                "tool": "list_open_memory_chains",
+                "reason": (
+                    "程序强制补协议步骤：技术最终判断前必须先查看同会话未闭环故障链。"
+                ),
+                "limit": 10,
+            }
+        ]
+    chain_id = str(chain_state.get("chain_id") or "")
+    if not chain_id or chain_id not in (available_ids.get("open_chain_ids") or set()):
+        return []
+    required_turn_ids = available_ids.get(f"open_chain_required::{chain_id}") or set()
+    observed_turn_ids = available_ids.get("observed_turn_ids") or set()
+    missing_turn_ids = sorted(set(required_turn_ids) - set(observed_turn_ids))
+    return [
+        {
+            "tool": "read_session_turn_evidence",
+            "turn_id": turn_id,
+            "reason": (
+                "程序强制补证据：继续既有故障链前，必须读取该链关联历史 turn 的详细证据。"
+            ),
+            "layers": ["core", "candidate", "pointer"],
+            "max_chars": 4000,
+        }
+        for turn_id in missing_turn_ids[:max_requests]
+    ]
+
+
 def _react_payload(
     *,
     initial_context: Mapping[str, Any],
@@ -1166,6 +1544,14 @@ def _react_payload(
             "observed_memory_ids": sorted(observed_memory_ids),
             "modifiable_memory_ids": sorted(observed_memory_ids),
             "rule": "memory_index 只是摘要索引；只有 modifiable_memory_ids 中的 memory 才允许 update/merge/merge_existing/retire/move_memory_topic/mark_conflict/record_conflict_decision。",
+        },
+        "turn_access_state": {
+            "discovered_turn_ids": sorted(available_ids.get("discovered_turn_ids") or set()),
+            "observed_turn_ids": sorted(available_ids.get("observed_turn_ids") or set()),
+            "authorized_historical_evidence_ids": sorted(
+                available_ids.get("historical_evidence_ids") or set()
+            ),
+            "rule": "历史摘要只用于发现候选；只有 observed_turn_ids 中已读取详情的 turn，其返回 evidence_id 才可在后续跨 turn 提交阶段使用。",
         },
         "action_decision_guide": {
             "create_memory": "有长期价值，已有 memory 不能覆盖，能形成清晰 stable_key，证据足够。",
@@ -1247,6 +1633,28 @@ def _react_payload(
                 "purpose": "回看当前 turn 的 core/candidate/pointer 紧凑摘要和可引用 evidence_id；不能直接授权修改已有 memory",
             },
             {
+                "tool": "list_open_memory_chains",
+                "args": {"limit": "可选；1-20，默认 10"},
+                "purpose": "列出同用户、同数据源、同会话、同项目的未闭环编译/上板链及关联 turn 摘要；只用于发现，不直接授权历史 evidence_id",
+            },
+            {
+                "tool": "list_previous_session_turns",
+                "args": {
+                    "limit": "可选；1-20，默认 10",
+                    "preview_chars": "可选；80-800，默认 320",
+                },
+                "purpose": "只列出同用户、同数据源、同会话、同项目且早于当前 turn 的摘要；只用于发现相关历史 turn",
+            },
+            {
+                "tool": "read_session_turn_evidence",
+                "args": {
+                    "turn_id": "必须来自已完成的 list_previous_session_turns 结果",
+                    "layers": "可选；core/candidate/pointer 的非重复子集",
+                    "max_chars": "可选；80-8000",
+                },
+                "purpose": "读取一个已发现历史 turn 的三层证据；成功后才授权该 turn 和返回 evidence_id",
+            },
+            {
                 "tool": "trace_memory_relations",
                 "args": {
                     "memory_id": "必须来自 available_ids.memory_ids",
@@ -1263,6 +1671,18 @@ def _react_payload(
             "schema_version": MEMORY_REACT_SCHEMA_VERSION,
             "decision": "tool_requests | final_changes",
             "reason": "中文原因",
+            "chain_state": {
+                "required_for": "all compilation/runtime final decisions",
+                "optional_for_non_technical": True,
+                "fields": ["chain_id?", "chain_type", "state", "related_turn_ids", "missing_evidence"],
+                "state_enums": {
+                    "none": ["not_applicable"],
+                    "compilation": ["failure_observed", "cause_identified", "fix_applied", "compile_verified"],
+                    "runtime": ["symptom_observed", "cause_identified", "fix_applied", "waiting_user_validation", "user_verified", "fix_rejected"],
+                },
+                "missing_evidence_rule": "open technical state requires non-empty array; closed or none state requires []",
+                "chain_id_rule": "only copy an existing chain_id returned by list_open_memory_chains",
+            },
             "tool_requests": [],
             "changes": "[] when tool_requests; memory-changes-v1 object when final_changes",
         },
@@ -1305,20 +1725,32 @@ def _validate_or_repair_react(
                 "required_schema": payload["required_output_schema"],
                 "current_turn_id": turn_id,
                 "strict_field_rules": {
+                    "memory_changes_top_level": [
+                        "schema_version",
+                        "turn_id",
+                        "source_turn_ids?",
+                        "reason",
+                        "changes",
+                    ],
                     "allowed_create_memory_types": sorted(ALLOWED_MEMORY_TYPES),
+                    "create_memory": [
+                        "action", "reason", "client_temp_id?", "topic|topic_id",
+                        "memory", "technical_closure?", "evidence_refs",
+                    ],
                     "noop": ["action", "reason", "evidence_refs"],
                     "request_more_evidence": ["action", "reason", "requests", "evidence_refs"],
-                    "merge_memory": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],
+                    "merge_memory": ["action", "reason", "target_memory_id", "memory", "technical_closure?", "evidence_refs"],
                     "merge_existing_memories": [
                         "action",
                         "reason",
                         "target_memory_id",
                         "source_memory_ids",
                         "memory",
+                        "technical_closure?",
                         "evidence_refs",
                         "conflict_disposition",
                     ],
-                    "update_memory": ["action", "reason", "target_memory_id", "memory", "evidence_refs"],
+                    "update_memory": ["action", "reason", "target_memory_id", "memory", "technical_closure?", "evidence_refs"],
                     "retire_memory": ["action", "reason", "target_memory_id", "evidence_refs", "conflict_disposition"],
                     "move_memory_topic": ["action", "reason", "target_memory_id", "from_topic_id", "to_topic_id", "evidence_refs"],
                     "merge_topics": ["action", "reason", "target_topic_id", "source_topic_ids", "evidence_refs"],
@@ -1326,6 +1758,7 @@ def _validate_or_repair_react(
                     "update_topic": ["action", "reason", "target_topic_id", "topic", "evidence_refs"],
                     "record_conflict_decision": ["action", "reason", "target_memory_id", "conflict", "evidence_refs"],
                     "memory_for_existing_target": ["summary", "content", "confidence"],
+                    "technical_closure": ["chain_type", "state", "verification_evidence_ids"],
                     "topic_patch": ["title", "summary"],
                     "conflict": ["conflict_type", "old_claim", "new_claim", "decision", "reason", "status", "metadata"],
                     "tool_request_expand_pointer": ["tool", "raw_pointer_id", "reason"],
@@ -1348,6 +1781,24 @@ def _validate_or_repair_react(
                         "domain?",
                         "project_key?",
                         "limit?",
+                    ],
+                    "tool_request_list_open_memory_chains": [
+                        "tool",
+                        "reason",
+                        "limit?",
+                    ],
+                    "tool_request_list_previous_session_turns": [
+                        "tool",
+                        "reason",
+                        "limit?",
+                        "preview_chars?",
+                    ],
+                    "tool_request_read_session_turn_evidence": [
+                        "tool",
+                        "turn_id",
+                        "reason",
+                        "layers?",
+                        "max_chars?",
                     ],
                 },
             }
@@ -1454,11 +1905,17 @@ def run_memory_react_agent(
             user_payload=payload,
             max_tokens=9000,
         )
-        auto_reads = _auto_required_memory_reads(
+        auto_chain_reads = _auto_required_chain_reads(
+            raw,
+            available_ids=available_ids,
+            max_requests=3,
+        )
+        auto_memory_reads = _auto_required_memory_reads(
             raw,
             available_ids=available_ids,
             observed_memory_ids=_observed_memory_ids(observations),
         )
+        auto_reads = [*auto_chain_reads, *auto_memory_reads][:3]
         if auto_reads:
             new_observations = _execute_tool_requests(
                 auto_reads,
@@ -1469,6 +1926,7 @@ def run_memory_react_agent(
                 max_chars=4000,
             )
             observations.extend(new_observations)
+            _update_turn_access_ids(available_ids, new_observations)
             iteration_logs.append(
                 {
                     "iteration": iteration,
@@ -1546,6 +2004,7 @@ def run_memory_react_agent(
                 max_chars=4000,
             )
             observations.extend(new_observations)
+            _update_turn_access_ids(available_ids, new_observations)
             steps.append(
                 _step(
                     "execute_read_tools",
@@ -1585,8 +2044,19 @@ def run_memory_react_agent(
         return {**result, "run_id": run_id, "log": _write_run_log(run_log=run_log, log_dir=log_dir)}
 
     plan = dict(final_decision["changes"])
+    chain_state = final_decision.get("chain_state")
     change_count = len(plan.get("changes") or [])
     steps.append(_step("final_changes", "complete", f"changes={change_count}"))
+    if isinstance(chain_state, Mapping):
+        steps.append(
+            _step(
+                "reconstruct_chain_state",
+                "complete",
+                f"chain_type={chain_state.get('chain_type')} state={chain_state.get('state')}",
+                related_turn_ids=list(chain_state.get("related_turn_ids") or []),
+                missing_evidence=list(chain_state.get("missing_evidence") or []),
+            )
+        )
 
     if dry_run:
         result = {
@@ -1595,6 +2065,7 @@ def run_memory_react_agent(
             "turn_id": turn_id,
             "iterations": len(iteration_logs),
             "observation_count": len(observations),
+            "chain_state": chain_state,
             "plan": plan,
             "committed": False,
         }
@@ -1623,14 +2094,88 @@ def run_memory_react_agent(
             f"applied={(commit.get('counts') or {}).get('applied', 0)} rejected={(commit.get('counts') or {}).get('rejected', 0)}",
         )
     )
+    chain_persistence: dict[str, Any] | None = None
+    if isinstance(chain_state, Mapping) and chain_state.get("chain_type") != "none":
+        if commit.get("ok"):
+            final_memory_ids: list[str] = []
+            for item in commit.get("applied") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                index = item.get("index")
+                plan_changes = plan.get("changes") if isinstance(plan, Mapping) else None
+                if not isinstance(plan_changes, list):
+                    continue
+                if not isinstance(index, int) and len(plan_changes) == 1:
+                    index = 0
+                if not isinstance(index, int) or index < 0 or index >= len(plan_changes):
+                    continue
+                planned_change = plan_changes[index]
+                closure = (
+                    planned_change.get("technical_closure")
+                    if isinstance(planned_change, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(closure, Mapping)
+                    or closure.get("chain_type") != chain_state.get("chain_type")
+                    or (closure.get("chain_type"), closure.get("state"))
+                    not in CLOSED_STATES
+                ):
+                    # A mixed turn may update a user preference while also
+                    # keeping a technical chain open. Only a formal memory
+                    # carrying the matching technical closure belongs to the
+                    # chain and may be linked as its final memory.
+                    continue
+                memory_id = item.get("memory_id") or item.get("target_memory_id")
+                if memory_id and str(memory_id) not in final_memory_ids:
+                    final_memory_ids.append(str(memory_id))
+            chain_persistence = save_memory_chain_state(
+                pg_config_path=pg_config_path,
+                current_turn_id=turn_id,
+                chain_state=chain_state,
+                final_memory_ids=final_memory_ids,
+            )
+            chain_status = str(chain_persistence.get("status") or "unknown")
+            steps.append(
+                _step(
+                    "persist_chain_state",
+                    "complete" if chain_status in {"complete", "skipped"} else "failed",
+                    f"status={chain_status} result={chain_persistence.get('result', '')}",
+                    chain_id=(chain_persistence.get("chain") or {}).get("chain_id"),
+                    error_code=chain_persistence.get("error_code"),
+                )
+            )
+        else:
+            chain_persistence = {
+                "status": "skipped",
+                "result": "memory_commit_failed",
+                "guidance": "记忆提交存在拒绝项，故障链状态未推进。",
+            }
+            steps.append(
+                _step(
+                    "persist_chain_state",
+                    "skipped",
+                    "memory commit failed; chain state was not advanced",
+                )
+            )
+    result_status = "complete"
+    if isinstance(chain_persistence, Mapping) and chain_persistence.get("status") in {
+        "rejected",
+        "denied",
+        "retry",
+        "not_found",
+    }:
+        result_status = "partial_failure"
     result = {
-        "status": "complete",
+        "status": result_status,
         "mode": "commit",
         "turn_id": turn_id,
         "iterations": len(iteration_logs),
         "observation_count": len(observations),
+        "chain_state": chain_state,
         "plan": plan,
         "commit": commit,
+        "chain_persistence": chain_persistence,
         "committed": committed,
     }
     run_log = {

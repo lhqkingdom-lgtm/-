@@ -1,0 +1,48 @@
+{
+  "schema_version": "memory-multiturn-rubric-v1",
+  "total_score": 100,
+  "hard_failures": [
+    "unclosed_technical_chain_writes_formal_memory",
+    "cross_session_or_unrelated_chain_contamination",
+    "hallucinated_root_cause_fix_or_verification",
+    "runtime_memory_without_user_run_confirmation",
+    "duplicate_formal_memory_for_same_failure_chain"
+  ],
+  "dimensions": [
+    {
+      "id": "decision_correctness",
+      "name": "动作与闭环判断",
+      "weight": 30,
+      "criteria": "该 noop 时不写；闭环时才创建或维护正式记忆；选择正确故障链。"
+    },
+    {
+      "id": "evidence_completeness",
+      "name": "证据完整性",
+      "weight": 25,
+      "criteria": "技术经验覆盖现象、原因、修复、验证，并读取所有必需历史 turn。"
+    },
+    {
+      "id": "reuse_value",
+      "name": "复用价值",
+      "weight": 20,
+      "criteria": "表达为相似任务可复用的条件、机制和处理办法，而不是当前项目流水账。"
+    },
+    {
+      "id": "scope_and_noise_control",
+      "name": "范围与噪声控制",
+      "weight": 15,
+      "criteria": "不混入一次性参数、路径、完整日志、不相关 turn 或无依据推断。"
+    },
+    {
+      "id": "organization_quality",
+      "name": "组织与去重",
+      "weight": 10,
+      "criteria": "同一故障链形成一条完整记忆，不拆碎、不重复，主题归属合理。"
+    }
+  ],
+  "thresholds": {
+    "scenario_pass": 80,
+    "release_gate_average": 85,
+    "hard_failure_allowed": 0
+  }
+}

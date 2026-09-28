@@ -1,0 +1,231 @@
+{
+  "schema_version": "memory-multiturn-scenarios-v1",
+  "evalset_id": "memory_multiturn_v1",
+  "spec_version": "1.0.0-candidate.2",
+  "scenarios": [
+    {
+      "scenario_id": "runtime_fan_oscillation_user_verified",
+      "title": "风扇阈值附近反复启停，修复后由用户上板确认",
+      "mode": "sequential",
+      "split": "development",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "C:/Users/19873/.local/share/codepulse/opencode-dev.db", "session_ids": ["ses_f5697e93effe4JEIlTKFDBzbLi"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": [
+        "turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573",
+        "turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8",
+        "turn_3fe3d67dcb7e226029818870637f74f7e13e85aa87d84bdb84ad882551f8b4d6"
+      ],
+      "steps": [
+        {"index": 1, "turn_id": "turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573", "role": "runtime_symptom", "expected_chain": {"chain_type": "runtime", "allowed_states": ["symptom_observed", "cause_identified"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8", "role": "runtime_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 3, "turn_id": "turn_3fe3d67dcb7e226029818870637f74f7e13e85aa87d84bdb84ad882551f8b4d6", "role": "runtime_user_verification", "expected_chain": {"chain_type": "runtime", "allowed_states": ["user_verified"], "formal_memory_allowed": true}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573", "turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8"], "allowed_actions": ["create_memory"]}
+      ],
+      "final_oracle": {
+        "formal_memory": {"required": true, "memory_type": "runtime_failure_experience", "exact_count": 1},
+        "required_semantics": [
+          {"claim": "温度阈值附近风扇反复启停或档位振荡", "supporting_turn_ids": ["turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573"]},
+          {"claim": "外部扰动或输出噪声会造成采样状态自激，单靠空间滞回不一定足够", "supporting_turn_ids": ["turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573", "turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8"]},
+          {"claim": "增加连续采样保持或时间滤波并由用户重新烧录确认有效", "supporting_turn_ids": ["turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8", "turn_3fe3d67dcb7e226029818870637f74f7e13e85aa87d84bdb84ad882551f8b4d6"]}
+        ],
+        "forbidden_semantics": ["仅凭编译通过宣称上板修复完成", "当前工程路径或完整日志"]
+      },
+      "evidence_hashes": {
+        "turn_b69caff0d62cc5e6c5d5e7ff76d7d6d492b9403d13aefe2445c0304d2071d573": "bb991727d07d339ce0995458ce7e4a7541dc6b289cb72283286055ee12d63ac7",
+        "turn_40c2299eac66d3ab167968a6bff695598e57ea02ce2bb415afa9bd48791494f8": "c8233e558a87f937e3188ffccf049f9ec4d077f501d851076d9e64755086eb14",
+        "turn_3fe3d67dcb7e226029818870637f74f7e13e85aa87d84bdb84ad882551f8b4d6": "4334198fdde2c80a99c2ba3c68f6e6167c74f02891611efae97cc2f1ba160934"
+      }
+    },
+    {
+      "scenario_id": "runtime_als_interleaved_then_verified",
+      "title": "光感故障处理中插入雷达和任务边界，最终只闭环光感链",
+      "mode": "sequential",
+      "split": "holdout",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f7c1f7464ffeu0WsT5QPGx2oP0"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": [
+        "turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790",
+        "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4",
+        "turn_9f5e270a1fc7ea15bb870a7272c3e3d1d54b8ea8c0b5b0fbbd376e12336626ca",
+        "turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516"
+      ],
+      "steps": [
+        {"index": 1, "turn_id": "turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790", "role": "runtime_multi_symptom_and_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4", "role": "unrelated_radar_fix_rejected", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 3, "turn_id": "turn_9f5e270a1fc7ea15bb870a7272c3e3d1d54b8ea8c0b5b0fbbd376e12336626ca", "role": "one_off_task_boundary", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]},
+        {"index": 4, "turn_id": "turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516", "role": "als_user_verification", "expected_chain": {"chain_type": "runtime", "allowed_states": ["user_verified"], "formal_memory_allowed": true}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790"], "forbidden_history_turn_ids": ["turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4", "turn_9f5e270a1fc7ea15bb870a7272c3e3d1d54b8ea8c0b5b0fbbd376e12336626ca"], "allowed_actions": ["create_memory"]}
+      ],
+      "final_oracle": {
+        "formal_memory": {"required": true, "memory_type": "runtime_failure_experience", "exact_count": 1},
+        "required_semantics": [
+          {"claim": "ADC 通道寄存器编码与物理通道编号存在偏移，读错通道会表现为光感无效或采样噪声", "supporting_turn_ids": ["turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790", "turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516"]},
+          {"claim": "修正通道编码后由用户确认光感功能恢复", "supporting_turn_ids": ["turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516"]}
+        ],
+        "forbidden_semantics": ["把雷达无法被开关键打断合入光感记忆", "把只改指定模块推断为长期偏好"]
+      },
+      "evidence_hashes": {
+        "turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790": "7d8939414e827da32932c865ba6ffa2492984509149ffab8b472f6fa3178af49",
+        "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4": "f77738c87c92b138562a591251b273c42f5153ba23274014a6a380ab26301588",
+        "turn_9f5e270a1fc7ea15bb870a7272c3e3d1d54b8ea8c0b5b0fbbd376e12336626ca": "58a207ea34b1a86d1e34fd5aa8c1a699e8c3197b15c33cdf5609188996c24870",
+        "turn_0c4148fe89666e9cdeaa29bd86fc1f2d58a56a352d8fd88f3e905b79e8e26516": "6894bdf92bda8dafbb1d9e064915742d975a1ec549337df627bf7b9da0750fd6"
+      }
+    },
+    {
+      "scenario_id": "compile_cloud_project_detection_verified",
+      "title": "云编译选错工程导致子集构建，纠正入口后完整编译通过",
+      "mode": "sequential",
+      "split": "development",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f580bcec1ffeB0CLjWDzsdFSu0"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_47ea7106881e1002081d430cfd7d6647c77d5be3d45f68df9a8cda0a2a66cd86", "turn_e4e444352dbf24e31600ef266ce8639f86d236c11d0458abf1310f15bee6533a"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_47ea7106881e1002081d430cfd7d6647c77d5be3d45f68df9a8cda0a2a66cd86", "role": "compile_failure_and_partial_diagnosis", "expected_chain": {"chain_type": "compilation", "allowed_states": ["failure_observed", "cause_identified", "fix_applied"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_e4e444352dbf24e31600ef266ce8639f86d236c11d0458abf1310f15bee6533a", "role": "compile_fix_and_verification", "expected_chain": {"chain_type": "compilation", "allowed_states": ["compile_verified"], "formal_memory_allowed": true}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_47ea7106881e1002081d430cfd7d6647c77d5be3d45f68df9a8cda0a2a66cd86"], "allowed_actions": ["create_memory"]}
+      ],
+      "final_oracle": {
+        "formal_memory": {"required": true, "memory_type": "compile_failure_experience", "exact_count": 1},
+        "required_semantics": [
+          {"claim": "云编译只构建部分文件时，构建成功不代表完整工程通过", "supporting_turn_ids": ["turn_47ea7106881e1002081d430cfd7d6647c77d5be3d45f68df9a8cda0a2a66cd86"]},
+          {"claim": "目录中多个 uvproj 工程会干扰项目检测或选择错误构建入口", "supporting_turn_ids": ["turn_e4e444352dbf24e31600ef266ce8639f86d236c11d0458abf1310f15bee6533a"]},
+          {"claim": "选择正确工程并完整编译全部文件后零错误通过", "supporting_turn_ids": ["turn_e4e444352dbf24e31600ef266ce8639f86d236c11d0458abf1310f15bee6533a"]}
+        ],
+        "forbidden_semantics": ["把具体 HEX 路径写入长期记忆", "把本地评估版限制误当作云编译根因"]
+      },
+      "evidence_hashes": {
+        "turn_47ea7106881e1002081d430cfd7d6647c77d5be3d45f68df9a8cda0a2a66cd86": "0e6a206a85f13c7b45804e754b22d0a38da5a7381011de14cf4931f960131c07",
+        "turn_e4e444352dbf24e31600ef266ce8639f86d236c11d0458abf1310f15bee6533a": "8e0fe08a379fbdcb00d59aa9e96daaba89b37ff622e4dae658a49c4e5ef7f4d6"
+      }
+    },
+    {
+      "scenario_id": "runtime_radar_fix_rejected_no_memory",
+      "title": "雷达中断修复被用户否定，不得提前沉淀",
+      "mode": "sequential",
+      "split": "development",
+      "release_gate": true,
+      "reuse_reason": "从混合 EL48 长流程中单独验证修复被否定分支。",
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f7c1f7464ffeu0WsT5QPGx2oP0"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790", "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790", "role": "runtime_fix_without_user_verification", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4", "role": "runtime_fix_rejected", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]}
+      ],
+      "final_oracle": {"formal_memory": {"required": false, "memory_type": "none", "exact_count": 0}, "required_semantics": [], "forbidden_semantics": ["宣称雷达中断问题已解决", "把被否定的修复写成有效经验"]},
+      "evidence_hashes": {"turn_5d2d466c64026e8c2d2dca6e5588a34d9ec480788ba991e9b2d8e2cec9862790": "7d8939414e827da32932c865ba6ffa2492984509149ffab8b472f6fa3178af49", "turn_b284492f40f50834007cc3eb7fbcfa97949db4bf26f4fbc137908eda42c5a4a4": "f77738c87c92b138562a591251b273c42f5153ba23274014a6a380ab26301588"}
+    },
+    {
+      "scenario_id": "runtime_fl20_iterative_unverified",
+      "title": "多轮上板仍失败并继续修复，最终未获用户确认",
+      "mode": "sequential",
+      "split": "holdout",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f5c178495ffeLN1uUhRaowtaPr"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226", "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f", "turn_a08aaa350d725a4483a5ea594fc05980c4a39ec19bfcc9b4a5b5d94e63ac76f1", "turn_edaf2278924bd8e7011a0fa0f62462d8fa495ef6a615e10c9069909c36be74b6"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226", "role": "runtime_symptoms_and_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f", "role": "runtime_partial_failure_after_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected", "fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 3, "turn_id": "turn_a08aaa350d725a4483a5ea594fc05980c4a39ec19bfcc9b4a5b5d94e63ac76f1", "role": "runtime_failure_report_without_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected", "cause_identified"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226", "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 4, "turn_id": "turn_edaf2278924bd8e7011a0fa0f62462d8fa495ef6a615e10c9069909c36be74b6", "role": "runtime_refix_waiting_user", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226", "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f", "turn_a08aaa350d725a4483a5ea594fc05980c4a39ec19bfcc9b4a5b5d94e63ac76f1"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]}
+      ],
+      "final_oracle": {"formal_memory": {"required": false, "memory_type": "none", "exact_count": 0}, "required_semantics": [], "forbidden_semantics": ["把助手最后一次编译通过当成上板验证", "把多项未闭环现象拆成正式记忆"]},
+      "evidence_hashes": {"turn_048a7991aaf2ece6772fcead7ed59343d60efc0d0dae3c5a7ed8a5b98d52f226": "e8322f7376a87ab55f58adcfbe480937bc0809589e8526fe0d2b08364614e4b1", "turn_f1671d981cd9bd0039ddfc8e54eb398c5f3ef3289b2a2aef30b1826d2addb59f": "d2ed4207cbca6b2abc43f621ff7f93308c1b968abbe3c684329529b980a635b7", "turn_a08aaa350d725a4483a5ea594fc05980c4a39ec19bfcc9b4a5b5d94e63ac76f1": "ef261ceb5bff829ab91cc6ff7719da8bb776d3b51377947e6204c976cb644dad", "turn_edaf2278924bd8e7011a0fa0f62462d8fa495ef6a615e10c9069909c36be74b6": "569badbac75297eb476629999f15f8fcbeb1173202f60940ce79815c208b2015"}
+    },
+    {
+      "scenario_id": "preference_ask_before_guessing_cross_session",
+      "title": "跨项目重复表达：信息不足先询问，不要猜测（夹带未闭环编译失败）",
+      "mode": "sequential",
+      "split": "holdout",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f580bcec1ffeB0CLjWDzsdFSu0", "ses_f528b583effe0gqY2ML7I1LWKf", "ses_f4c8c4db0ffetRhO3IjKePk27o"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_24e1d0cddff5e509862938fd43c144c945e8e64b97519c285bab3a85c6446626", "turn_4eaa9f6c277e07ce5f9eacac615a2115e5b5b86258965f33a1667e66c3bde275", "turn_9cc7e98011f2cfcc0bdc24fdc95cbe897927569925e1906fd2a2bc095c974bc3"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_24e1d0cddff5e509862938fd43c144c945e8e64b97519c285bab3a85c6446626", "role": "explicit_user_preference", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": true}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["create_memory"]},
+        {"index": 2, "turn_id": "turn_4eaa9f6c277e07ce5f9eacac615a2115e5b5b86258965f33a1667e66c3bde275", "role": "preference_repeat", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": true}, "required_tools": ["search_related_memories", "read_memory_detail"], "required_history_turn_ids": [], "allowed_actions": ["update_memory", "merge_memory", "noop"], "forbidden_actions": ["create_memory"]},
+        {"index": 3, "turn_id": "turn_9cc7e98011f2cfcc0bdc24fdc95cbe897927569925e1906fd2a2bc095c974bc3", "role": "preference_repeat_with_unresolved_compile_failure", "expected_chain": {"chain_type": "compilation", "allowed_states": ["failure_observed"], "formal_memory_allowed": true, "formal_memory_types_allowed": ["user_preference"]}, "required_tools": ["search_related_memories", "read_memory_detail", "list_open_memory_chains"], "required_history_turn_ids": [], "allowed_actions": ["update_memory", "merge_memory", "noop"], "forbidden_actions": ["create_memory"]}
+      ],
+      "final_oracle": {
+        "formal_memory": {"required": true, "memory_type": "user_preference", "exact_count": 1},
+        "required_semantics": [{"claim": "需求、IO 或硬件信息不明确时先询问用户，并优先依据已有需求文档、IO 配置和 SDK，不要自行猜测", "supporting_turn_ids": ["turn_24e1d0cddff5e509862938fd43c144c945e8e64b97519c285bab3a85c6446626", "turn_4eaa9f6c277e07ce5f9eacac615a2115e5b5b86258965f33a1667e66c3bde275", "turn_9cc7e98011f2cfcc0bdc24fdc95cbe897927569925e1906fd2a2bc095c974bc3"]}],
+        "forbidden_semantics": ["具体 SDK 路径", "当前项目 IO 数值", "三条重复偏好记忆", "把 Fatal Exit Code 的通用释义当作已证实根因", "本地许可证或环境损坏这一未证实结论"]
+      },
+      "evidence_hashes": {"turn_24e1d0cddff5e509862938fd43c144c945e8e64b97519c285bab3a85c6446626": "f6b1e607836fe419679cf6da7a03556dc7dbd1fb3fc3913ad9451e8dc924c716", "turn_4eaa9f6c277e07ce5f9eacac615a2115e5b5b86258965f33a1667e66c3bde275": "4c11e8ad82b36793736004aa1a5558bef83504f0baa567e281a49ceac736acdb", "turn_9cc7e98011f2cfcc0bdc24fdc95cbe897927569925e1906fd2a2bc095c974bc3": "fd7c6525f8762b2892159e1f3973f01aaa3aef901142a80077ce036fdf092e7d"}
+    },
+    {
+      "scenario_id": "oneoff_git_v1_is_not_preference",
+      "title": "本次提交为 v1，不推断为长期 Git 偏好",
+      "mode": "sequential",
+      "split": "development",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f528b583effe0gqY2ML7I1LWKf"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_fba4a5189f3c2affea2ef963ecf93df245c5b12e1b6d75b6e3e21506636e08b1"],
+      "steps": [{"index": 1, "turn_id": "turn_fba4a5189f3c2affea2ef963ecf93df245c5b12e1b6d75b6e3e21506636e08b1", "role": "one_off_version_control", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]}],
+      "final_oracle": {"formal_memory": {"required": false, "memory_type": "none", "exact_count": 0}, "required_semantics": [], "forbidden_semantics": ["用户总是希望使用 Git", "关键版本都必须提交", "v1 版本名"]},
+      "evidence_hashes": {"turn_fba4a5189f3c2affea2ef963ecf93df245c5b12e1b6d75b6e3e21506636e08b1": "27c7ae396b356dd7bad07b3cd4eda6df19e03695ff49df31e4b28a21a8589dc0"}
+    },
+    {
+      "scenario_id": "low_value_turns_all_noop",
+      "title": "继续、路径询问和一次性文件转换均不沉淀",
+      "mode": "sequential",
+      "split": "development",
+      "release_gate": true,
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f7c1f7464ffeu0WsT5QPGx2oP0", "ses_f580bcec1ffeB0CLjWDzsdFSu0", "ses_f4c8c4db0ffetRhO3IjKePk27o"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_38dadb00a1fea17d1a860cd5676814e4599f3cfa6955f407e6f3fab2ad4a5937", "turn_5bac64c1dba63fe209e923027ed0a2776d813567b6569fb90ed1c134db83b5e7", "turn_6de92bc87542233247f7085bd911e9d26ae522c7590523caf802ff0949c42eb5", "turn_1b834671a9be2efae922c321600037e6ddd631ebf39443f8ea113d7bd2ca4d96", "turn_5d83de860d4704395134b82544a5d8f30d94aa0e4bd13dfadeae8af941ee360e"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_38dadb00a1fea17d1a860cd5676814e4599f3cfa6955f407e6f3fab2ad4a5937", "role": "continue_only", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]},
+        {"index": 2, "turn_id": "turn_5bac64c1dba63fe209e923027ed0a2776d813567b6569fb90ed1c134db83b5e7", "role": "location_question", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]},
+        {"index": 3, "turn_id": "turn_6de92bc87542233247f7085bd911e9d26ae522c7590523caf802ff0949c42eb5", "role": "artifact_conversion", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]},
+        {"index": 4, "turn_id": "turn_1b834671a9be2efae922c321600037e6ddd631ebf39443f8ea113d7bd2ca4d96", "role": "location_question_with_unverified_summary", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]},
+        {"index": 5, "turn_id": "turn_5d83de860d4704395134b82544a5d8f30d94aa0e4bd13dfadeae8af941ee360e", "role": "database_location_question", "expected_chain": {"chain_type": "none", "allowed_states": ["not_applicable"], "formal_memory_allowed": false}, "required_tools": [], "required_history_turn_ids": [], "allowed_actions": ["noop"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory", "update_topic"]}
+      ],
+      "final_oracle": {"formal_memory": {"required": false, "memory_type": "none", "exact_count": 0}, "required_semantics": [], "forbidden_semantics": ["路径", "一次性转换任务", "继续指令", "缺乏直接证据的助手转述"]},
+      "evidence_hashes": {"turn_38dadb00a1fea17d1a860cd5676814e4599f3cfa6955f407e6f3fab2ad4a5937": "96983a19f2254a0ba021e871ae7c4b62a210f497347a14f44eaf8a72da7b58d1", "turn_5bac64c1dba63fe209e923027ed0a2776d813567b6569fb90ed1c134db83b5e7": "318dd85cfc3bf792a9f5f47e51aa09e947108444cd59a5683668d358f0686546", "turn_6de92bc87542233247f7085bd911e9d26ae522c7590523caf802ff0949c42eb5": "4a7ccfe77c59de1e8ebd161de3161b3ae8a7d2585e64169a3317573c2c7d7580", "turn_1b834671a9be2efae922c321600037e6ddd631ebf39443f8ea113d7bd2ca4d96": "f71eb3ecff03effdd1e1b1cbd5c83593dba3048f98c79d1412f2c4f45b92cebf", "turn_5d83de860d4704395134b82544a5d8f30d94aa0e4bd13dfadeae8af941ee360e": "f8e019d5ff2fb090b613a76576e9e7201e10256fa1a16f0bcced32205f0f779c"}
+    },
+    {
+      "scenario_id": "known_gap_compile_fix_rejected",
+      "title": "程序过大修复后仍失败：编译链缺少 fix_rejected 状态",
+      "mode": "sequential",
+      "split": "stress",
+      "release_gate": false,
+      "known_gap": "当前 compilation 状态机没有 fix_rejected，规范期望记录修复被否定并继续原链。",
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f4c8c4db0ffetRhO3IjKePk27o"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d", "turn_80f1eb1951705133f313a2b205d39e7e44b5f105ccbd61632e03c4680c83a4ac"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d", "role": "compile_or_flash_fix_claimed", "expected_chain": {"chain_type": "compilation", "allowed_states": ["fix_applied"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_80f1eb1951705133f313a2b205d39e7e44b5f105ccbd61632e03c4680c83a4ac", "role": "compile_or_flash_fix_rejected", "expected_chain": {"chain_type": "compilation", "allowed_states": ["fix_rejected"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]}
+      ],
+      "final_oracle": {"formal_memory": {"required": false, "memory_type": "none", "exact_count": 0}, "required_semantics": [], "forbidden_semantics": ["宣称扩大代码区已经解决问题", "把失败修复写成有效经验"]},
+      "evidence_hashes": {"turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d": "45a1e352673bda83b3493c639aadf309da74174ca1ffdcc739dd0357bd4f542a", "turn_80f1eb1951705133f313a2b205d39e7e44b5f105ccbd61632e03c4680c83a4ac": "10284b71d07ce65e044b3d1c0c16f69b0133f2f9eb8e6530d518787e40afa3f2"}
+    },
+    {
+      "scenario_id": "known_gap_close_old_and_open_new_same_turn",
+      "title": "同一 turn 既确认旧映射修复，又报告新的物理位置问题",
+      "mode": "sequential",
+      "split": "stress",
+      "release_gate": false,
+      "known_gap": "当前最终决策只有一个顶层 chain_state，不能在同一 turn 同时关闭旧链并新建另一条链。",
+      "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f528b583effe0gqY2ML7I1LWKf"]},
+      "initial_fixture": "empty_user_state_v1",
+      "turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd", "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328"],
+      "steps": [
+        {"index": 1, "turn_id": "turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "role": "runtime_led_symptom", "expected_chain": {"chain_type": "runtime", "allowed_states": ["symptom_observed"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains"], "required_history_turn_ids": [], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 2, "turn_id": "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "role": "runtime_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 3, "turn_id": "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "role": "runtime_fix_rejected_and_refixed", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected", "fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 4, "turn_id": "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd", "role": "runtime_mapping_refix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
+        {"index": 5, "turn_id": "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328", "role": "old_fix_verified_and_new_symptom", "expected_chain": {"chain_type": "runtime", "allowed_states": ["user_verified", "symptom_observed"], "formal_memory_allowed": true}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd"], "allowed_actions": ["create_memory"]}
+      ],
+      "final_oracle": {
+        "formal_memory": {"required": true, "memory_type": "runtime_failure_experience", "exact_count": 1},
+        "required_semantics": [{"claim": "按键与 LED 逻辑错位需要共同核对有效电平、引脚/通道映射及初始化覆盖，旧问题经用户确认后才能沉淀", "supporting_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd", "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328"]}],
+        "forbidden_semantics": ["把新报告的物理位置问题错误标成已验证", "将具体 IO 表作为长期记忆主体"]
+      },
+      "evidence_hashes": {"turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d": "ac9f61bc9d6fb6b93fc8c38c92891873956f0c3e6c741d070aa144a634adfcbc", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041": "87f9d4676cfb61227eb842079e09503cd6b3b590b422e4c79bca36dad69a88f5", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55": "462aa899c93a038fbf816f07c3ec41c0252b45df826a6f488cade60d5fa4ced9", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd": "2f763b3dd5a0c18b63e327f0a314b97a87ed9d0ca0e374b74e31bae9fef95780", "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328": "7620aa1e19136e7058e2582ab8267ded09e0f1fc56764dd2805f96191f553a6c"}
+    }
+  ]
+}
