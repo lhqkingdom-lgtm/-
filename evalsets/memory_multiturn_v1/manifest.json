@@ -1,7 +1,7 @@
 {
   "schema_version": "memory-multiturn-manifest-v1",
   "evalset_id": "memory_multiturn_v1",
-  "version": "1.0.0-candidate.2",
+  "version": "1.0.0-candidate.4",
   "status": "candidate",
   "created_at": "2026-09-28",
   "spec_file": "SPEC.md",
@@ -10,8 +10,8 @@
   "rubric_file": "rubric.json",
   "fixture_file": "fixtures/initial_states.json",
   "scenario_count": 10,
-  "release_gate_scenario_count": 8,
-  "known_gap_scenario_count": 2,
+  "release_gate_scenario_count": 9,
+  "known_gap_scenario_count": 1,
   "provenance": {
     "real_scenario_count": 10,
     "synthetic_scenario_count": 0,

@@ -18,8 +18,8 @@ class MultiturnEvalContractTests(unittest.TestCase):
         report = validate_multiturn_evalset(EVALSET)
         self.assertTrue(report["ok"])
         self.assertEqual(report["scenario_count"], 10)
-        self.assertEqual(report["release_gate_scenario_count"], 8)
-        self.assertEqual(report["known_gap_scenario_count"], 2)
+        self.assertEqual(report["release_gate_scenario_count"], 9)
+        self.assertEqual(report["known_gap_scenario_count"], 1)
         self.assertEqual(report["unique_turn_count"], 29)
 
     def test_rejects_premature_runtime_memory_write(self) -> None:
@@ -65,6 +65,46 @@ class MultiturnEvalContractTests(unittest.TestCase):
             ]
             path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
             with self.assertRaisesRegex(MultiturnEvalContractError, "compile_verified"):
+                validate_multiturn_evalset(target)
+
+    def test_accepts_close_old_and_open_new_chain_operations_contract(self) -> None:
+        report = validate_multiturn_evalset(EVALSET)
+        self.assertTrue(report["ok"])
+        final_step = json.loads(
+            (EVALSET / "scenarios.json").read_text(encoding="utf-8")
+        )["scenarios"][-1]["steps"][-1]
+        self.assertNotIn("expected_chain", final_step)
+        self.assertEqual(len(final_step["expected_chain_operations"]), 2)
+
+    def test_rejects_open_new_chain_linked_to_formal_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = self._copy(Path(directory))
+            path = target / "scenarios.json"
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            new_operation = doc["scenarios"][-1]["steps"][-1][
+                "expected_chain_operations"
+            ][1]
+            new_operation["linked_formal_memory"] = True
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(
+                MultiturnEvalContractError,
+                "只有允许正式记忆的闭环操作",
+            ):
+                validate_multiturn_evalset(target)
+
+    def test_rejects_both_single_and_multi_chain_expectations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = self._copy(Path(directory))
+            path = target / "scenarios.json"
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            final_step = doc["scenarios"][-1]["steps"][-1]
+            final_step["expected_chain"] = {
+                "chain_type": "runtime",
+                "allowed_states": ["user_verified"],
+                "formal_memory_allowed": True,
+            }
+            path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(MultiturnEvalContractError, "互斥"):
                 validate_multiturn_evalset(target)
 
     @staticmethod

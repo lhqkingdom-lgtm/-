@@ -183,6 +183,443 @@ class MemoryReactPromptTests(unittest.TestCase):
         self.assertTrue(result["committed"])
         self.assertEqual(save_chain.call_args.kwargs["final_memory_ids"], ["mem_closed"])
 
+    def test_validates_close_old_and_open_new_chain_operations(self) -> None:
+        plan = {
+            "schema_version": "memory-changes-v1",
+            "turn_id": "turn_current",
+            "reason": "旧故障经用户确认闭环，新现象另开故障链。",
+            "changes": [
+                {
+                    "action": "create_memory",
+                    "technical_closure": {
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "verification_evidence_ids": ["ev_user"],
+                    },
+                }
+            ],
+        }
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "旧问题已验证，新问题只有现象。",
+            "chain_operations": [
+                {
+                    "operation_id": "op_close_old",
+                    "mode": "update_existing",
+                    "chain_state": {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": [],
+                    },
+                    "linked_change_indexes": [0],
+                },
+                {
+                    "operation_id": "op_open_new",
+                    "mode": "create_new",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["新现象的根因、修复和用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+            ],
+            "tool_requests": [],
+            "changes": plan,
+        }
+        with patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            return_value=plan,
+        ):
+            validated = validate_react_decision(
+                decision,
+                turn_id="turn_current",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": set(),
+                    "pointer_ids": set(),
+                    "open_chain_scan_completed": {"current_session"},
+                    "open_chain_ids": {"chain_runtime_001"},
+                    "open_chain_required::chain_runtime_001": {"turn_current"},
+                },
+                pg_config_path=Path("unused.json"),
+            )
+        self.assertEqual(len(validated["chain_operations"]), 2)
+        self.assertEqual(
+            validated["chain_operations"][1]["chain_state"]["state"],
+            "symptom_observed",
+        )
+
+    def test_rejects_mixed_single_and_multi_chain_protocol(self) -> None:
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "非法地同时使用两套协议。",
+            "chain_state": {
+                "chain_type": "runtime",
+                "state": "symptom_observed",
+                "related_turn_ids": ["turn_current"],
+                "missing_evidence": ["根因、修复和验证"],
+            },
+            "chain_operations": [
+                {
+                    "operation_id": "op_open_new",
+                    "mode": "create_new",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["根因、修复和验证"],
+                    },
+                    "linked_change_indexes": [],
+                }
+            ],
+            "tool_requests": [],
+            "changes": {
+                "schema_version": "memory-changes-v1",
+                "turn_id": "turn_current",
+                "reason": "未闭环。",
+                "changes": [{"action": "noop", "reason": "等待证据。", "evidence_refs": []}],
+            },
+        }
+        with patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            side_effect=lambda changes, **_kwargs: changes,
+        ), self.assertRaisesRegex(Exception, "mutually exclusive"):
+            validate_react_decision(
+                decision,
+                turn_id="turn_current",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": set(),
+                    "pointer_ids": set(),
+                    "open_chain_scan_completed": {"current_session"},
+                },
+                pg_config_path=Path("unused.json"),
+            )
+
+    def test_rejects_unlinked_technical_memory_in_chain_operations(self) -> None:
+        plan = {
+            "schema_version": "memory-changes-v1",
+            "turn_id": "turn_current",
+            "reason": "运行故障已闭环。",
+            "changes": [
+                {
+                    "action": "create_memory",
+                    "technical_closure": {
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "verification_evidence_ids": ["ev_user"],
+                    },
+                }
+            ],
+        }
+        decision = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "错误地没有把技术记忆绑定到闭环操作。",
+            "chain_operations": [
+                {
+                    "operation_id": "op_close_old",
+                    "mode": "update_existing",
+                    "chain_state": {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": [],
+                    },
+                    "linked_change_indexes": [],
+                }
+            ],
+            "tool_requests": [],
+            "changes": plan,
+        }
+        with patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            return_value=plan,
+        ), self.assertRaisesRegex(Exception, "must be linked"):
+            validate_react_decision(
+                decision,
+                turn_id="turn_current",
+                available_ids={
+                    "topic_ids": set(),
+                    "memory_ids": set(),
+                    "pointer_ids": set(),
+                    "open_chain_scan_completed": {"current_session"},
+                    "open_chain_ids": {"chain_runtime_001"},
+                    "open_chain_required::chain_runtime_001": {"turn_current"},
+                },
+                pg_config_path=Path("unused.json"),
+            )
+
+    def test_commit_persists_close_old_and_open_new_independently(self) -> None:
+        plan = {
+            "schema_version": "memory-changes-v1",
+            "turn_id": "turn_current",
+            "reason": "旧问题闭环并保留新问题状态。",
+            "changes": [
+                {
+                    "action": "create_memory",
+                    "technical_closure": {
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "verification_evidence_ids": ["ev_user"],
+                    },
+                }
+            ],
+        }
+        output = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "旧问题已验证，新问题另开链。",
+            "chain_operations": [
+                {
+                    "operation_id": "op_close_old",
+                    "mode": "update_existing",
+                    "chain_state": {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "user_verified",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": [],
+                    },
+                    "linked_change_indexes": [0],
+                },
+                {
+                    "operation_id": "op_open_new",
+                    "mode": "create_new",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["新问题的根因、修复和用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+            ],
+            "tool_requests": [],
+            "changes": plan,
+        }
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "memory_lab.memory_react_agent.build_memory_agent_input",
+            return_value=self._minimal_context(),
+        ), patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            return_value=plan,
+        ), patch(
+            "memory_lab.memory_react_agent.commit_memory_changes",
+            return_value={
+                "ok": True,
+                "counts": {"applied": 1, "rejected": 0},
+                "applied": [{"index": 0, "action": "create_memory", "memory_id": "mem_closed"}],
+            },
+        ), patch(
+            "memory_lab.memory_react_agent.list_open_memory_chains",
+            return_value={
+                "status": "complete",
+                "tool": "list_open_memory_chains",
+                "current_turn_id": "turn_current",
+                "chains": [
+                    {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "waiting_user_validation",
+                        "related_turn_ids": ["turn_current"],
+                        "related_turns": [],
+                    }
+                ],
+            },
+        ), patch(
+            "memory_lab.memory_react_agent.save_memory_chain_state",
+            side_effect=[
+                {"status": "complete", "result": "updated", "chain": {"chain_id": "chain_runtime_001"}},
+                {"status": "complete", "result": "created", "chain": {"chain_id": "chain_runtime_002"}},
+            ],
+        ) as save_chain:
+            result = run_memory_react_agent(
+                source_database=Path("source.db"),
+                turn_id="turn_current",
+                pg_config_path=Path("unused.json"),
+                dry_run=False,
+                max_iterations=2,
+                log_dir=Path(directory),
+                client=SequenceClient([self._open_chain_scan_request(), output]),
+            )
+        self.assertEqual(result["status"], "complete")
+        self.assertIsNone(result["chain_persistence"])
+        self.assertEqual(len(result["chain_persistences"]), 2)
+        self.assertEqual(save_chain.call_count, 2)
+        self.assertEqual(save_chain.call_args_list[0].kwargs["final_memory_ids"], ["mem_closed"])
+        self.assertFalse(save_chain.call_args_list[0].kwargs["create_new"])
+        self.assertEqual(save_chain.call_args_list[1].kwargs["final_memory_ids"], [])
+        self.assertTrue(save_chain.call_args_list[1].kwargs["create_new"])
+        self.assertEqual(save_chain.call_args_list[1].kwargs["creation_key"], "op_open_new")
+
+    def test_multi_chain_partial_failure_is_visible(self) -> None:
+        plan = {
+            "schema_version": "memory-changes-v1",
+            "turn_id": "turn_current",
+            "reason": "本轮只推进两条未闭环链。",
+            "changes": [{"action": "noop", "reason": "等待后续证据。", "evidence_refs": []}],
+        }
+        output = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "更新旧链并创建新链。",
+            "chain_operations": [
+                {
+                    "operation_id": "op_update_old",
+                    "mode": "update_existing",
+                    "chain_state": {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "fix_applied",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+                {
+                    "operation_id": "op_open_new",
+                    "mode": "create_new",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["根因、修复和用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+            ],
+            "tool_requests": [],
+            "changes": plan,
+        }
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "memory_lab.memory_react_agent.build_memory_agent_input",
+            return_value=self._minimal_context(),
+        ), patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            return_value=plan,
+        ), patch(
+            "memory_lab.memory_react_agent.commit_memory_changes",
+            return_value={"ok": True, "counts": {"applied": 0, "rejected": 0}, "applied": []},
+        ), patch(
+            "memory_lab.memory_react_agent.list_open_memory_chains",
+            return_value={
+                "status": "complete",
+                "tool": "list_open_memory_chains",
+                "current_turn_id": "turn_current",
+                "chains": [{
+                    "chain_id": "chain_runtime_001",
+                    "chain_type": "runtime",
+                    "state": "cause_identified",
+                    "related_turn_ids": ["turn_current"],
+                    "related_turns": [],
+                }],
+            },
+        ), patch(
+            "memory_lab.memory_react_agent.save_memory_chain_state",
+            side_effect=[
+                {"status": "complete", "result": "updated", "chain": {"chain_id": "chain_runtime_001"}},
+                {"status": "retry", "error_code": "concurrent_chain_update"},
+            ],
+        ):
+            result = run_memory_react_agent(
+                source_database=Path("source.db"),
+                turn_id="turn_current",
+                pg_config_path=Path("unused.json"),
+                dry_run=False,
+                max_iterations=2,
+                log_dir=Path(directory),
+                client=SequenceClient([self._open_chain_scan_request(), output]),
+            )
+        self.assertEqual(result["status"], "partial_failure")
+        self.assertEqual(result["chain_persistences"][1]["error_code"], "concurrent_chain_update")
+
+    def test_multi_chain_memory_commit_failure_is_partial_failure(self) -> None:
+        plan = {
+            "schema_version": "memory-changes-v1",
+            "turn_id": "turn_current",
+            "reason": "旧问题闭环并开启新链。",
+            "changes": [{"action": "noop", "reason": "模拟提交失败。", "evidence_refs": []}],
+        }
+        output = {
+            "schema_version": "memory-react-v1",
+            "decision": "final_changes",
+            "reason": "两条链需要分别保存。",
+            "chain_operations": [
+                {
+                    "operation_id": "op_update_old",
+                    "mode": "update_existing",
+                    "chain_state": {
+                        "chain_id": "chain_runtime_001",
+                        "chain_type": "runtime",
+                        "state": "fix_applied",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+                {
+                    "operation_id": "op_open_new",
+                    "mode": "create_new",
+                    "chain_state": {
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_current"],
+                        "missing_evidence": ["根因、修复和用户复测"],
+                    },
+                    "linked_change_indexes": [],
+                },
+            ],
+            "tool_requests": [],
+            "changes": plan,
+        }
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "memory_lab.memory_react_agent.build_memory_agent_input",
+            return_value=self._minimal_context(),
+        ), patch(
+            "memory_lab.memory_react_agent.validate_memory_changes",
+            return_value=plan,
+        ), patch(
+            "memory_lab.memory_react_agent.commit_memory_changes",
+            return_value={"ok": False, "counts": {"applied": 0, "rejected": 1}, "applied": []},
+        ), patch(
+            "memory_lab.memory_react_agent.list_open_memory_chains",
+            return_value={
+                "status": "complete",
+                "tool": "list_open_memory_chains",
+                "current_turn_id": "turn_current",
+                "chains": [{
+                    "chain_id": "chain_runtime_001",
+                    "chain_type": "runtime",
+                    "state": "cause_identified",
+                    "related_turn_ids": ["turn_current"],
+                    "related_turns": [],
+                }],
+            },
+        ), patch("memory_lab.memory_react_agent.save_memory_chain_state") as save_chain:
+            result = run_memory_react_agent(
+                source_database=Path("source.db"),
+                turn_id="turn_current",
+                pg_config_path=Path("unused.json"),
+                dry_run=False,
+                max_iterations=2,
+                log_dir=Path(directory),
+                client=SequenceClient([self._open_chain_scan_request(), output]),
+            )
+        self.assertEqual(result["status"], "partial_failure")
+        self.assertEqual(
+            [item["result"] for item in result["chain_persistences"]],
+            ["memory_commit_failed", "memory_commit_failed"],
+        )
+        save_chain.assert_not_called()
+
     def test_open_compile_chain_does_not_link_same_turn_preference_memory(self) -> None:
         plan = {
             "schema_version": "memory-changes-v1",
@@ -346,7 +783,7 @@ class MemoryReactPromptTests(unittest.TestCase):
             "memory_lab.memory_react_agent.validate_memory_changes",
             return_value=plan,
         ):
-            with self.assertRaisesRegex(Exception, "chain_state is required"):
+            with self.assertRaisesRegex(Exception, "chain_state or chain_operations is required"):
                 validate_react_decision(
                     decision,
                     turn_id="turn_current",
@@ -502,6 +939,10 @@ class MemoryReactPromptTests(unittest.TestCase):
 
     def test_prompt_documents_exact_chain_state_protocol(self) -> None:
         self.assertIn("chain_state 使用严格枚举", REACT_SYSTEM_PROMPT)
+        self.assertIn("只有当同一 turn 真正包含多个独立故障动作时", REACT_SYSTEM_PROMPT)
+        self.assertIn("linked_change_indexes", REACT_SYSTEM_PROMPT)
+        self.assertIn("update_existing + user_verified", REACT_SYSTEM_PROMPT)
+        self.assertIn("create_new + symptom_observed", REACT_SYSTEM_PROMPT)
 
     def test_repair_prompt_documents_complete_history_tool_shape(self) -> None:
         self.assertIn("decision=tool_requests 时必须同时输出 `changes: []`", REACT_REPAIR_PROMPT)
@@ -540,11 +981,23 @@ class MemoryReactPromptTests(unittest.TestCase):
                 available_ids=available_ids,
             )
         self.assertIn("none，state=not_applicable", REACT_SYSTEM_PROMPT)
-        self.assertIn("failure_observed、cause_identified、fix_applied、compile_verified", REACT_SYSTEM_PROMPT)
+        self.assertIn(
+            "failure_observed、cause_identified、fix_applied、fix_rejected、compile_verified",
+            REACT_SYSTEM_PROMPT,
+        )
         self.assertIn("waiting_user_validation、user_verified、fix_rejected", REACT_SYSTEM_PROMPT)
+        self.assertIn(
+            "compilation/failure_observed、cause_identified、fix_applied、fix_rejected、compile_verified",
+            REACT_REPAIR_PROMPT,
+        )
         self.assertIn("needs_verification", REACT_SYSTEM_PROMPT)
         self.assertIn("noop 是记忆动作，不是 chain state", REACT_SYSTEM_PROMPT)
         self.assertIn("助手声称已修复", REACT_SYSTEM_PROMPT)
+        self.assertIn("必须复用同一 chain_id 并进入 fix_rejected", REACT_SYSTEM_PROMPT)
+        self.assertIn("fix_rejected 必须有用户否定", REACT_REPAIR_PROMPT)
+        self.assertIn("对“原始失败动作”", REACT_SYSTEM_PROMPT)
+        self.assertIn("上游步骤成功不能证明下游失败消失", REACT_SYSTEM_PROMPT)
+        self.assertIn("原失败发生在烧录/下载", REACT_REPAIR_PROMPT)
 
     def test_prompt_documents_multi_memory_granularity_gate(self) -> None:
         self.assertIn("单轮多条记忆自检", REACT_SYSTEM_PROMPT)

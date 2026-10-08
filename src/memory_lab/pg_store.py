@@ -969,9 +969,10 @@ def _memory_chain_id(
     project_key: str,
     chain_type: str,
     anchor_turn_id: str,
+    creation_key: str = "",
 ) -> str:
     material = "|".join(
-        (user_id, session_id, project_key, chain_type, anchor_turn_id)
+        (user_id, session_id, project_key, chain_type, anchor_turn_id, creation_key)
     )
     return "chain_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
@@ -982,6 +983,8 @@ def save_memory_chain_state(
     current_turn_id: str,
     chain_state: Mapping[str, Any],
     final_memory_ids: list[str] | None = None,
+    create_new: bool = False,
+    creation_key: str = "",
 ) -> dict[str, Any]:
     """Persist one validated technical chain in existing ``turns.metadata``."""
 
@@ -1031,6 +1034,21 @@ def save_memory_chain_state(
             "tool": "save_memory_chain_state",
             "error_code": "open_chain_has_final_memory",
             "guidance": "未闭环状态不能关联正式记忆。",
+        }
+    if create_new and normalized.get("chain_id"):
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "create_new_with_chain_id",
+            "guidance": "新建故障链不能携带已有 chain_id。",
+        }
+    creation_key = str(creation_key or "").strip()
+    if create_new and not creation_key:
+        return {
+            "status": "rejected",
+            "tool": "save_memory_chain_state",
+            "error_code": "creation_key_required",
+            "guidance": "同一 turn 可创建多条链；新建时必须提供唯一 creation_key。",
         }
 
     config = load_pg_config(pg_config_path)
@@ -1140,6 +1158,7 @@ SELECT jsonb_build_object(
         )
         overlap_match = (
             not requested_chain_id
+            and not create_new
             and chain.get("chain_type") == normalized["chain_type"]
             and bool(chain_turns.intersection(related_set))
         )
@@ -1194,7 +1213,45 @@ SELECT jsonb_build_object(
             project_key=str(context.get("project_key") or ""),
             chain_type=normalized["chain_type"],
             anchor_turn_id=anchor_turn_id,
+            creation_key=creation_key if create_new else "",
         )
+
+    previous_history = [
+        dict(item)
+        for item in ((existing or {}).get("transition_history") or [])
+        if isinstance(item, Mapping)
+    ]
+    previous_state = str((existing or {}).get("state") or "")
+    transition_history = list(previous_history)
+    if not existing:
+        transition_history.append(
+            {
+                "sequence": 1,
+                "from_state": None,
+                "to_state": normalized["state"],
+                "turn_id": current_turn_id,
+                "outcome": "created",
+            }
+        )
+    elif previous_state != normalized["state"]:
+        transition_history.append(
+            {
+                "sequence": len(transition_history) + 1,
+                "from_state": previous_state,
+                "to_state": normalized["state"],
+                "turn_id": current_turn_id,
+                "outcome": (
+                    "rejected"
+                    if normalized["state"] == "fix_rejected"
+                    else "verified"
+                    if normalized["status"] == "closed"
+                    else "advanced"
+                ),
+            }
+        )
+    rejected_attempt_count = sum(
+        1 for item in transition_history if item.get("to_state") == "fix_rejected"
+    )
 
     record = {
         "schema_version": MEMORY_CHAIN_SCHEMA_VERSION,
@@ -1207,15 +1264,22 @@ SELECT jsonb_build_object(
         "status": normalized["status"],
         "updated_by_turn_id": current_turn_id,
         "final_memory_ids": normalized_final_ids,
+        "rejected_attempt_count": rejected_attempt_count,
+        "transition_history": transition_history,
     }
-    if existing and all(
+    same_core_state = bool(existing) and all(
         existing.get(key) == record.get(key)
         for key in (
             "chain_id", "chain_type", "state", "anchor_turn_id",
             "related_turn_ids", "missing_evidence", "status",
             "updated_by_turn_id", "final_memory_ids",
         )
-    ):
+    )
+    same_attempt_history = bool(existing) and (
+        int(existing.get("rejected_attempt_count") or 0) == rejected_attempt_count
+        and list(existing.get("transition_history") or []) == transition_history
+    )
+    if same_core_state and same_attempt_history:
         return {
             "status": "complete",
             "tool": "save_memory_chain_state",
@@ -1330,6 +1394,8 @@ SELECT jsonb_build_object(
       'related_turn_ids', COALESCE(chain -> 'related_turn_ids', '[]'::jsonb),
       'missing_evidence', COALESCE(chain -> 'missing_evidence', '[]'::jsonb),
       'updated_by_turn_id', chain ->> 'updated_by_turn_id',
+      'rejected_attempt_count', COALESCE(chain -> 'rejected_attempt_count', '0'::jsonb),
+      'transition_history', COALESCE(chain -> 'transition_history', '[]'::jsonb),
       'related_turns', COALESCE((
         SELECT jsonb_agg(jsonb_build_object(
           'turn_id', rt.turn_id,

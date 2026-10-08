@@ -72,6 +72,58 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _validate_expected_chain(
+    chain: Any,
+    *,
+    prefix: str,
+    gate: bool,
+    forbidden_actions: set[str],
+    errors: list[str],
+    enforce_step_write_ban: bool = True,
+) -> None:
+    if not isinstance(chain, Mapping):
+        errors.append(f"{prefix}: expected chain 缺失")
+        return
+    chain_type = str(chain.get("chain_type") or "")
+    states = chain.get("allowed_states")
+    if chain_type not in CHAIN_STATES or not isinstance(states, list) or not states:
+        errors.append(f"{prefix}: chain 类型或状态缺失")
+        states = []
+    invalid = set(map(str, states)) - CHAIN_STATES.get(chain_type, set())
+    if invalid:
+        errors.append(f"{prefix}: 非法状态 {sorted(invalid)}")
+    formal = chain.get("formal_memory_allowed")
+    if not isinstance(formal, bool):
+        errors.append(f"{prefix}: formal_memory_allowed 必须是布尔值")
+    formal_types_raw = chain.get("formal_memory_types_allowed")
+    formal_types: set[str] | None = None
+    if formal_types_raw is not None:
+        if not isinstance(formal_types_raw, list):
+            errors.append(f"{prefix}: formal_memory_types_allowed 必须是数组")
+            formal_types = set()
+        else:
+            formal_types = set(map(str, formal_types_raw))
+            invalid_types = formal_types - FORMAL_MEMORY_TYPES
+            if invalid_types:
+                errors.append(f"{prefix}: 非法正式记忆类型 {sorted(invalid_types)}")
+        if formal is False and formal_types:
+            errors.append(f"{prefix}: 禁止正式记忆时不能声明允许的正式记忆类型")
+    if enforce_step_write_ban and formal is False and not WRITE_ACTIONS.issubset(forbidden_actions):
+        errors.append(f"{prefix}: 未闭环步骤必须禁止正式 memory 写入")
+    runtime_memory_allowed = (
+        formal is True
+        and (formal_types is None or "runtime_failure_experience" in formal_types)
+    )
+    compile_memory_allowed = (
+        formal is True
+        and (formal_types is None or "compile_failure_experience" in formal_types)
+    )
+    if gate and runtime_memory_allowed and chain_type == "runtime" and "user_verified" not in states:
+        errors.append(f"{prefix}: 运行记忆只有 user_verified 才能写入")
+    if gate and compile_memory_allowed and chain_type == "compilation" and "compile_verified" not in states:
+        errors.append(f"{prefix}: 编译记忆只有 compile_verified 才能写入")
+
+
 def validate_multiturn_evalset(
     evalset_path: Path,
     *,
@@ -174,51 +226,63 @@ def validate_multiturn_evalset(
                 continue
             if step.get("index") != index or step.get("turn_id") != turn_ids[index - 1]:
                 errors.append(f"{step_prefix}: index/turn 顺序错误")
-            chain = step.get("expected_chain")
-            if not isinstance(chain, Mapping):
-                errors.append(f"{step_prefix}: expected_chain 缺失")
-                continue
-            chain_type = str(chain.get("chain_type") or "")
-            states = chain.get("allowed_states")
-            if chain_type not in CHAIN_STATES or not isinstance(states, list) or not states:
-                errors.append(f"{step_prefix}: chain 类型或状态缺失")
-                states = []
-            invalid = set(map(str, states)) - CHAIN_STATES.get(chain_type, set())
-            if invalid:
-                errors.append(f"{step_prefix}: 非法状态 {sorted(invalid)}")
-            formal = chain.get("formal_memory_allowed")
-            formal_types_raw = chain.get("formal_memory_types_allowed")
-            formal_types: set[str] | None = None
-            if formal_types_raw is not None:
-                if not isinstance(formal_types_raw, list):
-                    errors.append(f"{step_prefix}: formal_memory_types_allowed 必须是数组")
-                    formal_types = set()
-                else:
-                    formal_types = set(map(str, formal_types_raw))
-                    invalid_types = formal_types - FORMAL_MEMORY_TYPES
-                    if invalid_types:
-                        errors.append(
-                            f"{step_prefix}: 非法正式记忆类型 {sorted(invalid_types)}"
-                        )
-                if formal is False and formal_types:
-                    errors.append(
-                        f"{step_prefix}: 禁止正式记忆时不能声明允许的正式记忆类型"
-                    )
             forbidden = set(map(str, step.get("forbidden_actions") or []))
-            if formal is False and not WRITE_ACTIONS.issubset(forbidden):
-                errors.append(f"{step_prefix}: 未闭环步骤必须禁止正式 memory 写入")
-            runtime_memory_allowed = (
-                formal is True
-                and (formal_types is None or "runtime_failure_experience" in formal_types)
-            )
-            compile_memory_allowed = (
-                formal is True
-                and (formal_types is None or "compile_failure_experience" in formal_types)
-            )
-            if gate and runtime_memory_allowed and chain_type == "runtime" and "user_verified" not in states:
-                errors.append(f"{step_prefix}: 运行记忆只有 user_verified 才能写入")
-            if gate and compile_memory_allowed and chain_type == "compilation" and "compile_verified" not in states:
-                errors.append(f"{step_prefix}: 编译记忆只有 compile_verified 才能写入")
+            expected_chain = step.get("expected_chain")
+            expected_operations = step.get("expected_chain_operations")
+            if expected_chain is not None and expected_operations is not None:
+                errors.append(f"{step_prefix}: expected_chain 与 expected_chain_operations 互斥")
+            elif expected_operations is not None:
+                if (
+                    not isinstance(expected_operations, list)
+                    or len(expected_operations) < 2
+                    or len(expected_operations) > 4
+                ):
+                    errors.append(f"{step_prefix}: expected_chain_operations 必须包含 2 到 4 项")
+                else:
+                    operation_ids: set[str] = set()
+                    for operation_index, operation in enumerate(expected_operations, 1):
+                        operation_prefix = f"{step_prefix}: chain operation {operation_index}"
+                        if not isinstance(operation, Mapping):
+                            errors.append(f"{operation_prefix} 必须是对象")
+                            continue
+                        operation_id = str(operation.get("operation_id") or "")
+                        if not operation_id or operation_id in operation_ids:
+                            errors.append(f"{operation_prefix}: operation_id 缺失或重复")
+                        operation_ids.add(operation_id)
+                        if operation.get("mode") not in {"update_existing", "create_new"}:
+                            errors.append(f"{operation_prefix}: mode 非法")
+                        linked = operation.get("linked_formal_memory")
+                        if not isinstance(linked, bool):
+                            errors.append(f"{operation_prefix}: linked_formal_memory 必须是布尔值")
+                        operation_chain = operation.get("expected_chain")
+                        _validate_expected_chain(
+                            operation_chain,
+                            prefix=operation_prefix,
+                            gate=gate,
+                            forbidden_actions=forbidden,
+                            errors=errors,
+                            enforce_step_write_ban=False,
+                        )
+                        if isinstance(operation_chain, Mapping):
+                            formal = operation_chain.get("formal_memory_allowed")
+                            if linked is True and formal is not True:
+                                errors.append(
+                                    f"{operation_prefix}: 只有允许正式记忆的闭环操作才能 linked_formal_memory"
+                                )
+                            if linked is False and formal is True:
+                                errors.append(
+                                    f"{operation_prefix}: 允许正式记忆的操作必须明确绑定最终记忆"
+                                )
+            elif expected_chain is not None:
+                _validate_expected_chain(
+                    expected_chain,
+                    prefix=step_prefix,
+                    gate=gate,
+                    forbidden_actions=forbidden,
+                    errors=errors,
+                )
+            else:
+                errors.append(f"{step_prefix}: expected_chain 或 expected_chain_operations 缺失")
             tools = step.get("required_tools")
             if not isinstance(tools, list) or set(map(str, tools)) - KNOWN_TOOLS:
                 errors.append(f"{step_prefix}: required_tools 非法")

@@ -29,14 +29,14 @@ CodePulse Memory Lab 是一个独立的长期记忆沉淀实验。它目前只�
 - 已支持从真实 CP turn 生成三层证据池，并交给 ReAct Agent 判断 `create / merge / update / noop / conflict / topic` 等动作；
 - 已支持只读补证据工具：搜索相关记忆、读取 memory/topic 详情、读取主题下记忆列表、读取历史、查看冲突、回查 pointer；
 - 已支持结构化写入动作：新增、更新、合并证据、合并已有记忆、退役、标记冲突、记录冲突决策、更新主题、移动记忆主题、合并主题、记录关系；
-- 已完成 40 条真实单 turn 评测集，以及新版 `memory_multiturn_v1`（10 个真实多轮场景、29 个唯一 turn、8 个发布门禁、2 个已知缺口）；
+- 已完成 40 条真实单 turn 评测集，以及新版 `memory_multiturn_v1`（10 个真实多轮场景、29 个唯一 turn、9 个发布门禁、1 个已知缺口）；
 - 已实现本机 CP SQLite 轮询入口：自动发现新 turn、生成证据池、运行 ReAct 并提交/演练记忆动作；
 - 已实现中文终端摘要、逐 turn ReAct JSON 日志和 Markdown/HTML/JSON trace 报告；
 - 旧单 turn 冻结基线执行成功率 100%（40/40），动作命中率 95%（38/40），明确低价值用例 noop 命中 100%（11/11）；
-- 新版多轮发布门禁真实回放 24/24 turn 成功：4 次新增、1 次偏好合并、19 次 noop；未闭环技术链不会进入正式召回；
-- 当前仍需处理两个已登记的复杂缺口：编译修复被后续结果否定，以及同一 turn 同时关闭旧故障并开启新故障；召回注入 CP 主流程、多设备并发隔离仍属于下一阶段。
+- 新版多轮发布门禁真实回放 26/26 turn 成功：4 次新增、1 次偏好合并、21 次 noop；支持编译/烧录修复被否定后在同一故障链中回退为 `fix_rejected`，未闭环技术链不会进入正式召回；
+- 同一 turn 同时关闭旧故障并开启新故障的代码、数据库集成和 502 项回归已完成；真实 LLM 回放因 DeepSeek HTTP 402 尚未验收，所以该场景仍暂列 known gap；召回注入 CP 主流程、多设备并发隔离仍属于下一阶段。
 
-回家继续开发时，优先阅读 [当前能力与续作说明](docs/当前能力与续作说明.md)。该文档集中说明评测集、评测链路、轮询入口、日志系统、本地数据依赖和下一步顺序。
+回家继续开发时，先阅读 [回家续作清单](docs/回家续作清单.md)，再阅读 [当前能力与续作说明](docs/当前能力与续作说明.md)。前者记录本机数据、恢复命令、当前阻塞和下一任务，后者说明完整评测集、轮询入口和日志系统。
 
 评测体系为什么从单 turn 升级为多 turn，以及各轮真实测试暴露并修复了什么，见 [从单轮评测到多轮闭环评测](docs/从单轮评测到多轮闭环评测.md)。
 
@@ -183,13 +183,13 @@ Set-Location '<Codepulse-Memory-Lab 仓库目录>'
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\src).Path
-python -m unittest tests.test_memory_react_prompt tests.test_memory_changes_validation tests.test_real_flow_memory_plans tests.test_pg_memory_search tests.test_pg_memory_versioning
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-当前核心定向回归期望：
+当前全量回归期望：
 
 ```text
-100 tests OK
+502 tests OK
 ```
 
 PostgreSQL ReAct dry-run 示例：

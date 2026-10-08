@@ -1,7 +1,7 @@
 {
   "schema_version": "memory-multiturn-scenarios-v1",
   "evalset_id": "memory_multiturn_v1",
-  "spec_version": "1.0.0-candidate.2",
+  "spec_version": "1.0.0-candidate.4",
   "scenarios": [
     {
       "scenario_id": "runtime_fan_oscillation_user_verified",
@@ -187,12 +187,11 @@
       "evidence_hashes": {"turn_38dadb00a1fea17d1a860cd5676814e4599f3cfa6955f407e6f3fab2ad4a5937": "96983a19f2254a0ba021e871ae7c4b62a210f497347a14f44eaf8a72da7b58d1", "turn_5bac64c1dba63fe209e923027ed0a2776d813567b6569fb90ed1c134db83b5e7": "318dd85cfc3bf792a9f5f47e51aa09e947108444cd59a5683668d358f0686546", "turn_6de92bc87542233247f7085bd911e9d26ae522c7590523caf802ff0949c42eb5": "4a7ccfe77c59de1e8ebd161de3161b3ae8a7d2585e64169a3317573c2c7d7580", "turn_1b834671a9be2efae922c321600037e6ddd631ebf39443f8ea113d7bd2ca4d96": "f71eb3ecff03effdd1e1b1cbd5c83593dba3048f98c79d1412f2c4f45b92cebf", "turn_5d83de860d4704395134b82544a5d8f30d94aa0e4bd13dfadeae8af941ee360e": "f8e019d5ff2fb090b613a76576e9e7201e10256fa1a16f0bcced32205f0f779c"}
     },
     {
-      "scenario_id": "known_gap_compile_fix_rejected",
-      "title": "程序过大修复后仍失败：编译链缺少 fix_rejected 状态",
+      "scenario_id": "compile_fix_rejected_same_chain",
+      "title": "程序过大修复后仍失败：编译链续接并标记 fix_rejected",
       "mode": "sequential",
       "split": "stress",
-      "release_gate": false,
-      "known_gap": "当前 compilation 状态机没有 fix_rejected，规范期望记录修复被否定并继续原链。",
+      "release_gate": true,
       "provenance": {"kind": "real", "source_db": "D:/opencode-dev/opencode-dev.db", "session_ids": ["ses_f4c8c4db0ffetRhO3IjKePk27o"]},
       "initial_fixture": "empty_user_state_v1",
       "turn_ids": ["turn_1189b71dabf6222fd678862519dca76859a53a8e6c03bf045585c20096ce1d0d", "turn_80f1eb1951705133f313a2b205d39e7e44b5f105ccbd61632e03c4680c83a4ac"],
@@ -218,7 +217,7 @@
         {"index": 2, "turn_id": "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "role": "runtime_fix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
         {"index": 3, "turn_id": "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "role": "runtime_fix_rejected_and_refixed", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_rejected", "fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
         {"index": 4, "turn_id": "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd", "role": "runtime_mapping_refix", "expected_chain": {"chain_type": "runtime", "allowed_states": ["fix_applied", "waiting_user_validation"], "formal_memory_allowed": false}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55"], "forbidden_actions": ["create_memory", "update_memory", "merge_memory"]},
-        {"index": 5, "turn_id": "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328", "role": "old_fix_verified_and_new_symptom", "expected_chain": {"chain_type": "runtime", "allowed_states": ["user_verified", "symptom_observed"], "formal_memory_allowed": true}, "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd"], "allowed_actions": ["create_memory"]}
+        {"index": 5, "turn_id": "turn_cc4acd5b0a7113b2a5d7a4b1371703375f6a2fc445b376b1c03e2d52e80f5328", "role": "old_fix_verified_and_new_symptom", "expected_chain_operations": [{"operation_id": "close_old_mapping_chain", "mode": "update_existing", "expected_chain": {"chain_type": "runtime", "allowed_states": ["user_verified"], "formal_memory_allowed": true}, "linked_formal_memory": true}, {"operation_id": "open_new_position_chain", "mode": "create_new", "expected_chain": {"chain_type": "runtime", "allowed_states": ["symptom_observed"], "formal_memory_allowed": false}, "linked_formal_memory": false}], "required_tools": ["list_open_memory_chains", "read_session_turn_evidence"], "required_history_turn_ids": ["turn_2eb1c2d63b78aacfa818a199b7dae0cad17faf96f22e7d535901b425ef254b1d", "turn_38c2b9f1cfa62a34e84e5b09a160ddf1dc2e5e5fe0878dad63da671f26985041", "turn_0b5beb6346f72c2a8ddebce49a02ccd0f95b5eff8121cedb6154f6d96305bd55", "turn_7772e8e12666aaf4ec6efc12d587b98eb25af44b5ba9c74dd472bd10632a66cd"], "allowed_actions": ["create_memory"]}
       ],
       "final_oracle": {
         "formal_memory": {"required": true, "memory_type": "runtime_failure_experience", "exact_count": 1},

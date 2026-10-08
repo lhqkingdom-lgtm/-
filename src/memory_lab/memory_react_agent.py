@@ -38,6 +38,7 @@ from .memory_changes import (
 from .memory_chain_state import (
     CLOSED_STATES,
     MemoryChainStateValidationError,
+    validate_chain_operations,
     validate_chain_state,
 )
 from .pg_store import (
@@ -151,7 +152,7 @@ REACT_SYSTEM_PROMPT = """你是 Memory Lab 的 ReAct 长期记忆整理 Agent，
 
 2. 类型必备证据门槛
 - user_preference：必须来自用户明确表达。未来取向、跨 turn 重复，或明确建立会持续影响后续迭代的协作机制是强证据；一次表达若包含可复用的“触发条件—做法—目的”，可低置信度沉淀。单次对象明确的临时命令仍然 noop。
-- compile_failure_experience：必须有明确失败/限制、证据支持的原因、已执行的修复，以及修复后编译通过的验证。未达到 compile_verified 时只保留 turn 证据并输出 noop + chain_state；“编译通过”本身不是长期经验，除非它验证了某个失败修复。
+- compile_failure_experience：必须有明确失败/限制、证据支持的原因、已执行的修复，以及对“原始失败动作”重新执行成功的验证。未达到 compile_verified 时只保留 turn 证据并输出 noop + chain_state；“编译通过”本身不是长期经验，除非原始失败就发生在该编译/链接/构建步骤，且同类命令重跑成功。若原始错误发生在烧录/下载/编程阶段，仅有上游编译 0 Error 或生成 HEX 不能证明该错误消失；应保持 fix_applied 并把“原烧录/下载动作重试成功”列入 missing_evidence。
 - 编译工具返回的“可能含义”、通用错误说明或错误码释义不是已证实根因。若同一环境随后用另一入口/命令成功构建，不能直接归因于许可证、安装或环境损坏；必须先定位两种调用的关键差异。原因仍不明确时保留 failure_observed 未闭环链并 noop，不得把“换个入口后成功”包装成完整失败经验。
 - runtime_failure_experience：必须有用户反馈或工具确认的运行现象，以及定位原因和解决方向；只有现象时 request_more_evidence 或 noop。
 - runtime_failure_experience 只有在用户测试/重新烧录/运行后明确确认正常，达到 user_verified，才能写入正式 memory。用户明确表示“我测试了，功能已实现/问题消失/现在正常”即属于 user_verified，不要求机械地逐字出现“烧录”；代码修好或编译通过都不能代替用户验证。
@@ -331,12 +332,21 @@ request_more_evidence：证据不足
 如果当前 turn 涉及编译或上板故障链，最终判断前必须先请求 list_open_memory_chains；若现象/根因/修复确实命中同一既有链，原样带回其 chain_id，并读取该链全部关联历史 turn 的证据，不得丢弃旧环节。开放链若描述的是另一个症状、根因或修复对象，即使来自同一会话、同一模块或同一条多问题 turn，也不得复用该 chain_id。若没有明确命中或需要发现尚未标记的历史环节，再请求 list_previous_session_turns。选中相关 turn 后，再请求 read_session_turn_evidence，不要一次读取整个会话。确认为全新链时不要填写 chain_id。
 chain_state 使用严格枚举，禁止发明近义状态：
 - 非技术 turn：chain_type=none，state=not_applicable，missing_evidence=[]；也可以完全省略 chain_state。noop 是记忆动作，不是 chain state。
-- 编译链：chain_type=compilation，state 只能是 failure_observed、cause_identified、fix_applied、compile_verified。
+- 编译链：chain_type=compilation，state 只能是 failure_observed、cause_identified、fix_applied、fix_rejected、compile_verified。
 - 运行链：chain_type=runtime，state 只能是 symptom_observed、cause_identified、fix_applied、waiting_user_validation、user_verified、fix_rejected。
 - needs_verification、needs_user_verification、unverified、compile_unverified、diagnosis_only、no_chain、noop 都不是合法 state；必须根据已有证据选上面的精确枚举。
 - 所有 chain_state 都必须包含 related_turn_ids 和 missing_evidence。未闭环技术链的 missing_evidence 必须非空；compile_verified、user_verified 和 none/not_applicable 的 missing_evidence 必须为空数组。
 - user_verified 只允许用于用户明确说明重新烧录/运行后正常；助手声称已修复、代码已修改或编译通过均不得使用 user_verified。
-- compile_verified 只允许用于失败修复后的编译/链接/构建验证；普通低价值 turn、路径问答和一次性任务不得因为助手文本提到编译而建立 compilation 链。
+- compile_verified 只允许用于失败修复后、对原始失败步骤的同类编译/链接/构建动作重跑成功；上游步骤成功不能证明下游失败消失。例如，原错误发生在烧录/下载时，仅有编译 0 Error 或 HEX 生成必须保持 fix_applied，不得判为 compile_verified。普通低价值 turn、路径问答和一次性任务不得因为助手文本提到编译而建立 compilation 链。
+- 用户或编译结果明确否定上一轮修复时，必须复用同一 chain_id 并进入 fix_rejected；不得创建新链，也不得把被否定的修复写入正式技术 memory。
+- compilation/fix_rejected 只能从 fix_applied 进入；runtime/fix_rejected 只能从 fix_applied 或 waiting_user_validation 进入。进入 fix_rejected 后，下一轮应重新定位原因或应用新的修复，直到获得对应的 compile_verified/user_verified。
+- 续接被否定的修复时必须保留已有 related_turn_ids，并加入当前 turn；不能丢弃失败尝试的证据。
+单链 turn 使用 chain_state；只有当同一 turn 真正包含多个独立故障动作时，才使用 chain_operations，两者不能同时出现。chain_operations 每项必须包含：
+- operation_id：本次决策内唯一的 `op_` 小写标识，仅用于区分操作。
+- mode：`update_existing` 或 `create_new`。更新旧链必须带 list_open_memory_chains 返回的 chain_id；创建新链禁止带 chain_id。
+- chain_state：该独立故障链的完整状态；不允许 none/not_applicable。
+- linked_change_indexes：该链闭环后所生成技术 memory 在 changes.changes 中的下标。未闭环新链必须是 []；每个技术 memory 必须且只能绑定一个链操作。
+典型混合 turn：用户确认旧问题 A 已正常，同时报告不同的新现象 B。应输出两个操作：`update_existing + user_verified + linked_change_indexes:[旧经验下标]`，以及 `create_new + symptom_observed + linked_change_indexes:[]`。禁止用 B 的新现象重新打开 A，也禁止把 B 写进 A 的已验证 memory。
 禁止凭 memory_index 摘要直接 update_memory / merge_memory / mark_conflict / record_conflict_decision。
 禁止凭 search_related_memories 结果直接 update_memory / merge_memory / mark_conflict / record_conflict_decision；搜索结果只用于决定下一步读哪个 memory/topic 详情。
 禁止凭 get_current_turn_evidence_summary 直接修改已有 memory；它只用于确认当前 turn 证据，修改已有 memory 仍必须先 read_memory_detail 或 read_topic_detail。
@@ -387,8 +397,15 @@ chain_state 使用严格枚举，禁止发明近义状态：
 chain_state 合法示例：
 - 非技术 noop：省略 chain_state，或 {"chain_type":"none","state":"not_applicable","related_turn_ids":["当前 turn_id"],"missing_evidence":[]}
 - 编译未闭环：{"chain_type":"compilation","state":"fix_applied","related_turn_ids":["当前 turn_id"],"missing_evidence":["修复后的编译通过证据"]}
+- 编译修复被否定：{"chain_type":"compilation","state":"fix_rejected","related_turn_ids":["历史 turn_id","当前 turn_id"],"missing_evidence":["重新定位根因、再次修复和编译通过证据"]}
 - 运行待复测：{"chain_type":"runtime","state":"waiting_user_validation","related_turn_ids":["当前 turn_id"],"missing_evidence":["用户重新烧录运行后的确认"]}
 - 运行修复被否定：{"chain_type":"runtime","state":"fix_rejected","related_turn_ids":["历史 turn_id","当前 turn_id"],"missing_evidence":["新的根因定位、有效修复和用户复测确认"]}
+
+chain_operations 混合 turn 示例：
+[
+  {"operation_id":"op_close_mapping","mode":"update_existing","chain_state":{"chain_id":"chain_from_tool","chain_type":"runtime","state":"user_verified","related_turn_ids":["历史 turn_id","当前 turn_id"],"missing_evidence":[]},"linked_change_indexes":[0]},
+  {"operation_id":"op_open_position","mode":"create_new","chain_state":{"chain_type":"runtime","state":"symptom_observed","related_turn_ids":["当前 turn_id"],"missing_evidence":["新现象的根因、修复和用户复测"]},"linked_change_indexes":[]}
+]
 
 memory-changes-v1 changes 可用 action：
 - create_memory
@@ -571,7 +588,7 @@ noop 示例：
 - decision=tool_requests 时，tool_requests 必须非空，changes 必须是空数组。
 - decision=final_changes 时，tool_requests 必须是空数组，changes 必须是完整 memory-changes-v1 对象。
 - changes.source_turn_ids 可省略；单 turn 时默认只有当前 turn。跨 turn 时必须包含当前 turn，且历史 turn 只能来自 turn_access_state.observed_turn_ids。
-- chain_state 可用于记录本轮重建出的故障链状态；技术 memory 写入时必须提供，并与 technical_closure 一致。
+- 单链使用 chain_state；多链混合 turn 使用 chain_operations；两者互斥。技术 memory 写入时必须由匹配的闭环 chain_state 支撑，多链时还必须通过 linked_change_indexes 精确绑定。
 - compile_failure_experience 的 create/merge/update 必须带 technical_closure，state 只能是 compile_verified。
 - runtime_failure_experience 的 create/merge/update 必须带 technical_closure，state 只能是 user_verified，验证证据必须包含用户确认。
 - 每轮最多请求 3 个工具。
@@ -595,11 +612,14 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 只修复 JSON schema、字段名、字段结构和引用 ID，不要改变原本语义判断。
 如果错误是 unsupported fields，必须删除这些字段，不能换成别的未知字段。
 特别注意：
-- chain_state 是严格协议字段，允许值只有：none/not_applicable；compilation/failure_observed、cause_identified、fix_applied、compile_verified；runtime/symptom_observed、cause_identified、fix_applied、waiting_user_validation、user_verified、fix_rejected。
+- chain_state 是严格协议字段，允许值只有：none/not_applicable；compilation/failure_observed、cause_identified、fix_applied、fix_rejected、compile_verified；runtime/symptom_observed、cause_identified、fix_applied、waiting_user_validation、user_verified、fix_rejected。
+- chain_state 与 chain_operations 互斥。同一 turn 同时更新旧链并创建新链时，必须改用 chain_operations；每项只允许 operation_id、mode、chain_state、linked_change_indexes。
+- chain_operations.mode=update_existing 必须带工具返回的 chain_id；mode=create_new 必须省略 chain_id。linked_change_indexes 只能引用 changes.changes 中带 technical_closure 的技术 memory，且不能被多个操作重复引用。
 - needs_verification、needs_user_verification、unverified、compile_unverified、diagnosis_only、no_chain、noop 都是非法 state。根据 previous_output 的原意改成最接近的合法状态；noop 是 action，不是 state。
 - chain_state 必须含 chain_type、state、related_turn_ids、missing_evidence。未闭环技术链 missing_evidence 必须非空；compile_verified、user_verified、none/not_applicable 时必须为 []。
 - 非技术 turn 应省略 chain_state，或使用 none/not_applicable；不要因为助手文本里出现“编译”就建立技术链。
-- user_verified 必须有用户测试、重新烧录或运行后确认正常；用户明确说“我测试了，功能已实现/问题消失/现在正常”可以作为用户确认证据，不要求原话必须含“烧录”。不能由助手的修复声明或编译通过替代。compile_verified 必须是失败修复后的编译/链接/构建验证。
+- user_verified 必须有用户测试、重新烧录或运行后确认正常；用户明确说“我测试了，功能已实现/问题消失/现在正常”可以作为用户确认证据，不要求原话必须含“烧录”。不能由助手的修复声明或编译通过替代。compile_verified 必须是失败修复后、对原始失败步骤的同类编译/链接/构建动作重跑成功；如果原失败发生在烧录/下载，仅有编译 0 Error 或生成 HEX 仍是 fix_applied，不是 compile_verified。
+- fix_rejected 必须有用户否定、重新编译仍失败或等价的失败证据；不能因为“尚未验证”而使用 fix_rejected，尚未验证应保留 fix_applied 或 waiting_user_validation。
 - 如果校验错误要求先完成 list_open_memory_chains，不要继续输出技术 final_changes；改为请求 list_open_memory_chains 的 tool_requests。
 - decision=tool_requests 时必须同时输出 `changes: []`，不能省略 changes。
 - read_session_turn_evidence 只能读取 available_ids.discovered_turn_ids 中的历史 turn；current_turn_id 已在当前证据包内，禁止用历史工具读取当前 turn。
@@ -614,7 +634,7 @@ REACT_REPAIR_PROMPT = """你是 Memory Lab ReAct JSON 修复器。
 - create_memory.memory.memory_type 只能是 user_preference、compile_failure_experience、runtime_failure_experience；旧类型或近义类型必须改成这三类之一，不能发明新类型。
 - compile_failure_experience 的 create/merge/update 必须带 technical_closure={"chain_type":"compilation","state":"compile_verified","verification_evidence_ids":[...]}。
 - runtime_failure_experience 的 create/merge/update 必须带 technical_closure={"chain_type":"runtime","state":"user_verified","verification_evidence_ids":[...]}，且验证证据必须是用户确认。
-- 写技术 memory 时顶层 chain_state 必须与 technical_closure 的 chain_type/state 一致。
+- 写技术 memory 时，单链的顶层 chain_state 必须与 technical_closure 的 chain_type/state 一致；多链时必须由唯一 chain_operation 绑定且状态一致。
 - merge_existing_memories 必须包含 source_memory_ids；source 不能包含 target。
 - retire_memory 不能包含 memory 对象；如目标 memory 有 active conflict，必须包含 conflict_disposition。
 - move_memory_topic 不能包含 memory 或 topic 对象，必须包含 from_topic_id 和 to_topic_id。
@@ -753,7 +773,7 @@ def validate_react_decision(
 ) -> dict[str, Any]:
     errors: list[str] = []
     required = {"schema_version", "decision", "reason", "tool_requests", "changes"}
-    allowed = required | {"chain_state"}
+    allowed = required | {"chain_state", "chain_operations"}
     extra = set(decision) - allowed
     missing = required - set(decision)
     if extra:
@@ -768,6 +788,10 @@ def validate_react_decision(
         errors.append("reason must be a non-empty string")
 
     chain_state = decision.get("chain_state")
+    raw_chain_operations = decision.get("chain_operations")
+    chain_operations: list[dict[str, Any]] = []
+    if chain_state is not None and raw_chain_operations is not None:
+        errors.append("chain_state and chain_operations are mutually exclusive")
     if chain_state is not None:
         try:
             chain_state = validate_chain_state(
@@ -777,34 +801,58 @@ def validate_react_decision(
             )
         except MemoryChainStateValidationError as error:
             errors.extend(error.errors)
+    if raw_chain_operations is not None:
+        try:
+            chain_operations = validate_chain_operations(
+                raw_chain_operations,
+                current_turn_id=turn_id,
+                observed_turn_ids=available_ids.get("observed_turn_ids") or set(),
+            )
+        except MemoryChainStateValidationError as error:
+            errors.extend(error.errors)
 
-    if (
-        decision.get("decision") == "final_changes"
-        and isinstance(chain_state, Mapping)
-        and chain_state.get("chain_type") in {"compilation", "runtime"}
-    ):
+    technical_chain_states = [
+        state
+        for state in (
+            [chain_state] if isinstance(chain_state, Mapping) else []
+        ) + [
+            operation.get("chain_state")
+            for operation in chain_operations
+            if isinstance(operation.get("chain_state"), Mapping)
+        ]
+        if isinstance(state, Mapping)
+        and state.get("chain_type") in {"compilation", "runtime"}
+    ]
+    if decision.get("decision") == "final_changes" and technical_chain_states:
         if "current_session" not in (
             available_ids.get("open_chain_scan_completed") or set()
         ):
             errors.append(
                 "technical final decision requires a completed list_open_memory_chains observation"
             )
-        chain_id = str(chain_state.get("chain_id") or "")
-        if chain_id:
+        for technical_index, technical_state in enumerate(technical_chain_states):
+            chain_id = str(technical_state.get("chain_id") or "")
+            if not chain_id:
+                continue
+            prefix = (
+                "chain_state"
+                if not chain_operations
+                else f"chain_operations[{technical_index}].chain_state"
+            )
             if chain_id not in (available_ids.get("open_chain_ids") or set()):
                 errors.append(
-                    "chain_state.chain_id must come from a completed list_open_memory_chains observation"
+                    f"{prefix}.chain_id must come from a completed list_open_memory_chains observation"
                 )
             required_turn_ids = available_ids.get(
                 f"open_chain_required::{chain_id}"
             ) or set()
             related_turn_ids = {
-                str(item) for item in chain_state.get("related_turn_ids") or []
+                str(item) for item in technical_state.get("related_turn_ids") or []
             }
             missing_turn_ids = set(required_turn_ids) - related_turn_ids
             if missing_turn_ids:
                 errors.append(
-                    "chain_state.related_turn_ids cannot drop turns from the selected open chain: "
+                    f"{prefix}.related_turn_ids cannot drop turns from the selected open chain: "
                     + ", ".join(sorted(missing_turn_ids))
                 )
 
@@ -1083,15 +1131,62 @@ def validate_react_decision(
                         "changes.source_turn_ids contain historical turns that were not read by read_session_turn_evidence: "
                         + ", ".join(sorted(unauthorized_source_turn_ids))
                     )
-            technical_closures = [
-                change.get("technical_closure")
-                for change in normalized_changes.get("changes") or []
+            plan_changes = normalized_changes.get("changes") or []
+            technical_change_indexes = [
+                change_index
+                for change_index, change in enumerate(plan_changes)
                 if isinstance(change, Mapping)
                 and isinstance(change.get("technical_closure"), Mapping)
             ]
+            technical_closures = [
+                plan_changes[change_index].get("technical_closure")
+                for change_index in technical_change_indexes
+            ]
+            if chain_operations and not technical_closures:
+                for operation_index, operation in enumerate(chain_operations):
+                    if operation.get("linked_change_indexes"):
+                        errors.append(
+                            f"chain_operations[{operation_index}].linked_change_indexes must be empty when no technical memory is written"
+                        )
             if technical_closures:
-                if not isinstance(chain_state, Mapping):
-                    errors.append("chain_state is required when writing a technical memory")
+                if chain_operations:
+                    linked_indexes: set[int] = set()
+                    for operation_index, operation in enumerate(chain_operations):
+                        operation_state = operation.get("chain_state") or {}
+                        for linked_index in operation.get("linked_change_indexes") or []:
+                            if linked_index >= len(plan_changes):
+                                errors.append(
+                                    f"chain_operations[{operation_index}].linked_change_indexes contains out-of-range index {linked_index}"
+                                )
+                                continue
+                            linked_change = plan_changes[linked_index]
+                            closure = (
+                                linked_change.get("technical_closure")
+                                if isinstance(linked_change, Mapping)
+                                else None
+                            )
+                            if not isinstance(closure, Mapping):
+                                errors.append(
+                                    f"chain_operations[{operation_index}].linked_change_indexes[{linked_index}] must reference a technical memory change"
+                                )
+                                continue
+                            linked_indexes.add(linked_index)
+                            if closure.get("chain_type") != operation_state.get("chain_type"):
+                                errors.append(
+                                    f"chain_operations[{operation_index}] linked technical_closure.chain_type must match chain_state.chain_type"
+                                )
+                            if closure.get("state") != operation_state.get("state"):
+                                errors.append(
+                                    f"chain_operations[{operation_index}] linked technical_closure.state must match chain_state.state"
+                                )
+                    missing_links = set(technical_change_indexes) - linked_indexes
+                    if missing_links:
+                        errors.append(
+                            "every technical memory change must be linked by exactly one chain operation: "
+                            + ", ".join(str(index) for index in sorted(missing_links))
+                        )
+                elif not isinstance(chain_state, Mapping):
+                    errors.append("chain_state or chain_operations is required when writing a technical memory")
                 else:
                     for closure_index, closure in enumerate(technical_closures):
                         if closure.get("chain_type") != chain_state.get("chain_type"):
@@ -1132,7 +1227,12 @@ def validate_react_decision(
 
     if errors:
         raise MemoryReactValidationError(errors)
-    return dict(decision)
+    normalized_decision = dict(decision)
+    if isinstance(chain_state, Mapping):
+        normalized_decision["chain_state"] = dict(chain_state)
+    if raw_chain_operations is not None and chain_operations:
+        normalized_decision["chain_operations"] = chain_operations
+    return normalized_decision
 
 
 def _execute_tool_request(
@@ -1468,12 +1568,25 @@ def _auto_required_chain_reads(
 
     if raw_decision.get("decision") != "final_changes":
         return []
+    chain_states: list[Mapping[str, Any]] = []
     chain_state = raw_decision.get("chain_state")
-    if not isinstance(chain_state, Mapping):
+    if isinstance(chain_state, Mapping):
+        chain_states.append(chain_state)
+    raw_operations = raw_decision.get("chain_operations")
+    if isinstance(raw_operations, list):
+        chain_states.extend(
+            operation.get("chain_state")
+            for operation in raw_operations
+            if isinstance(operation, Mapping)
+            and isinstance(operation.get("chain_state"), Mapping)
+        )
+    if not chain_states:
         return []
-    chain_type = str(chain_state.get("chain_type") or "")
     if (
-        chain_type in {"compilation", "runtime"}
+        any(
+            str(state.get("chain_type") or "") in {"compilation", "runtime"}
+            for state in chain_states
+        )
         and "current_session"
         not in (available_ids.get("open_chain_scan_completed") or set())
         and not (available_ids.get("open_chain_ids") or set())
@@ -1487,12 +1600,14 @@ def _auto_required_chain_reads(
                 "limit": 10,
             }
         ]
-    chain_id = str(chain_state.get("chain_id") or "")
-    if not chain_id or chain_id not in (available_ids.get("open_chain_ids") or set()):
-        return []
-    required_turn_ids = available_ids.get(f"open_chain_required::{chain_id}") or set()
     observed_turn_ids = available_ids.get("observed_turn_ids") or set()
-    missing_turn_ids = sorted(set(required_turn_ids) - set(observed_turn_ids))
+    missing_turn_ids: set[str] = set()
+    for state in chain_states:
+        chain_id = str(state.get("chain_id") or "")
+        if not chain_id or chain_id not in (available_ids.get("open_chain_ids") or set()):
+            continue
+        required_turn_ids = available_ids.get(f"open_chain_required::{chain_id}") or set()
+        missing_turn_ids.update(set(required_turn_ids) - set(observed_turn_ids))
     return [
         {
             "tool": "read_session_turn_evidence",
@@ -1503,7 +1618,7 @@ def _auto_required_chain_reads(
             "layers": ["core", "candidate", "pointer"],
             "max_chars": 4000,
         }
-        for turn_id in missing_turn_ids[:max_requests]
+        for turn_id in sorted(missing_turn_ids)[:max_requests]
     ]
 
 
@@ -1672,16 +1787,25 @@ def _react_payload(
             "decision": "tool_requests | final_changes",
             "reason": "中文原因",
             "chain_state": {
-                "required_for": "all compilation/runtime final decisions",
+                "required_for": "single-chain compilation/runtime final decisions",
                 "optional_for_non_technical": True,
                 "fields": ["chain_id?", "chain_type", "state", "related_turn_ids", "missing_evidence"],
                 "state_enums": {
                     "none": ["not_applicable"],
-                    "compilation": ["failure_observed", "cause_identified", "fix_applied", "compile_verified"],
+                    "compilation": ["failure_observed", "cause_identified", "fix_applied", "fix_rejected", "compile_verified"],
                     "runtime": ["symptom_observed", "cause_identified", "fix_applied", "waiting_user_validation", "user_verified", "fix_rejected"],
                 },
                 "missing_evidence_rule": "open technical state requires non-empty array; closed or none state requires []",
                 "chain_id_rule": "only copy an existing chain_id returned by list_open_memory_chains",
+            },
+            "chain_operations": {
+                "required_for": "a final decision that mutates two or more independent technical chains",
+                "mutually_exclusive_with": "chain_state",
+                "max_items": 4,
+                "fields": ["operation_id", "mode", "chain_state", "linked_change_indexes"],
+                "mode_enums": ["update_existing", "create_new"],
+                "operation_id_rule": "unique op_[a-z0-9_] identifier within this decision",
+                "link_rule": "every technical memory change index is linked by exactly one closed operation; open operations use []",
             },
             "tool_requests": [],
             "changes": "[] when tool_requests; memory-changes-v1 object when final_changes",
@@ -2045,6 +2169,11 @@ def run_memory_react_agent(
 
     plan = dict(final_decision["changes"])
     chain_state = final_decision.get("chain_state")
+    chain_operations = [
+        dict(item)
+        for item in final_decision.get("chain_operations") or []
+        if isinstance(item, Mapping)
+    ]
     change_count = len(plan.get("changes") or [])
     steps.append(_step("final_changes", "complete", f"changes={change_count}"))
     if isinstance(chain_state, Mapping):
@@ -2057,6 +2186,21 @@ def run_memory_react_agent(
                 missing_evidence=list(chain_state.get("missing_evidence") or []),
             )
         )
+    for operation in chain_operations:
+        operation_state = operation.get("chain_state") or {}
+        steps.append(
+            _step(
+                "reconstruct_chain_operation",
+                "complete",
+                (
+                    f"operation_id={operation.get('operation_id')} mode={operation.get('mode')} "
+                    f"chain_type={operation_state.get('chain_type')} state={operation_state.get('state')}"
+                ),
+                linked_change_indexes=list(operation.get("linked_change_indexes") or []),
+                related_turn_ids=list(operation_state.get("related_turn_ids") or []),
+                missing_evidence=list(operation_state.get("missing_evidence") or []),
+            )
+        )
 
     if dry_run:
         result = {
@@ -2066,6 +2210,7 @@ def run_memory_react_agent(
             "iterations": len(iteration_logs),
             "observation_count": len(observations),
             "chain_state": chain_state,
+            "chain_operations": chain_operations,
             "plan": plan,
             "committed": False,
         }
@@ -2094,77 +2239,96 @@ def run_memory_react_agent(
             f"applied={(commit.get('counts') or {}).get('applied', 0)} rejected={(commit.get('counts') or {}).get('rejected', 0)}",
         )
     )
-    chain_persistence: dict[str, Any] | None = None
-    if isinstance(chain_state, Mapping) and chain_state.get("chain_type") != "none":
+    plan_changes = plan.get("changes") if isinstance(plan.get("changes"), list) else []
+    runtime_operations = list(chain_operations)
+    legacy_operation = False
+    if not runtime_operations and isinstance(chain_state, Mapping) and chain_state.get("chain_type") != "none":
+        legacy_operation = True
+        linked_indexes = [
+            index
+            for index, change in enumerate(plan_changes)
+            if isinstance(change, Mapping)
+            and isinstance(change.get("technical_closure"), Mapping)
+            and change["technical_closure"].get("chain_type") == chain_state.get("chain_type")
+            and change["technical_closure"].get("state") == chain_state.get("state")
+            and (chain_state.get("chain_type"), chain_state.get("state")) in CLOSED_STATES
+        ]
+        runtime_operations = [
+            {
+                "operation_id": "op_legacy_single",
+                "mode": "legacy_auto",
+                "chain_state": dict(chain_state),
+                "linked_change_indexes": linked_indexes,
+            }
+        ]
+
+    applied_memory_ids: dict[int, list[str]] = {}
+    for item in commit.get("applied") or []:
+        if not isinstance(item, Mapping):
+            continue
+        index = item.get("index")
+        if not isinstance(index, int) and len(plan_changes) == 1:
+            index = 0
+        if not isinstance(index, int) or index < 0 or index >= len(plan_changes):
+            continue
+        memory_id = item.get("memory_id") or item.get("target_memory_id")
+        if memory_id and str(memory_id) not in applied_memory_ids.setdefault(index, []):
+            applied_memory_ids[index].append(str(memory_id))
+
+    chain_persistences: list[dict[str, Any]] = []
+    for operation in runtime_operations:
+        operation_id = str(operation.get("operation_id") or "")
+        mode = str(operation.get("mode") or "")
+        operation_state = operation.get("chain_state") or {}
         if commit.get("ok"):
-            final_memory_ids: list[str] = []
-            for item in commit.get("applied") or []:
-                if not isinstance(item, Mapping):
-                    continue
-                index = item.get("index")
-                plan_changes = plan.get("changes") if isinstance(plan, Mapping) else None
-                if not isinstance(plan_changes, list):
-                    continue
-                if not isinstance(index, int) and len(plan_changes) == 1:
-                    index = 0
-                if not isinstance(index, int) or index < 0 or index >= len(plan_changes):
-                    continue
-                planned_change = plan_changes[index]
-                closure = (
-                    planned_change.get("technical_closure")
-                    if isinstance(planned_change, Mapping)
-                    else None
-                )
-                if (
-                    not isinstance(closure, Mapping)
-                    or closure.get("chain_type") != chain_state.get("chain_type")
-                    or (closure.get("chain_type"), closure.get("state"))
-                    not in CLOSED_STATES
-                ):
-                    # A mixed turn may update a user preference while also
-                    # keeping a technical chain open. Only a formal memory
-                    # carrying the matching technical closure belongs to the
-                    # chain and may be linked as its final memory.
-                    continue
-                memory_id = item.get("memory_id") or item.get("target_memory_id")
-                if memory_id and str(memory_id) not in final_memory_ids:
-                    final_memory_ids.append(str(memory_id))
-            chain_persistence = save_memory_chain_state(
+            final_memory_ids = [
+                memory_id
+                for index in operation.get("linked_change_indexes") or []
+                for memory_id in applied_memory_ids.get(index, [])
+            ]
+            persistence = save_memory_chain_state(
                 pg_config_path=pg_config_path,
                 current_turn_id=turn_id,
-                chain_state=chain_state,
+                chain_state=operation_state,
                 final_memory_ids=final_memory_ids,
-            )
-            chain_status = str(chain_persistence.get("status") or "unknown")
-            steps.append(
-                _step(
-                    "persist_chain_state",
-                    "complete" if chain_status in {"complete", "skipped"} else "failed",
-                    f"status={chain_status} result={chain_persistence.get('result', '')}",
-                    chain_id=(chain_persistence.get("chain") or {}).get("chain_id"),
-                    error_code=chain_persistence.get("error_code"),
-                )
+                create_new=mode == "create_new",
+                creation_key=operation_id if mode == "create_new" else "",
             )
         else:
-            chain_persistence = {
+            persistence = {
                 "status": "skipped",
                 "result": "memory_commit_failed",
                 "guidance": "记忆提交存在拒绝项，故障链状态未推进。",
             }
-            steps.append(
-                _step(
-                    "persist_chain_state",
-                    "skipped",
-                    "memory commit failed; chain state was not advanced",
-                )
+        persistence_with_operation = {
+            "operation_id": operation_id,
+            "mode": mode,
+            **persistence,
+        }
+        chain_persistences.append(persistence_with_operation)
+        chain_status = str(persistence.get("status") or "unknown")
+        steps.append(
+            _step(
+                "persist_chain_state" if legacy_operation else "persist_chain_operation",
+                "complete" if chain_status in {"complete", "skipped"} else "failed",
+                (
+                    f"operation_id={operation_id} mode={mode} status={chain_status} "
+                    f"result={persistence.get('result', '')}"
+                ),
+                chain_id=(persistence.get("chain") or {}).get("chain_id"),
+                error_code=persistence.get("error_code"),
             )
+        )
+    chain_persistence = (
+        {key: value for key, value in chain_persistences[0].items() if key not in {"operation_id", "mode"}}
+        if legacy_operation and chain_persistences
+        else None
+    )
     result_status = "complete"
-    if isinstance(chain_persistence, Mapping) and chain_persistence.get("status") in {
-        "rejected",
-        "denied",
-        "retry",
-        "not_found",
-    }:
+    if not commit.get("ok") or any(
+        item.get("status") in {"rejected", "denied", "retry", "not_found"}
+        for item in chain_persistences
+    ):
         result_status = "partial_failure"
     result = {
         "status": result_status,
@@ -2173,9 +2337,11 @@ def run_memory_react_agent(
         "iterations": len(iteration_logs),
         "observation_count": len(observations),
         "chain_state": chain_state,
+        "chain_operations": chain_operations,
         "plan": plan,
         "commit": commit,
         "chain_persistence": chain_persistence,
+        "chain_persistences": chain_persistences,
         "committed": committed,
     }
     run_log = {

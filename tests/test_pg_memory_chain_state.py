@@ -194,6 +194,96 @@ class PgMemoryChainStateTests(unittest.TestCase):
             )
         self.assertEqual(result["error_code"], "chain_id_required_for_existing_chain")
 
+    def test_create_new_bypasses_same_type_overlap_with_explicit_creation_key(self) -> None:
+        existing = {
+            "chain_id": "chain_existing",
+            "chain_type": "runtime",
+            "state": "waiting_user_validation",
+            "anchor_turn_id": "turn_1",
+            "related_turn_ids": ["turn_1", "turn_2"],
+            "missing_evidence": ["用户确认"],
+            "status": "open",
+            "updated_by_turn_id": "turn_2",
+            "final_memory_ids": [],
+        }
+        context = self._context(
+            turns=[
+                {"turn_id": "turn_1", "memory_chains": [existing]},
+                {"turn_id": "turn_2", "memory_chains": []},
+            ],
+            chains=[{"stored_on_turn_id": "turn_1", "chain": existing}],
+        )
+        with patch("memory_lab.pg_store.load_pg_config", return_value=CONFIG), patch(
+            "memory_lab.pg_store._json_from_psql_object",
+            side_effect=[context, {"updated": True}],
+        ):
+            result = save_memory_chain_state(
+                pg_config_path=Path("unused.json"),
+                current_turn_id="turn_2",
+                chain_state={
+                    "chain_type": "runtime",
+                    "state": "symptom_observed",
+                    "related_turn_ids": ["turn_2"],
+                    "missing_evidence": ["新现象的根因、修复和用户复测"],
+                },
+                create_new=True,
+                creation_key="op_open_new",
+            )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["result"], "created")
+        self.assertNotEqual(result["chain"]["chain_id"], "chain_existing")
+
+    def test_create_new_requires_creation_key_and_forbids_chain_id(self) -> None:
+        missing_key = save_memory_chain_state(
+            pg_config_path=Path("unused.json"),
+            current_turn_id="turn_2",
+            chain_state={
+                "chain_type": "runtime",
+                "state": "symptom_observed",
+                "related_turn_ids": ["turn_2"],
+                "missing_evidence": ["根因、修复和验证"],
+            },
+            create_new=True,
+        )
+        self.assertEqual(missing_key["error_code"], "creation_key_required")
+
+        with_existing_id = save_memory_chain_state(
+            pg_config_path=Path("unused.json"),
+            current_turn_id="turn_2",
+            chain_state={
+                "chain_id": "chain_existing",
+                "chain_type": "runtime",
+                "state": "symptom_observed",
+                "related_turn_ids": ["turn_2"],
+                "missing_evidence": ["根因、修复和验证"],
+            },
+            create_new=True,
+            creation_key="op_open_new",
+        )
+        self.assertEqual(with_existing_id["error_code"], "create_new_with_chain_id")
+
+    def test_distinct_creation_keys_produce_distinct_chain_ids(self) -> None:
+        chain_ids: list[str] = []
+        for creation_key in ("op_first", "op_second"):
+            with patch("memory_lab.pg_store.load_pg_config", return_value=CONFIG), patch(
+                "memory_lab.pg_store._json_from_psql_object",
+                side_effect=[self._context(), {"updated": True}],
+            ):
+                result = save_memory_chain_state(
+                    pg_config_path=Path("unused.json"),
+                    current_turn_id="turn_2",
+                    chain_state={
+                        "chain_type": "runtime",
+                        "state": "symptom_observed",
+                        "related_turn_ids": ["turn_2"],
+                        "missing_evidence": ["根因、修复和验证"],
+                    },
+                    create_new=True,
+                    creation_key=creation_key,
+                )
+            chain_ids.append(result["chain"]["chain_id"])
+        self.assertEqual(len(set(chain_ids)), 2)
+
     def test_detects_optimistic_concurrency_conflict(self) -> None:
         with patch("memory_lab.pg_store.load_pg_config", return_value=CONFIG), patch(
             "memory_lab.pg_store._json_from_psql_object",
@@ -211,6 +301,56 @@ class PgMemoryChainStateTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "retry")
         self.assertEqual(result["error_code"], "concurrent_chain_update")
+
+    def test_compile_rejection_records_transition_history(self) -> None:
+        existing = {
+            "schema_version": "memory-chain-state-v1",
+            "chain_id": "chain_compile_001",
+            "chain_type": "compilation",
+            "state": "fix_applied",
+            "anchor_turn_id": "turn_1",
+            "related_turn_ids": ["turn_1"],
+            "missing_evidence": ["重新编译结果"],
+            "status": "open",
+            "updated_by_turn_id": "turn_1",
+            "final_memory_ids": [],
+        }
+        context = self._context(
+            turns=[
+                {"turn_id": "turn_1", "memory_chains": [existing]},
+                {"turn_id": "turn_2", "memory_chains": []},
+            ],
+            chains=[{"stored_on_turn_id": "turn_1", "chain": existing}],
+        )
+        with patch("memory_lab.pg_store.load_pg_config", return_value=CONFIG), patch(
+            "memory_lab.pg_store._json_from_psql_object",
+            side_effect=[context, {"updated": True}],
+        ):
+            result = save_memory_chain_state(
+                pg_config_path=Path("unused.json"),
+                current_turn_id="turn_2",
+                chain_state={
+                    "chain_id": "chain_compile_001",
+                    "chain_type": "compilation",
+                    "state": "fix_rejected",
+                    "related_turn_ids": ["turn_1", "turn_2"],
+                    "missing_evidence": ["重新定位、修复和编译验证"],
+                },
+            )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["chain"]["rejected_attempt_count"], 1)
+        self.assertEqual(
+            result["chain"]["transition_history"],
+            [
+                {
+                    "sequence": 1,
+                    "from_state": "fix_applied",
+                    "to_state": "fix_rejected",
+                    "turn_id": "turn_2",
+                    "outcome": "rejected",
+                }
+            ],
+        )
 
     def test_turn_reingest_sql_preserves_memory_chains(self) -> None:
         pool = {
@@ -288,6 +428,8 @@ class PgMemoryChainStateTests(unittest.TestCase):
         sql = query.call_args.args[1]
         self.assertIn("t.session_id = a.session_id", sql)
         self.assertIn("COALESCE(t.project_key, '')", sql)
+        self.assertIn("rejected_attempt_count", sql)
+        self.assertIn("transition_history", sql)
 
 
 if __name__ == "__main__":
